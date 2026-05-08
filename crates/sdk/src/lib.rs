@@ -25,6 +25,9 @@ mod host {
         );
         pub fn clear_world();
 
+        pub fn scene_set_active(id: u32);
+        pub fn scene_get_active() -> u32;
+
         pub fn material_define(slot: u32, color: u32, emission: u32, flags: u32);
 
         pub fn camera_set_lookat(
@@ -94,9 +97,25 @@ pub fn fill_box(min: UVec3, max: UVec3, material: u8) {
     }
 }
 
-/// Reset the world to all-air. See SPEC.md §3.6.
+/// Reset the **active scene** to all-air. Other scenes are unaffected.
+/// See SPEC.md §3.6.
 pub fn clear_world() {
     unsafe { host::clear_world() }
+}
+
+/// Switch the active scene. All subsequent voxel reads, writes, and
+/// rendering target the scene with this id. Carts may address up to
+/// 256 scenes; an unallocated scene reads as uniform air and lazy-
+/// allocates on first write. Materials, prefabs, actors, and audio
+/// state are cart-global and survive scene switches — see SPEC.md
+/// §3.6 for the full carry-over semantics.
+pub fn scene_set_active(scene: SceneId) {
+    unsafe { host::scene_set_active(scene.0 as u32) }
+}
+
+pub fn scene_get_active() -> SceneId {
+    let v = unsafe { host::scene_get_active() };
+    SceneId(v as u8)
 }
 
 /// Define one material in the cart's material table.

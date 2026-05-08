@@ -114,6 +114,25 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
+    // Scenes (§3.6) — multi-scene mutable voxel grids. Each scene is a
+    // 1024³ world; the cart can address up to 256 of them. Mutations
+    // and the renderer always target the active scene.
+    linker.func_wrap(
+        "env", "scene_set_active",
+        |mut caller: Caller<WorldState>, id: u32| {
+            // u32 → u8 is a low-byte truncation; values ≥ 256 map onto
+            // a different scene rather than being rejected. Cart-side
+            // SDK enforces the SceneId(u8) at the type level.
+            caller.data_mut().scene_set_active(id as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "scene_get_active",
+        |caller: Caller<WorldState>| -> u32 {
+            caller.data().scene_get_active() as u32
+        },
+    )?;
+
     // Material table (v0.0.3 placeholder for materials.toml-driven loading)
     linker.func_wrap(
         "env", "material_define",

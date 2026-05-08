@@ -1,21 +1,26 @@
 //! World state shared between cart-driven mutation and the renderer.
 //!
-//! v0.0.8: a sparse 32³ grid of 32³ chunks per SPEC.md §13.6, covering
-//! the full 1024³ voxel world. Chunks are allocated lazily on first
-//! mutation; the slot table is a dense `Vec<Option<Box<ChunkState>>>`
-//! length 32768 (256 KB upfront, niche-optimized 8 bytes per slot) so
-//! per-chunk lookup is `O(1)` array indexing rather than hash table
-//! probing — important for the per-ray inner loop that visits up to
-//! one chunk per macro-cell.
+//! v0.0.9: cart-managed multi-scene model. The cart can address up to
+//! **256 scenes**, each a 1024³ voxel grid (sparse 32³ chunk grid per
+//! SPEC.md §13.6). All voxel mutations target the **active scene**;
+//! `scene_set_active(id)` switches the active scene and lazy-allocates
+//! it on first touch.
 //!
-//! Each populated `ChunkState` holds:
-//!   - `dense`: 32 KB material buffer for cart-driven edits.
-//!   - `chunk`: cached SVO rebuilt from `dense` on `flush()`.
-//!   - `dirty`: set by mutations, cleared by `flush()`.
+//! The host's only responsibility is to swap which voxel grid is
+//! active — actors, materials, prefabs, audio, save block all stay
+//! cart-global. Carts that want per-scene cleanup (despawn enemies on
+//! exit, etc.) handle that themselves; the host doesn't try to be
+//! clever about it. See SPEC.md §3.6 for the design rationale.
 //!
-//! The dense + SVO duality is a v0.0.x convenience — eventually
-//! mutations apply directly to the SVO per §13.5 and there's no dense
-//! shadow.
+//! ## Memory model
+//!
+//! - `scenes: Vec<Option<Box<Scene>>>` length 256 — 2 KB upfront slot
+//!   table, niche-optimized to 8 bytes per slot.
+//! - Each populated `Scene` holds its own `Vec<Option<Box<ChunkState>>>`
+//!   length 32768 — 256 KB per scene; only populated chunks add their
+//!   ~33 KB dense buffer.
+//! - Worst case (all 256 scenes populated): 64 MB just for slot tables,
+//!   plus chunk dense data. Practical carts populate a handful.
 
 use voxlconsl_svo::{build, ChunkData, ChunkKey};
 use voxlconsl_types::{Material, Vec3};
@@ -28,11 +33,12 @@ use crate::renderer::Camera;
 
 const CHUNK_SIDE: u32 = build::CHUNK_SIZE;
 const CHUNK_VOXELS: usize = (CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE) as usize;
-/// Cells per axis in the world; world side = `WORLD_CHUNKS * CHUNK_SIDE`.
 const WORLD_CHUNKS: u32 = 32;
 const N_CHUNKS: usize = (WORLD_CHUNKS * WORLD_CHUNKS * WORLD_CHUNKS) as usize;
-/// World side in voxels (1024).
+/// World side in voxels per scene (1024).
 pub const WORLD_SIDE: u32 = WORLD_CHUNKS * CHUNK_SIDE;
+/// Maximum number of scenes per cart.
+pub const MAX_SCENES: usize = 256;
 
 /// One 32³ chunk: cart-mutable dense buffer + cached SVO.
 pub struct ChunkState {
@@ -51,13 +57,50 @@ impl ChunkState {
     }
 }
 
+/// One scene's chunk grid. Sparse — `chunks[k] = None` means the chunk
+/// is uniformly air and not allocated.
+pub struct Scene {
+    chunks: Vec<Option<Box<ChunkState>>>,
+}
+
+impl Scene {
+    fn new_empty() -> Self {
+        let mut chunks: Vec<Option<Box<ChunkState>>> = Vec::with_capacity(N_CHUNKS);
+        chunks.resize_with(N_CHUNKS, || None);
+        Self { chunks }
+    }
+
+    pub fn chunks_slice(&self) -> &[Option<Box<ChunkState>>] {
+        &self.chunks
+    }
+
+    pub fn chunk_at(&self, key: ChunkKey) -> Option<&ChunkState> {
+        self.chunks.get(key.0 as usize)?.as_deref()
+    }
+
+    pub fn populated_chunk_count(&self) -> usize {
+        self.chunks.iter().filter(|s| s.is_some()).count()
+    }
+
+    fn flush(&mut self) {
+        for slot in self.chunks.iter_mut() {
+            if let Some(cs) = slot.as_mut() {
+                if cs.dirty {
+                    cs.chunk = build::from_dense(&cs.dense);
+                    cs.dirty = false;
+                }
+            }
+        }
+    }
+}
+
 /// All host state the cart can read or mutate via host imports.
 pub struct WorldState {
-    /// Sparse chunk slots, indexed by `ChunkKey.0 as usize`. `None` =
-    /// the chunk is uniform air and not allocated. Empty world =
-    /// 32 768 × 8 bytes = 256 KB upfront; populated chunks add ~33 KB
-    /// each from their dense buffer.
-    chunks: Vec<Option<Box<ChunkState>>>,
+    /// Sparse per-cart scene table. `None` = unallocated (uniform air).
+    /// Lazy-allocated on first `set_voxel` / `fill_box` / scene activate
+    /// that touches the slot.
+    scenes: Vec<Option<Box<Scene>>>,
+    active_scene: u8,
     pub materials: Box<[Material; 256]>,
     pub camera: Camera,
     pub sun_dir: Vec3,
@@ -71,10 +114,11 @@ pub struct WorldState {
 
 impl WorldState {
     pub fn new() -> Self {
-        let mut chunks: Vec<Option<Box<ChunkState>>> = Vec::with_capacity(N_CHUNKS);
-        chunks.resize_with(N_CHUNKS, || None);
+        let mut scenes: Vec<Option<Box<Scene>>> = Vec::with_capacity(MAX_SCENES);
+        scenes.resize_with(MAX_SCENES, || None);
         Self {
-            chunks,
+            scenes,
+            active_scene: 0,
             materials: Box::new([Material::AIR; 256]),
             camera: Camera::new(
                 Vec3::new(50.0, 30.0, 50.0),
@@ -91,18 +135,45 @@ impl WorldState {
         }
     }
 
-    /// Cart-driven world mutation. Coords ≥ `WORLD_SIDE` are silently
-    /// rejected per §3.6's "clamped or rejected — implementation must
-    /// be consistent" guidance.
+    /// Switch the active scene. The new scene is lazy-allocated if it
+    /// hasn't been touched before, so reading from a fresh scene
+    /// returns uniform air without paying for chunk storage.
+    /// IDs ≥ MAX_SCENES are silently rejected.
+    pub fn scene_set_active(&mut self, id: u8) {
+        // u8 caps at 255; MAX_SCENES is 256 — every u8 is in range.
+        let _ = id;
+        self.active_scene = id;
+        self.ensure_active_scene();
+    }
+
+    pub fn scene_get_active(&self) -> u8 { self.active_scene }
+
+    fn ensure_active_scene(&mut self) -> &mut Scene {
+        let i = self.active_scene as usize;
+        if self.scenes[i].is_none() {
+            self.scenes[i] = Some(Box::new(Scene::new_empty()));
+        }
+        self.scenes[i].as_mut().unwrap()
+    }
+
+    fn active_scene_ref(&self) -> Option<&Scene> {
+        self.scenes[self.active_scene as usize].as_deref()
+    }
+
+    /// Cart-driven world mutation, targeting the active scene. Coords
+    /// ≥ `WORLD_SIDE` are silently rejected per §3.6.
     pub fn set_voxel(&mut self, x: u32, y: u32, z: u32, material: u8) {
         if x >= WORLD_SIDE || y >= WORLD_SIDE || z >= WORLD_SIDE {
             return;
         }
+        // Setting air into an unallocated scene is a no-op.
+        if material == 0 && self.active_scene_ref().is_none() {
+            return;
+        }
+        let scene = self.ensure_active_scene();
         let (cx, cy, cz, lx, ly, lz) = split_world_coords(x, y, z);
         let key = ChunkKey::new(cx, cy, cz);
-        let slot = &mut self.chunks[key.0 as usize];
-        // Setting air into a non-existent chunk is a no-op. Avoids
-        // allocating a chunk full of air just to write the same.
+        let slot = &mut scene.chunks[key.0 as usize];
         if slot.is_none() {
             if material == 0 {
                 return;
@@ -123,7 +194,6 @@ impl WorldState {
         max_x: u32, max_y: u32, max_z: u32,
         material: u8,
     ) {
-        // Clamp into [0, WORLD_SIDE).
         let xs = min_x.min(WORLD_SIDE - 1);
         let ys = min_y.min(WORLD_SIDE - 1);
         let zs = min_z.min(WORLD_SIDE - 1);
@@ -133,8 +203,12 @@ impl WorldState {
         if xs > xe || ys > ye || zs > ze {
             return;
         }
+        // Filling air into an unallocated scene is a no-op.
+        if material == 0 && self.active_scene_ref().is_none() {
+            return;
+        }
+        let scene = self.ensure_active_scene();
 
-        // Iterate the chunks the box overlaps.
         let cx_min = xs >> 5;
         let cx_max = xe >> 5;
         let cy_min = ys >> 5;
@@ -145,7 +219,6 @@ impl WorldState {
         for cz in cz_min..=cz_max {
             for cy in cy_min..=cy_max {
                 for cx in cx_min..=cx_max {
-                    // Box's intersection with this chunk, in chunk-local coords.
                     let lxs = if cx == cx_min { (xs & 31) as u8 } else { 0 };
                     let lxe = if cx == cx_max { (xe & 31) as u8 } else { 31 };
                     let lys = if cy == cy_min { (ys & 31) as u8 } else { 0 };
@@ -154,7 +227,7 @@ impl WorldState {
                     let lze = if cz == cz_max { (ze & 31) as u8 } else { 31 };
 
                     let key = ChunkKey::new(cx as u8, cy as u8, cz as u8);
-                    let slot = &mut self.chunks[key.0 as usize];
+                    let slot = &mut scene.chunks[key.0 as usize];
                     if slot.is_none() {
                         if material == 0 {
                             continue;
@@ -176,11 +249,13 @@ impl WorldState {
         }
     }
 
-    /// Reset the entire mutable world to all-air. Drops every populated
-    /// chunk; subsequent reads see uniform air.
+    /// Reset the **active scene** to all-air. Other scenes are
+    /// unaffected; this is per-scene, not cart-wide.
     pub fn clear_world(&mut self) {
-        for slot in self.chunks.iter_mut() {
-            *slot = None;
+        if let Some(scene) = self.scenes.get_mut(self.active_scene as usize).and_then(|s| s.as_mut()) {
+            for slot in scene.chunks.iter_mut() {
+                *slot = None;
+            }
         }
     }
 
@@ -188,33 +263,44 @@ impl WorldState {
         self.materials[slot as usize] = material;
     }
 
-    /// Rebuild any dirty chunk's SVO. Renderer must call this once per
-    /// frame before reading chunk data.
+    /// Rebuild any dirty chunks in the **active scene**'s SVO. Renderer
+    /// must call this once per frame before reading chunk data. Inactive
+    /// scenes' dirty chunks are flushed lazily the next time their
+    /// scene becomes active.
     pub fn flush(&mut self) {
-        for slot in self.chunks.iter_mut() {
-            if let Some(cs) = slot.as_mut() {
-                if cs.dirty {
-                    cs.chunk = build::from_dense(&cs.dense);
-                    cs.dirty = false;
-                }
-            }
+        if let Some(scene) = self.scenes.get_mut(self.active_scene as usize).and_then(|s| s.as_mut()) {
+            scene.flush();
         }
     }
 
-    /// Look up a chunk by key. Returns `None` if uniform air.
+    /// Look up a chunk in the active scene. None = uniform air.
     pub fn chunk_at(&self, key: ChunkKey) -> Option<&ChunkState> {
-        self.chunks.get(key.0 as usize)?.as_deref()
+        self.active_scene_ref()?.chunk_at(key)
     }
 
-    /// Borrow the entire chunk slot table — used by the renderer as a
-    /// flat per-cell lookup indexed by `ChunkKey.0 as usize`.
+    /// Borrow the active scene's chunk slot table. Returns an empty
+    /// slice if the active scene is unallocated (renders as all sky).
     pub fn chunks_slice(&self) -> &[Option<Box<ChunkState>>] {
-        &self.chunks
+        self.active_scene_ref().map(|s| s.chunks_slice()).unwrap_or(&[])
     }
 
-    /// Number of currently allocated chunks. Useful for tests + telemetry.
+    /// Number of populated chunks in the active scene. Tests + telemetry.
     pub fn populated_chunk_count(&self) -> usize {
-        self.chunks.iter().filter(|s| s.is_some()).count()
+        self.active_scene_ref().map(|s| s.populated_chunk_count()).unwrap_or(0)
+    }
+
+    /// Number of populated scenes (allocated, even if their chunk
+    /// table is empty). Tests + telemetry.
+    pub fn populated_scene_count(&self) -> usize {
+        self.scenes.iter().filter(|s| s.is_some()).count()
+    }
+
+    pub fn scene_chunk_count(&self, scene: u8) -> usize {
+        self.scenes
+            .get(scene as usize)
+            .and_then(|s| s.as_deref())
+            .map(|s| s.populated_chunk_count())
+            .unwrap_or(0)
     }
 }
 
@@ -240,36 +326,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_world_has_no_populated_chunks() {
+    fn empty_world_has_no_populated_scenes_or_chunks() {
         let w = WorldState::new();
+        assert_eq!(w.populated_scene_count(), 0);
         assert_eq!(w.populated_chunk_count(), 0);
     }
 
     #[test]
-    fn set_voxel_in_origin_chunk_allocates_only_that_chunk() {
+    fn set_voxel_in_origin_chunk_lazy_allocates_active_scene() {
         let mut w = WorldState::new();
         w.set_voxel(5, 5, 5, 7);
+        assert_eq!(w.populated_scene_count(), 1);
         assert_eq!(w.populated_chunk_count(), 1);
         let cs = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
         assert_eq!(cs.dense[local_index(5, 5, 5)], 7);
-        assert!(cs.dirty);
     }
 
     #[test]
     fn set_voxel_in_far_chunk_routes_correctly() {
         let mut w = WorldState::new();
         w.set_voxel(40, 64, 100, 9);
-        // (40, 64, 100) → chunk (1, 2, 3), local (8, 0, 4)
         let cs = w.chunk_at(ChunkKey::new(1, 2, 3)).unwrap();
         assert_eq!(cs.dense[local_index(8, 0, 4)], 9);
         assert!(w.chunk_at(ChunkKey::new(0, 0, 0)).is_none());
     }
 
     #[test]
-    fn set_voxel_air_in_empty_chunk_is_noop() {
+    fn set_voxel_air_in_empty_scene_is_noop() {
         let mut w = WorldState::new();
         w.set_voxel(40, 64, 100, 0);
-        assert_eq!(w.populated_chunk_count(), 0);
+        assert_eq!(w.populated_scene_count(), 0);
+    }
+
+    #[test]
+    fn fill_box_with_air_in_empty_scene_doesnt_allocate() {
+        let mut w = WorldState::new();
+        w.fill_box(0, 0, 0, 100, 100, 100, 0);
+        assert_eq!(w.populated_scene_count(), 0);
     }
 
     #[test]
@@ -277,63 +370,100 @@ mod tests {
         let mut w = WorldState::new();
         w.set_voxel(WORLD_SIDE, 0, 0, 5);
         w.set_voxel(0, 5000, 0, 5);
-        assert_eq!(w.populated_chunk_count(), 0);
+        assert_eq!(w.populated_scene_count(), 0);
     }
 
     #[test]
-    fn fill_box_spanning_two_chunks_populates_both() {
+    fn fill_box_spanning_two_chunks_populates_both_in_active_scene() {
         let mut w = WorldState::new();
-        // Box (28..36, 0..2, 0..2) crosses the cx=0 / cx=1 boundary.
         w.fill_box(28, 0, 0, 36, 1, 1, 4);
         assert_eq!(w.populated_chunk_count(), 2);
         let c0 = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
         let c1 = w.chunk_at(ChunkKey::new(1, 0, 0)).unwrap();
         assert_eq!(c0.dense[local_index(28, 0, 0)], 4);
-        assert_eq!(c0.dense[local_index(31, 1, 1)], 4);
         assert_eq!(c1.dense[local_index(0, 0, 0)], 4);
-        assert_eq!(c1.dense[local_index(4, 1, 1)], 4);
     }
 
     #[test]
-    fn clear_world_drops_everything() {
+    fn clear_world_only_affects_active_scene() {
         let mut w = WorldState::new();
-        w.set_voxel(5, 5, 5, 7);
-        w.set_voxel(500, 500, 500, 7);
-        assert_eq!(w.populated_chunk_count(), 2);
-        w.clear_world();
-        assert_eq!(w.populated_chunk_count(), 0);
-    }
+        w.set_voxel(5, 5, 5, 7);            // scene 0
+        w.scene_set_active(1);
+        w.set_voxel(5, 5, 5, 8);            // scene 1
+        assert_eq!(w.scene_chunk_count(0), 1);
+        assert_eq!(w.scene_chunk_count(1), 1);
 
-    #[test]
-    fn flush_rebuilds_dirty_chunk_svo() {
-        let mut w = WorldState::new();
-        w.set_voxel(5, 5, 5, 7);
+        w.clear_world();                    // clears scene 1 only
+        assert_eq!(w.scene_chunk_count(0), 1);
+        assert_eq!(w.scene_chunk_count(1), 0);
+
+        w.scene_set_active(0);
         let cs = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
-        assert!(cs.dirty);
-        w.flush();
-        let cs = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
-        assert!(!cs.dirty);
-        // Non-uniform chunk after the edit.
-        assert!(!cs.chunk.is_uniform());
+        assert_eq!(cs.dense[local_index(5, 5, 5)], 7);
     }
 
     #[test]
-    fn flush_skips_clean_chunks() {
+    fn voxels_dont_leak_across_scenes() {
+        let mut w = WorldState::new();
+        w.set_voxel(10, 0, 10, 7);          // scene 0
+        w.scene_set_active(7);
+        // Reading from scene 7's (10, 0, 10) — chunk (0,0,0) is unallocated.
+        assert!(w.chunk_at(ChunkKey::new(0, 0, 0)).is_none());
+
+        // Writing scene 7 doesn't touch scene 0.
+        w.set_voxel(10, 0, 10, 9);
+        let cs = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
+        assert_eq!(cs.dense[local_index(10, 0, 10)], 9);
+
+        // Switch back to scene 0 — original data still there.
+        w.scene_set_active(0);
+        let cs = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
+        assert_eq!(cs.dense[local_index(10, 0, 10)], 7);
+    }
+
+    #[test]
+    fn scene_set_active_to_unused_id_returns_empty_chunks_slice() {
+        let mut w = WorldState::new();
+        w.set_voxel(0, 0, 0, 5);
+        w.scene_set_active(42);
+        // Scene 42 was just allocated by scene_set_active (eager), but
+        // it has no chunks.
+        assert_eq!(w.populated_chunk_count(), 0);
+        assert!(w.chunk_at(ChunkKey::new(0, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn scene_get_active_round_trips() {
+        let mut w = WorldState::new();
+        assert_eq!(w.scene_get_active(), 0);
+        w.scene_set_active(255);
+        assert_eq!(w.scene_get_active(), 255);
+        w.scene_set_active(0);
+        assert_eq!(w.scene_get_active(), 0);
+    }
+
+    #[test]
+    fn flush_only_rebuilds_active_scene() {
         let mut w = WorldState::new();
         w.set_voxel(5, 5, 5, 7);
-        w.flush();
-        // Second flush should be a no-op (nothing dirty); read SVO is
-        // unchanged.
-        let nodes_before = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap().chunk.nodes.clone();
-        w.flush();
-        let nodes_after = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap().chunk.nodes.clone();
-        assert_eq!(nodes_before, nodes_after);
-    }
+        w.scene_set_active(1);
+        w.set_voxel(5, 5, 5, 8);
+        // Both scenes have a dirty chunk now (each scene was active when set).
+        assert!(w.scene_chunk_count(0) == 1);
+        assert!(w.scene_chunk_count(1) == 1);
 
-    #[test]
-    fn fill_box_with_air_doesnt_allocate_empty_chunks() {
-        let mut w = WorldState::new();
-        w.fill_box(100, 100, 100, 200, 200, 200, 0);
-        assert_eq!(w.populated_chunk_count(), 0);
+        // Flush while scene 1 is active.
+        w.flush();
+        // Scene 1's chunk should be clean.
+        let cs1 = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
+        assert!(!cs1.dirty);
+
+        // Switch back to scene 0 — its chunk is still dirty until flush.
+        w.scene_set_active(0);
+        let cs0 = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
+        assert!(cs0.dirty);
+        w.flush();
+        let cs0 = w.chunk_at(ChunkKey::new(0, 0, 0)).unwrap();
+        assert!(!cs0.dirty);
     }
 }

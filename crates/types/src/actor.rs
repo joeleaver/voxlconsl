@@ -8,6 +8,14 @@ pub struct ActorId(pub u32);
 #[repr(transparent)]
 pub struct PrefabId(pub u16);
 
+/// Identifier for one of the cart's scenes — a 1024³ voxel grid the
+/// cart can populate and switch to with `scene_set_active`. Up to 256
+/// per cart. `Scene 0` is the default active scene at boot. See
+/// SPEC.md §3.6 / §13.6.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct SceneId(pub u8);
+
 /// 24 cube-symmetry orientations. See SPEC.md §11.3.
 ///
 /// Each orientation is uniquely specified by a pair of signed world

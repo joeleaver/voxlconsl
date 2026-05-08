@@ -152,11 +152,36 @@ fn clear_world();
 
 `UVec3` components are world-voxel coordinates `0..1024`; values outside that range are clamped or rejected (host's choice — implementation must be consistent across ports).
 
-`clear_world()` resets the entire mutable world to all-air, including chunks loaded from the cart at boot. After `clear_world()`, the world has no resident voxels until the cart writes new ones via `set_voxel` / `fill_box`. Use sparingly; carts that want a fresh slate per level are better off using actors and a small static decor.
+All voxel reads, writes, and rendering target the **active scene** (see §3.7). `clear_world()` resets the active scene's voxel grid to all-air; other scenes are unaffected. Use sparingly; carts that want a fresh slate per level are better off authoring a separate scene up front.
 
 Mutations seed the Layer 3 active set automatically (see §10.3) for any voxel whose material has CA flags. Direct world writes are intended for level setup and large infrequent edits — actor-shaped moving objects belong in §11 actors. Loading prebuilt voxel data is done at level setup via the cart's prefab table (see §11.4 / §13.6) and `actor_spawn_from`, not via a host-side blit API.
 
-### 3.7 Performance budget
+### 3.7 Scenes
+
+A **scene** is one 1024³ voxel grid the cart can address by `SceneId(u8)`. Each cart may use up to **256 scenes**. Scenes are the cart's unit of "level," "room," "stage," or anything else with a distinct voxel layout. The host doesn't impose semantics — it just keeps each scene's chunks separate and gives the cart a single API call to switch which one is active.
+
+```rust
+fn scene_set_active(scene: SceneId);
+fn scene_get_active() -> SceneId;
+```
+
+Scene 0 is active at boot. `scene_set_active` switches the active scene; an unallocated scene reads as uniform air and lazy-allocates on first write, so addressing scene 200 costs nothing until you populate it.
+
+**Carry-over semantics — what scene switching does and doesn't change:**
+
+| State | Per-scene? | Notes |
+|---|---|---|
+| Voxel grid (chunks) | yes | The whole point of scenes. |
+| Materials (§2 table) | no — cart-global | One palette per cart by design (§4.4). |
+| Actors (§11) | no — cart-global | Carts that want per-scene NPCs despawn / spawn them on switch. |
+| Prefabs + bake cache (§11.4) | no — cart-global | Source data is shared; bakes are reused across scenes. |
+| Audio state, save block | no — cart-global | A song crossfades through scene transitions unless the cart stops it. |
+
+This is deliberately minimal: the host *only* swaps which voxel grid is active. Cleanup on transition (despawn enemies, hide UI actors, clear sticky physics state) is cart-side. Carts that want elaborate transitions compose them on top of the primitive.
+
+**Memory cost.** Empty world: ~2 KB for the scene slot table. Each populated scene adds 256 KB for its chunk slot table; populated chunks add their ~33 KB dense buffer. A typical multi-room cart with ~5 scenes × 50 chunks each is ~10 MB resident, well within the §2 budget.
+
+### 3.8 Performance budget
 
 256×144 = 36,864 rays/frame × 60 fps = **2.21 M rays/sec** at full-rect. ESP32-P4 (RISC-V @ 400 MHz w/ FPU) sustains this for typical sparse worlds. ESP32-S3 may need adaptive render res or 30 Hz under load. Reducing `view_distance` or shrinking the render rect (e.g., 256×108 letterbox = 27,648 rays/frame, 25% savings) are the cart's two biggest knobs.
 
@@ -658,6 +683,7 @@ The host calls these from the per-frame loop described in §10. Carts must expor
 | §3.4 | Sky: `sky_set_gradient`, `sky_set_sun_disc` |
 | §3.5 | Pause: `world_set_paused` |
 | §3.6 | World mutation: `set_voxel`, `fill_box`, `clear_world` |
+| §3.7 | Scenes: `scene_set_active`, `scene_get_active` |
 | §5.3 | Sequenced music: `music_play`, `music_stop`, `music_set_tempo_scale`, `music_position_beats` |
 | §5.6 | Real-time audio: `note_on`, `note_off`, `pitch_bend`, `cc`, `program_change`, `all_notes_off`, `sfx_play`, `sfx_stop`, `sfx_set_volume`, `sfx_set_pitch` |
 | §5.7 | Patch editing: `patch_set_osc`, `patch_set_fm`, `patch_set_filter`, `patch_set_amp_env`, `patch_set_filter_env`, `patch_set_lfo`, `patch_set_glide`, `patch_load`, `patch_save`, `patch_copy`, `patch_reset` |
@@ -1649,9 +1675,9 @@ A real free-list-managed allocator can come later; v1 prioritizes simplicity.
 
 ### 13.6 World-level chunk indexing
 
-The 32³ chunk grid is sparse — most chunks don't exist in a typical world.
+Each scene (§3.7) holds its own 32³ chunk grid. The grid is sparse — most chunks don't exist in a typical scene.
 
-**In RAM:** `HashMap<ChunkKey, ChunkData>`, where `ChunkKey` is a packed 15-bit `(cx, cy, cz)` (5 bits per axis, since 32 = 2⁵). Fast lookup, simple eviction. The hashmap's value can be the `ChunkData` directly or a handle to a chunk pool (implementation detail).
+**In RAM:** `HashMap<ChunkKey, ChunkData>` per scene, where `ChunkKey` is a packed 15-bit `(cx, cy, cz)` (5 bits per axis, since 32 = 2⁵). Fast lookup, simple eviction. The hashmap's value can be the `ChunkData` directly or a handle to a chunk pool (implementation detail). The reference browser host uses a dense `Vec<Option<Box<ChunkState>>>` of length 32 768 per scene to keep per-cell lookup at one cache-friendly array indexing — both shapes preserve the §13.6 semantics.
 
 **On disk** (cart World section): a sorted index plus a blob area:
 

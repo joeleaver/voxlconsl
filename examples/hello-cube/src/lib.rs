@@ -15,11 +15,16 @@
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
 
-/// Side length of the playable area in voxels. The world is 1024³
+/// Side length of the playable area in voxels. Each scene is 1024³
 /// total per the spec; the demo only uses a 64×64×N square at the
 /// (0,0,0) corner so the player can walk across the chunk-boundary
 /// at x=32 / z=32 and you can see multi-chunk traversal at work.
 const PLAY_SIDE: u32 = 64;
+
+/// Scene IDs the cart uses. Scene 0 = the lit overworld, Scene 1 = a
+/// small stone "dungeon" room. FIRE toggles between them.
+const SCENE_OVERWORLD: SceneId = SceneId(0);
+const SCENE_DUNGEON:   SceneId = SceneId(1);
 
 const M_STONE: u8 = 1;
 const M_WOOD:  u8 = 2;
@@ -129,6 +134,26 @@ pub extern "C" fn init() {
     for &(x, z) in &[(4u32, 4), (28, 6), (5, 27), (26, 26), (12, 22), (44, 38), (52, 16)] {
         set_voxel(UVec3::new(x, 1, z), M_GOLD);
     }
+
+    // ── Scene 1: a small "dungeon" room ──────────────────────
+    //
+    // Demonstrates the multi-scene model (§3.7): the cart authors
+    // both scenes up front and toggles between them at runtime via
+    // FIRE. Materials, prefabs, and actors are cart-global, so the
+    // dude survives the switch — but the voxel grid swaps wholesale.
+    scene_set_active(SCENE_DUNGEON);
+    fill_box(UVec3::new(8, 0, 8), UVec3::new(40, 0, 40), M_STONE);
+    // Walls: 4-tall stone perimeter at the room's edges.
+    fill_box(UVec3::new(8, 1, 8),  UVec3::new(40, 4, 8),  M_STONE);
+    fill_box(UVec3::new(8, 1, 40), UVec3::new(40, 4, 40), M_STONE);
+    fill_box(UVec3::new(8, 1, 8),  UVec3::new(8, 4, 40),  M_STONE);
+    fill_box(UVec3::new(40, 1, 8), UVec3::new(40, 4, 40), M_STONE);
+    // Glowing ruby pillar at the room's center.
+    for y in 1..5 {
+        set_voxel(UVec3::new(24, y, 24), M_RUBY);
+    }
+    // Switch back to the overworld so first-frame render shows scene 0.
+    scene_set_active(SCENE_OVERWORLD);
 
     // ── Barrel prefab + three barrels at different orientations ──
     //
@@ -251,12 +276,23 @@ pub extern "C" fn update(dt_ms: u32) {
             }
         }
 
-        // Edge-detected FIRE cycles the player's shirt color through ramps.
+        // Edge-detected FIRE toggles between the overworld and the
+        // dungeon scene. The player actor is cart-global, so it
+        // survives the switch — but the world geometry changes
+        // wholesale, demonstrating §3.7's "host swaps voxel grids"
+        // model. Reposition the player to a known-safe spot in
+        // each scene since the dungeon room is centered at (24, 1, 24).
         if input_action_pressed(unsafe { FIRE_ACTION }) {
-            static mut SHIRT_RAMP: u8 = 7;
+            let now = scene_get_active();
+            let next = if now == SCENE_OVERWORLD { SCENE_DUNGEON } else { SCENE_OVERWORLD };
+            scene_set_active(next);
             unsafe {
-                SHIRT_RAMP = (SHIRT_RAMP + 1) & 0x0F;
-                material_define(M_SHIRT, Material::pack_color(SHIRT_RAMP, 2), 0, MaterialFlags::empty());
+                PLAYER_POS = if next == SCENE_DUNGEON {
+                    Vec3::new(20.0, 1.0, 20.0)
+                } else {
+                    Vec3::new(16.0, 1.0, 16.0)
+                };
+                actor_set_position(player, PLAYER_POS);
             }
         }
     }
