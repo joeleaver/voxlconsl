@@ -920,20 +920,28 @@ Copy-on-write means typical carts use far less than the 4 MB ceiling; many actor
 
 **Continuous yaw** (rotation around world Y axis): an `f32` that may change every frame. Applied per-ray at render time as a 2D rotation in the X-Z plane — no volume re-bake.
 
-**24 fixed orientations** for pitch/roll: the rotational symmetries of a cube. Stored as an enum:
+**24 fixed orientations** for pitch/roll: the rotational symmetries of a cube. Each orientation is uniquely specified by a pair of perpendicular signed world axes — which world direction the actor's local **+Y** (up) and **+Z** (forward) end up pointing. The remaining axis (right) is `up × fwd`. The 6 possible up-axes (±X, ±Y, ±Z) × 4 yaw rotations around each = 24 orientations, grouped into 6 stances:
 
 ```rust
 pub enum Orientation {
-    Up,  Down,
-    NorthUp, NorthDown, SouthUp, SouthDown,
-    EastUp,  EastDown,  WestUp,  WestDown,
-    UpRot90, UpRot180, UpRot270,
-    DownRot90, DownRot180, DownRot270,
-    // ... 24 total — cube symmetry group
+    // up = +Y  (canonical / standing)
+    Up = 0,           UpRot90,        UpRot180,        UpRot270,
+    // up = -Y  (upside down)
+    Down,             DownRot90,      DownRot180,      DownRot270,
+    // up = +X  (lying on left side, right-side-up world-east)
+    EastUp,           EastUpRot90,    EastUpRot180,    EastUpRot270,
+    // up = -X
+    WestUp,           WestUpRot90,    WestUpRot180,    WestUpRot270,
+    // up = +Z  (lying on back, head world-north)
+    NorthUp,          NorthUpRot90,   NorthUpRot180,   NorthUpRot270,
+    // up = -Z
+    SouthUp,          SouthUpRot90,   SouthUpRot180,   SouthUpRot270,
 }
 ```
 
-`Orientation` is **baked into the volume buffer** at spawn or on `actor_set_orientation` (§11.5). After baking, the volume is axis-aligned in actor-local space; rendering treats it identically to the `Up` case.
+`RotN` denotes N degrees of CCW rotation about the stance's up-axis (right-hand rule), starting from the stance's identity forward. `Up` is the identity (`up = +Y`, `forward = +Z`).
+
+`Orientation` is **baked into the volume buffer** at spawn or on `actor_set_orientation` (§11.5). After baking, the volume is axis-aligned in actor-local space; rendering treats it identically to the `Up` case. The bake is a signed axis permutation — no trigonometry — so non-cubic source extents permute (e.g., a 5×7×3 source baked to `EastUp` becomes 7×3×5).
 
 Result: smooth turning is free, "tipped over barrel / wall-mounted sign / sideways door" cost a one-time bake, and there is no continuous tumbling. Carts that want a tumbling effect should fake it via yaw + occasional orientation flips, or split the visual across multiple actors.
 
@@ -954,7 +962,7 @@ Cart authors don't see the fork directly; the volume editing API "just works."
 
 Prefab subsection layout in the cart's World section is specified in §13.6 (`PrefabEntry` table + shared `chunk_blobs` area).
 
-> **v0.0.5 implementation note.** The cart format (§7) is not yet implemented, so prefabs are populated via a temporary host import `prefab_define(prefab_id, ptr, len, sx, sy, sz)` that the cart calls from `init`. The runtime API surface (`actor_spawn_from`, `actor_set_prefab`) is unchanged. Once the §7 cart format lands, prefab data loads from the World section before `init` runs and `prefab_define` becomes optional. Bake routines for the 23 non-`Up` orientations are also pending (§11.3 / §11.5); current builds fall back to identity for non-`Up` requests.
+> **v0.0.6 implementation note.** The cart format (§7) is not yet implemented, so prefabs are populated via a temporary host import `prefab_define(prefab_id, ptr, len, sx, sy, sz)` that the cart calls from `init`. The runtime API surface (`actor_spawn_from`, `actor_set_prefab`, `actor_set_orientation`) is unchanged. Once the §7 cart format lands, prefab data loads from the World section before `init` runs and `prefab_define` becomes optional.
 
 ### 11.5 Bake triggers
 

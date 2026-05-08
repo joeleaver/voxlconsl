@@ -39,6 +39,16 @@ const P_IDLE:    PrefabId = PrefabId(1);
 const P_WALK_0:  PrefabId = PrefabId(2);
 const P_WALK_1:  PrefabId = PrefabId(3);
 const P_WALK_2:  PrefabId = PrefabId(4);
+const P_BARREL:  PrefabId = PrefabId(5);
+
+// Barrel prefab geometry — 4×6×4 with stained ends so the orientation
+// reads visually. Same prefab spawned at three different orientations
+// shows the 24-orientation bake at work.
+const BARREL_W: usize = 4;
+const BARREL_H: usize = 6;
+const BARREL_D: usize = 4;
+const BARREL_VOL: usize = BARREL_W * BARREL_H * BARREL_D;
+static mut DENSE_BARREL: [u8; BARREL_VOL] = [0; BARREL_VOL];
 
 // Authored at runtime in `init` and registered with the host via
 // `prefab_define`. Cart is no_std + no_alloc, so the buffers live in
@@ -124,6 +134,32 @@ pub extern "C" fn init() {
 
     for &(x, z) in &[(4u32, 4), (28, 6), (5, 27), (26, 26), (12, 22)] {
         set_voxel(UVec3::new(x, 1, z), M_GOLD);
+    }
+
+    // ── Barrel prefab + three barrels at different orientations ──
+    //
+    // The barrel's top is RUBY and its bottom is WOOD. With three
+    // copies spawned at Up, EastUp, and NorthUp, the ruby cap should
+    // visibly point in three different directions, demonstrating the
+    // 24-orientation bake (§11.3 / §11.5). All three instances share
+    // the same prefab data; the host bakes one volume per unique
+    // orientation and Rc-shares any duplicates.
+    unsafe {
+        build_barrel(&mut *(&raw mut DENSE_BARREL));
+        prefab_define(
+            P_BARREL,
+            &*(&raw const DENSE_BARREL),
+            U8Vec3::new(BARREL_W as u8, BARREL_H as u8, BARREL_D as u8),
+        );
+    }
+    if let Some(b) = actor_spawn_from(P_BARREL, Orientation::Up) {
+        actor_set_position(b, Vec3::new(2.0, 1.0, 4.0));
+    }
+    if let Some(b) = actor_spawn_from(P_BARREL, Orientation::EastUp) {
+        actor_set_position(b, Vec3::new(2.0, 1.0, 12.0));
+    }
+    if let Some(b) = actor_spawn_from(P_BARREL, Orientation::NorthUp) {
+        actor_set_position(b, Vec3::new(2.0, 1.0, 20.0));
     }
 
     // ── Player prefabs ────────────────────────────────────────
@@ -306,6 +342,29 @@ fn build_dude(
             y += 1;
         }
         x += 1;
+    }
+}
+
+/// Build the barrel prefab into `buf`: WOOD bottom (y=0), GOLD body
+/// (y=1..=4), RUBY top (y=5). The contrasting top/bottom and the gold
+/// midriff make rotations easy to read.
+fn build_barrel(buf: &mut [u8; BARREL_VOL]) {
+    *buf = [0; BARREL_VOL];
+    let bx = BARREL_W;
+    let by = BARREL_H;
+    for z in 0..BARREL_D {
+        for x in 0..bx {
+            let mut y = 0;
+            while y < by {
+                let m = match y {
+                    0 => M_WOOD,            // bottom
+                    1 | 2 | 3 | 4 => M_GOLD, // body
+                    _ => M_RUBY,            // top (y=5)
+                };
+                buf[(z * by + y) * bx + x] = m;
+                y += 1;
+            }
+        }
     }
 }
 

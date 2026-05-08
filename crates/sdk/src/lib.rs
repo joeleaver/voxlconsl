@@ -55,6 +55,8 @@ mod host {
         );
         pub fn actor_clear(actor_id: u32);
         pub fn actor_set_prefab(actor_id: u32, prefab_id: u32);
+        pub fn actor_set_orientation(actor_id: u32, orientation: u32);
+        pub fn actor_get_orientation(actor_id: u32) -> u32;
 
         pub fn prefab_define(
             prefab_id: u32,
@@ -245,6 +247,45 @@ pub fn actor_clear(actor: ActorId) {
 /// pair via copy-on-write, so prefab swaps are pointer-cheap.
 pub fn actor_set_prefab(actor: ActorId, prefab: PrefabId) {
     unsafe { host::actor_set_prefab(actor.0, prefab.0 as u32) }
+}
+
+/// Re-orient an actor (§11.5). For prefab-shared actors this is a
+/// pointer swap into the bake cache; for owned actors the host rotates
+/// the dense buffer and rebuilds the SVO. Setting the same orientation
+/// is a no-op.
+pub fn actor_set_orientation(actor: ActorId, orientation: Orientation) {
+    unsafe { host::actor_set_orientation(actor.0, orientation as u32) }
+}
+
+pub fn actor_get_orientation(actor: ActorId) -> Orientation {
+    let v = unsafe { host::actor_get_orientation(actor.0) };
+    match v {
+        0 => Orientation::Up,
+        1 => Orientation::UpRot90,
+        2 => Orientation::UpRot180,
+        3 => Orientation::UpRot270,
+        4 => Orientation::Down,
+        5 => Orientation::DownRot90,
+        6 => Orientation::DownRot180,
+        7 => Orientation::DownRot270,
+        8 => Orientation::EastUp,
+        9 => Orientation::EastUpRot90,
+        10 => Orientation::EastUpRot180,
+        11 => Orientation::EastUpRot270,
+        12 => Orientation::WestUp,
+        13 => Orientation::WestUpRot90,
+        14 => Orientation::WestUpRot180,
+        15 => Orientation::WestUpRot270,
+        16 => Orientation::NorthUp,
+        17 => Orientation::NorthUpRot90,
+        18 => Orientation::NorthUpRot180,
+        19 => Orientation::NorthUpRot270,
+        20 => Orientation::SouthUp,
+        21 => Orientation::SouthUpRot90,
+        22 => Orientation::SouthUpRot180,
+        23 => Orientation::SouthUpRot270,
+        _ => Orientation::Up,
+    }
 }
 
 pub mod animation;

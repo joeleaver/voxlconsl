@@ -25,7 +25,10 @@ use std::rc::Rc;
 use voxlconsl_svo::{build, ChunkData};
 use voxlconsl_types::{ActorId, Orientation, PrefabId, U8Vec3, Vec3};
 
-use crate::prefabs::{BakedVolume, PrefabTable};
+use crate::prefabs::{
+    build_padded_chunk, matmul, matrix_transpose, orientation_matrix, rotate_dense_by_matrix,
+    BakedVolume, PrefabTable,
+};
 
 /// Default per-actor volume side length for `actor_spawn`. Cart can leave
 /// most voxels empty.
@@ -258,6 +261,53 @@ impl Actor {
         // orientation.
     }
 
+    /// Re-orient the actor (§11.5).
+    ///
+    /// Shared + has prefab: look up `(prefab, new)` in the bake cache and
+    /// Rc-swap. No allocation in the cart's RAM budget.
+    ///
+    /// Owned (post-fork or post-`actor_spawn`): rotate the owned dense
+    /// by the *delta* `R_new · R_current⁻¹`, rebuild SVO eagerly. The
+    /// delta is itself a signed permutation, so the cost is one O(N)
+    /// pass over the actor's voxels.
+    pub fn set_orientation(&mut self, new_ori: Orientation, prefabs: &mut PrefabTable) {
+        if self.orientation == new_ori {
+            return;
+        }
+        match (&self.volume, self.prefab) {
+            (ActorVolume::Shared(_), Some(prefab_id)) => {
+                let Some(baked) = prefabs.bake(prefab_id, new_ori) else { return };
+                self.volume = ActorVolume::Shared(baked);
+            }
+            (ActorVolume::Owned(_), _) => {
+                let r_new = orientation_matrix(new_ori);
+                let r_current = orientation_matrix(self.orientation);
+                let r_delta = matmul(r_new, matrix_transpose(r_current));
+
+                // Borrow-juggle: pull dense out, build new, swap in.
+                let (new_dense, new_size) = match &self.volume {
+                    ActorVolume::Owned(o) => rotate_dense_by_matrix(&o.dense, o.size, r_delta),
+                    _ => unreachable!(),
+                };
+                let chunk = build_padded_chunk(&new_dense, [
+                    new_size.x as usize,
+                    new_size.y as usize,
+                    new_size.z as usize,
+                ]);
+                self.volume = ActorVolume::Owned(OwnedVolume {
+                    dense: new_dense,
+                    size: new_size,
+                    chunk,
+                    dirty: false,
+                });
+            }
+            // Shared without prefab — should not occur with current paths
+            // (`actor_spawn_from` always sets `prefab`); leave a no-op.
+            _ => {}
+        }
+        self.orientation = new_ori;
+    }
+
     /// Flush a dirty Owned actor's SVO. Shared actors are no-ops since
     /// their SVO is immutable.
     pub fn flush(&mut self) {
@@ -442,6 +492,18 @@ impl ActorTable {
             actor.set_prefab(prefab, baked);
         }
     }
+
+    /// Re-orient an actor (§11.5). No-op if id is unknown.
+    pub fn set_actor_orientation(
+        &mut self,
+        id: ActorId,
+        ori: Orientation,
+        prefabs: &mut PrefabTable,
+    ) {
+        if let Some(actor) = self.get_mut(id) {
+            actor.set_orientation(ori, prefabs);
+        }
+    }
 }
 
 impl Default for ActorTable {
@@ -537,5 +599,89 @@ mod tests {
         assert_eq!(a.get_voxel(0, 0, 0), 5);
         assert_eq!(a.get_voxel(1, 0, 0), 6);
         assert_eq!(a.get_voxel(2, 0, 0), 6);
+    }
+
+    #[test]
+    fn set_orientation_on_shared_actor_uses_bake_cache() {
+        let mut table = ActorTable::new();
+        let mut prefabs = PrefabTable::new();
+        let size = U8Vec3::new(2, 2, 2);
+        prefabs.define(PrefabId(1), dense_filled(size, 7), size);
+
+        let a = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+        let b = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+        // Re-orient `a` to UpRot90; `b` keeps Up.
+        table.set_actor_orientation(a, Orientation::UpRot90, &mut prefabs);
+
+        // Both still Shared; `a` now references a different bake.
+        assert!(table.get(a).unwrap().is_shared());
+        assert!(table.get(b).unwrap().is_shared());
+        assert_eq!(table.get(a).unwrap().orientation, Orientation::UpRot90);
+        assert_eq!(table.get(b).unwrap().orientation, Orientation::Up);
+
+        // Spawning a third actor at UpRot90 should reuse `a`'s bake.
+        let c = table.spawn_from(PrefabId(1), Orientation::UpRot90, &mut prefabs).unwrap();
+        let (a_rc, c_rc) = match (&table.get(a).unwrap().volume, &table.get(c).unwrap().volume) {
+            (ActorVolume::Shared(ra), ActorVolume::Shared(rc)) => (Rc::clone(ra), Rc::clone(rc)),
+            _ => panic!("expected Shared"),
+        };
+        assert!(Rc::ptr_eq(&a_rc, &c_rc));
+    }
+
+    #[test]
+    fn set_orientation_on_owned_actor_rotates_dense() {
+        // Spawn an owned actor (default 16³, all-air), set one voxel,
+        // then re-orient. The voxel should follow the rotation.
+        let mut table = ActorTable::new();
+        let mut prefabs = PrefabTable::new();
+        let id = table.spawn().unwrap();
+        let a = table.get_mut(id).unwrap();
+        a.set_voxel(0, 0, 0, 5);
+        a.set_voxel(15, 0, 0, 9);
+        a.flush();
+        // After UpRot180 (flips X and Z): voxel (0,0,0) → (15, 0, 15);
+        // voxel (15, 0, 0) → (0, 0, 15).
+        table.set_actor_orientation(id, Orientation::UpRot180, &mut prefabs);
+        let a = table.get(id).unwrap();
+        assert!(!a.is_shared(), "owned actor should stay owned");
+        assert_eq!(a.orientation, Orientation::UpRot180);
+        assert_eq!(a.get_voxel(15, 0, 15), 5);
+        assert_eq!(a.get_voxel(0, 0, 15), 9);
+        // Original locations are now empty.
+        assert_eq!(a.get_voxel(0, 0, 0), 0);
+        assert_eq!(a.get_voxel(15, 0, 0), 0);
+    }
+
+    #[test]
+    fn owned_orientation_composes_correctly_across_two_calls() {
+        // UpRot90 followed by UpRot90 should equal UpRot180.
+        let mut table = ActorTable::new();
+        let mut prefabs = PrefabTable::new();
+        let id = table.spawn().unwrap();
+        let a = table.get_mut(id).unwrap();
+        a.set_voxel(0, 0, 0, 5);
+        a.flush();
+
+        table.set_actor_orientation(id, Orientation::UpRot90, &mut prefabs);
+        table.set_actor_orientation(id, Orientation::UpRot180, &mut prefabs);
+
+        // Reference path: a fresh actor with a single set_voxel + UpRot180
+        // applied directly should match.
+        let mut tbl2 = ActorTable::new();
+        let mut prefabs2 = PrefabTable::new();
+        let ref_id = tbl2.spawn().unwrap();
+        tbl2.get_mut(ref_id).unwrap().set_voxel(0, 0, 0, 5);
+        tbl2.get_mut(ref_id).unwrap().flush();
+        tbl2.set_actor_orientation(ref_id, Orientation::UpRot180, &mut prefabs2);
+
+        let got = match &table.get(id).unwrap().volume {
+            ActorVolume::Owned(o) => o.dense.clone(),
+            _ => panic!(),
+        };
+        let want = match &tbl2.get(ref_id).unwrap().volume {
+            ActorVolume::Owned(o) => o.dense.clone(),
+            _ => panic!(),
+        };
+        assert_eq!(got, want);
     }
 }

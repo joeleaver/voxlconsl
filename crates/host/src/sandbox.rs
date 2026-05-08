@@ -331,6 +331,25 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
             );
         },
     )?;
+    linker.func_wrap(
+        "env", "actor_set_orientation",
+        |mut caller: Caller<WorldState>, actor_id: u32, orientation: u32| {
+            let ori = orientation_from_u32(orientation);
+            let world = caller.data_mut();
+            world.actors.set_actor_orientation(ActorId(actor_id), ori, &mut world.prefabs);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_get_orientation",
+        |caller: Caller<WorldState>, actor_id: u32| -> u32 {
+            caller
+                .data()
+                .actors
+                .get(ActorId(actor_id))
+                .map(|a| a.orientation as u32)
+                .unwrap_or(0)
+        },
+    )?;
 
     // Input (§6) — declaration is one-action-at-a-time; cart calls
     // input_declare_action N times during init() and stores the handles.
@@ -452,24 +471,34 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
 
 /// Decode the u32 the cart ABI passes for `Orientation`. Falls back to
 /// `Up` for unknown values so a malformed cart can't crash the host.
+/// The numbering matches the explicit `#[repr(u8)]` in
+/// `voxlconsl-types::Orientation`.
 fn orientation_from_u32(v: u32) -> Orientation {
     match v {
-        0 => Orientation::Up,
-        1 => Orientation::Down,
-        2 => Orientation::NorthUp,
-        3 => Orientation::NorthDown,
-        4 => Orientation::SouthUp,
-        5 => Orientation::SouthDown,
-        6 => Orientation::EastUp,
-        7 => Orientation::EastDown,
-        8 => Orientation::WestUp,
-        9 => Orientation::WestDown,
-        10 => Orientation::UpRot90,
-        11 => Orientation::UpRot180,
-        12 => Orientation::UpRot270,
-        13 => Orientation::DownRot90,
-        14 => Orientation::DownRot180,
-        15 => Orientation::DownRot270,
+        0  => Orientation::Up,
+        1  => Orientation::UpRot90,
+        2  => Orientation::UpRot180,
+        3  => Orientation::UpRot270,
+        4  => Orientation::Down,
+        5  => Orientation::DownRot90,
+        6  => Orientation::DownRot180,
+        7  => Orientation::DownRot270,
+        8  => Orientation::EastUp,
+        9  => Orientation::EastUpRot90,
+        10 => Orientation::EastUpRot180,
+        11 => Orientation::EastUpRot270,
+        12 => Orientation::WestUp,
+        13 => Orientation::WestUpRot90,
+        14 => Orientation::WestUpRot180,
+        15 => Orientation::WestUpRot270,
+        16 => Orientation::NorthUp,
+        17 => Orientation::NorthUpRot90,
+        18 => Orientation::NorthUpRot180,
+        19 => Orientation::NorthUpRot270,
+        20 => Orientation::SouthUp,
+        21 => Orientation::SouthUpRot90,
+        22 => Orientation::SouthUpRot180,
+        23 => Orientation::SouthUpRot270,
         _ => Orientation::Up,
     }
 }
