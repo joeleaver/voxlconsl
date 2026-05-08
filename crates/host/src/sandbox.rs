@@ -17,7 +17,10 @@
 
 use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
-use voxlconsl_types::{ActionKind, ActorId, BindingHint, Material, MaterialFlags, U8Vec3, Vec3};
+use voxlconsl_types::{
+    ActionKind, ActorId, BindingHint, Material, MaterialFlags, Orientation, PrefabId,
+    U8Vec3, Vec3,
+};
 
 use crate::renderer::Camera;
 use crate::world::WorldState;
@@ -278,11 +281,54 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
-    // Prefab swap (§11.9 animation) — still a no-op until prefabs land.
+    // Prefabs (§11.4)
+    //
+    // `prefab_define` is the v0.0.5 stand-in for the cart-format-driven
+    // path: the cart copies a dense voxel buffer into the host's prefab
+    // table at init time. Once the §7 cart format lands, the runtime
+    // populates the same table from the World section before `init` runs
+    // and this import becomes optional.
+    linker.func_wrap(
+        "env", "prefab_define",
+        |mut caller: Caller<WorldState>,
+         prefab_id: u32, ptr: u32, len: u32,
+         sx: u32, sy: u32, sz: u32| {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return,
+            };
+            let mut buf = vec![0u8; len as usize];
+            if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+                return;
+            }
+            let size = U8Vec3::new(sx as u8, sy as u8, sz as u8);
+            caller
+                .data_mut()
+                .prefabs
+                .define(PrefabId(prefab_id as u16), buf, size);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_spawn_from",
+        |mut caller: Caller<WorldState>, prefab_id: u32, orientation: u32| -> u32 {
+            let ori = orientation_from_u32(orientation);
+            let world = caller.data_mut();
+            world
+                .actors
+                .spawn_from(PrefabId(prefab_id as u16), ori, &mut world.prefabs)
+                .map(|id| id.0)
+                .unwrap_or(u32::MAX)
+        },
+    )?;
     linker.func_wrap(
         "env", "actor_set_prefab",
-        |_caller: Caller<WorldState>, _actor_id: u32, _prefab_id: u32| {
-            // no-op until the prefab system is implemented
+        |mut caller: Caller<WorldState>, actor_id: u32, prefab_id: u32| {
+            let world = caller.data_mut();
+            world.actors.set_actor_prefab(
+                ActorId(actor_id),
+                PrefabId(prefab_id as u16),
+                &mut world.prefabs,
+            );
         },
     )?;
 
@@ -402,6 +448,30 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
     )?;
 
     Ok(())
+}
+
+/// Decode the u32 the cart ABI passes for `Orientation`. Falls back to
+/// `Up` for unknown values so a malformed cart can't crash the host.
+fn orientation_from_u32(v: u32) -> Orientation {
+    match v {
+        0 => Orientation::Up,
+        1 => Orientation::Down,
+        2 => Orientation::NorthUp,
+        3 => Orientation::NorthDown,
+        4 => Orientation::SouthUp,
+        5 => Orientation::SouthDown,
+        6 => Orientation::EastUp,
+        7 => Orientation::EastDown,
+        8 => Orientation::WestUp,
+        9 => Orientation::WestDown,
+        10 => Orientation::UpRot90,
+        11 => Orientation::UpRot180,
+        12 => Orientation::UpRot270,
+        13 => Orientation::DownRot90,
+        14 => Orientation::DownRot180,
+        15 => Orientation::DownRot270,
+        _ => Orientation::Up,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

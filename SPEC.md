@@ -954,6 +954,8 @@ Cart authors don't see the fork directly; the volume editing API "just works."
 
 Prefab subsection layout in the cart's World section is specified in §13.6 (`PrefabEntry` table + shared `chunk_blobs` area).
 
+> **v0.0.5 implementation note.** The cart format (§7) is not yet implemented, so prefabs are populated via a temporary host import `prefab_define(prefab_id, ptr, len, sx, sy, sz)` that the cart calls from `init`. The runtime API surface (`actor_spawn_from`, `actor_set_prefab`) is unchanged. Once the §7 cart format lands, prefab data loads from the World section before `init` runs and `prefab_define` becomes optional. Bake routines for the 23 non-`Up` orientations are also pending (§11.3 / §11.5); current builds fall back to identity for non-`Up` requests.
+
 ### 11.5 Bake triggers
 
 The host bakes the actor's volume buffer in exactly these cases:

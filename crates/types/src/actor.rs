@@ -16,7 +16,7 @@ pub struct PrefabId(pub u16);
 //
 // TODO: spec lists representative names; the canonical 24-element layout
 // will be filled in when the bake routine is implemented.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Orientation {
     Up = 0,

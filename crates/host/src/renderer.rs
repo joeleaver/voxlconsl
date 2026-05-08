@@ -95,7 +95,7 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
                     continue;
                 }
                 let (lo, ld) = actor.world_to_local_ray(camera.eye, dir);
-                if let Some(mut hit) = actor.volume_chunk.raycast(lo, ld, bound) {
+                if let Some(mut hit) = actor.chunk().raycast(lo, ld, bound) {
                     // Rotate the hit's local-space normal back into world space
                     // for lighting math. The hit's `t` is preserved across
                     // pure-rotation transforms.

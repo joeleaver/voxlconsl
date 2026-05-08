@@ -38,6 +38,7 @@ mod host {
         pub fn sky_set_gradient(top: u32, horizon: u32);
 
         pub fn actor_spawn() -> u32;
+        pub fn actor_spawn_from(prefab_id: u32, orientation: u32) -> u32;
         pub fn actor_despawn(actor_id: u32);
         pub fn actor_count() -> u32;
         pub fn actor_set_position(actor_id: u32, x: f32, y: f32, z: f32);
@@ -54,6 +55,12 @@ mod host {
         );
         pub fn actor_clear(actor_id: u32);
         pub fn actor_set_prefab(actor_id: u32, prefab_id: u32);
+
+        pub fn prefab_define(
+            prefab_id: u32,
+            ptr: *const u8, len: u32,
+            sx: u32, sy: u32, sz: u32,
+        );
 
         pub fn input_declare_action(kind: u32, hint: u32, name_ptr: *const u8, name_len: u32) -> u32;
         pub fn input_action_button(h: u32) -> u32;
@@ -142,6 +149,35 @@ pub fn log(msg: &str) {
 pub fn actor_spawn() -> Option<ActorId> {
     let id = unsafe { host::actor_spawn() };
     if id == u32::MAX { None } else { Some(ActorId(id)) }
+}
+
+/// Spawn an actor instancing a prefab (§11.4). Returns `None` when the
+/// prefab id is unknown or the per-cart actor cap is hit. Multiple actors
+/// instancing the same `(prefab, orientation)` share one baked volume via
+/// copy-on-write — see SPEC.md §11.4.
+pub fn actor_spawn_from(prefab: PrefabId, orientation: Orientation) -> Option<ActorId> {
+    let id = unsafe { host::actor_spawn_from(prefab.0 as u32, orientation as u32) };
+    if id == u32::MAX { None } else { Some(ActorId(id)) }
+}
+
+/// Register a prefab volume with the host.
+///
+/// `dense` is row-major (x fastest, then y, then z), `size.x * size.y *
+/// size.z` bytes. Material `0` is air. The host copies the buffer into
+/// its own prefab table; the cart can drop or reuse `dense` after this
+/// call returns.
+///
+/// v0.0.5 is a runtime API; once the §7 cart format lands prefab data
+/// will load from the cart's World section before `init` runs and this
+/// call becomes optional.
+pub fn prefab_define(prefab: PrefabId, dense: &[u8], size: U8Vec3) {
+    unsafe {
+        host::prefab_define(
+            prefab.0 as u32,
+            dense.as_ptr(), dense.len() as u32,
+            size.x as u32, size.y as u32, size.z as u32,
+        )
+    }
 }
 
 pub fn actor_despawn(actor: ActorId) {

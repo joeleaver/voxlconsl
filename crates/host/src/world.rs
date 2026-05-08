@@ -11,6 +11,7 @@ use voxlconsl_types::{Material, Vec3};
 
 use crate::actors::ActorTable;
 use crate::input::InputState;
+use crate::prefabs::PrefabTable;
 use crate::renderer::Camera;
 
 const CHUNK_SIDE: u32 = build::CHUNK_SIZE;
@@ -31,6 +32,7 @@ pub struct WorldState {
     pub sky_horizon: u8,
     pub input: InputState,
     pub actors: ActorTable,
+    pub prefabs: PrefabTable,
     dirty: bool,
 }
 
@@ -50,6 +52,7 @@ impl WorldState {
             sky_horizon: ((6 << 2) | 0), // sky blue, shade 0
             input: InputState::new(),
             actors: ActorTable::new(),
+            prefabs: PrefabTable::new(),
             dirty: true,
         }
     }

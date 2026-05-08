@@ -1,17 +1,21 @@
-//! hello-cube — a first voxlconsl cart with a controllable character actor.
+//! hello-cube — a first voxlconsl cart with a controllable, animated
+//! character.
 //!
 //! Builds a chequered ground, a voxel tree with leaf canopy, a ruby on top,
-//! and a few gold cubes scattered around. Spawns a "little dude" actor
-//! the player drives with WASD; the camera orbits around the dude and
-//! follows him as he moves.
+//! and a few gold cubes scattered around. The player is spawned from a
+//! **prefab** (§11.4) and animates via **flipbook prefab-swap** (§11.9):
+//! while moving, the cart cycles the actor through walk-cycle prefabs;
+//! when standing still it swaps back to the idle pose. Multiple instances
+//! of the same prefab share a single baked volume via copy-on-write — the
+//! prefab swap is a pointer rotation, not a re-bake.
 
 #![no_std]
 #![no_main]
 
 use voxlconsl_sdk::*;
+use voxlconsl_sdk::animation::Flipbook;
 
 const CHUNK_SIDE: u32 = 32;
-const CHUNK_CENTER: f32 = 16.0;
 
 const M_STONE: u8 = 1;
 const M_WOOD:  u8 = 2;
@@ -22,15 +26,44 @@ const M_GRASS: u8 = 6;
 const M_SKIN:  u8 = 7;
 const M_SHIRT: u8 = 8;
 
+// ── Player prefab geometry ────────────────────────────────────────────────
+//
+// The dude is 5×7×3: x=5 wide, y=7 tall, z=3 deep. Animation cycles the
+// foot offsets in z to fake a walk.
+const DUDE_W: usize = 5;
+const DUDE_H: usize = 7;
+const DUDE_D: usize = 3;
+const DUDE_VOL: usize = DUDE_W * DUDE_H * DUDE_D;
+
+const P_IDLE:    PrefabId = PrefabId(1);
+const P_WALK_0:  PrefabId = PrefabId(2);
+const P_WALK_1:  PrefabId = PrefabId(3);
+const P_WALK_2:  PrefabId = PrefabId(4);
+
+// Authored at runtime in `init` and registered with the host via
+// `prefab_define`. Cart is no_std + no_alloc, so the buffers live in
+// `static mut`.
+static mut DENSE_IDLE:   [u8; DUDE_VOL] = [0; DUDE_VOL];
+static mut DENSE_WALK_0: [u8; DUDE_VOL] = [0; DUDE_VOL];
+static mut DENSE_WALK_1: [u8; DUDE_VOL] = [0; DUDE_VOL];
+static mut DENSE_WALK_2: [u8; DUDE_VOL] = [0; DUDE_VOL];
+
 // Camera state — orbit around the dude.
 static mut CAM_YAW: f32 = 0.7;
 static mut CAM_PITCH: f32 = 0.5;
 static mut CAM_DISTANCE: f32 = 14.0;
 
-// The player's actor.
+// The player actor.
 static mut PLAYER: Option<ActorId> = None;
 static mut PLAYER_POS: Vec3 = Vec3 { x: 16.0, y: 1.0, z: 16.0 };
 static mut PLAYER_FACING: f32 = 0.0;
+
+// Walk-cycle flipbook: WALK_0 → WALK_1 → WALK_2 → WALK_1 → repeat.
+const WALK_FRAMES: &[PrefabId] = &[P_WALK_0, P_WALK_1, P_WALK_2, P_WALK_1];
+static mut WALK_FB: Flipbook = Flipbook::new(WALK_FRAMES, 140, true);
+
+// Tracks which prefab is currently bound so we don't spam `actor_set_prefab`.
+static mut CURRENT_FRAME: PrefabId = P_IDLE;
 
 // Action handles.
 static mut MOVE_ACTION: ActionHandle = ActionHandle(0);
@@ -93,25 +126,30 @@ pub extern "C" fn init() {
         set_voxel(UVec3::new(x, 1, z), M_GOLD);
     }
 
-    // ── Player actor ──────────────────────────────────────────
-    // A 5×8×3 little dude: brown legs, blue shirt, skin head.
-    let id = actor_spawn().expect("failed to spawn player actor");
-    unsafe { PLAYER = Some(id); }
+    // ── Player prefabs ────────────────────────────────────────
+    // IDLE: legs straight (z=1, z=1), arms at sides (z=1, z=1).
+    // WALK frames: feet/arms swing in counterphase so the cycle reads.
+    unsafe {
+        build_dude(&mut *(&raw mut DENSE_IDLE),   /*l*/ 1, /*r*/ 1, /*al*/ 1, /*ar*/ 1);
+        build_dude(&mut *(&raw mut DENSE_WALK_0), /*l*/ 0, /*r*/ 2, /*al*/ 2, /*ar*/ 0);
+        build_dude(&mut *(&raw mut DENSE_WALK_1), /*l*/ 1, /*r*/ 1, /*al*/ 1, /*ar*/ 1);
+        build_dude(&mut *(&raw mut DENSE_WALK_2), /*l*/ 2, /*r*/ 0, /*al*/ 0, /*ar*/ 2);
 
-    // Legs (y 0..2)
-    actor_fill_box(id, U8Vec3::new(1, 0, 1), U8Vec3::new(1, 1, 1), M_WOOD);
-    actor_fill_box(id, U8Vec3::new(3, 0, 1), U8Vec3::new(3, 1, 1), M_WOOD);
-    // Torso (y 2..5), centered on x=2
-    actor_fill_box(id, U8Vec3::new(1, 2, 0), U8Vec3::new(3, 4, 2), M_SHIRT);
-    // Arms (y 2..4), x = 0 and x = 4
-    actor_fill_box(id, U8Vec3::new(0, 2, 1), U8Vec3::new(0, 3, 1), M_SHIRT);
-    actor_fill_box(id, U8Vec3::new(4, 2, 1), U8Vec3::new(4, 3, 1), M_SHIRT);
-    // Head (y 5..7)
-    actor_fill_box(id, U8Vec3::new(1, 5, 0), U8Vec3::new(3, 6, 2), M_SKIN);
+        let size = U8Vec3::new(DUDE_W as u8, DUDE_H as u8, DUDE_D as u8);
+        prefab_define(P_IDLE,   &*(&raw const DENSE_IDLE),   size);
+        prefab_define(P_WALK_0, &*(&raw const DENSE_WALK_0), size);
+        prefab_define(P_WALK_1, &*(&raw const DENSE_WALK_1), size);
+        prefab_define(P_WALK_2, &*(&raw const DENSE_WALK_2), size);
+    }
 
-    // Drop the dude in the middle of the world, raised so feet sit on the
-    // ground (world ground = y=0 surface, so dude's local y=0 sits at y=1).
-    unsafe { actor_set_position(id, PLAYER_POS); }
+    // ── Player actor (spawned from prefab; CoW = the host shares one
+    // baked volume between this actor and any future instances) ──
+    let id = actor_spawn_from(P_IDLE, Orientation::Up).expect("failed to spawn player");
+    unsafe {
+        PLAYER = Some(id);
+        actor_set_position(id, PLAYER_POS);
+        CURRENT_FRAME = P_IDLE;
+    }
 
     // ── Input actions ─────────────────────────────────────────
     unsafe {
@@ -146,6 +184,7 @@ pub extern "C" fn update(dt_ms: u32) {
         right.z * mx + forward.z * my,
     );
     let speed_sq = movement.x * movement.x + movement.z * movement.z;
+    let moving = speed_sq > 0.0025;
 
     if let Some(player) = unsafe { PLAYER } {
         unsafe {
@@ -154,9 +193,26 @@ pub extern "C" fn update(dt_ms: u32) {
             actor_set_position(player, PLAYER_POS);
 
             // Face the direction of movement when walking.
-            if speed_sq > 0.0025 {
+            if moving {
                 PLAYER_FACING = -atan2(movement.x, movement.z);
                 actor_set_yaw(player, PLAYER_FACING);
+            }
+
+            // Animation: cycle walk frames while moving, snap back to
+            // idle when stopped. Only call `actor_set_prefab` when the
+            // bound frame actually changes — the swap is cheap (a
+            // pointer move on the host) but spamming it is silly.
+            let walk_fb = &mut *(&raw mut WALK_FB);
+            let want = if moving {
+                walk_fb.tick(dt_ms);
+                walk_fb.current()
+            } else {
+                walk_fb.reset();
+                P_IDLE
+            };
+            if want != CURRENT_FRAME {
+                actor_set_prefab(player, want);
+                CURRENT_FRAME = want;
             }
         }
 
@@ -185,9 +241,72 @@ pub extern "C" fn render() {
         target.z + dist * cosine(yaw) * cos_pitch,
     );
 
-    let _ = CHUNK_CENTER;  // kept for backward source compat; unused now
     camera_set_lookat(eye, target, Vec3::Y);
     camera_set_fov(60.0);
+}
+
+// ── Prefab authoring ───────────────────────────────────────────────────────
+
+/// Index into a 5×7×3 dense buffer (row-major: x fastest, then y, then z).
+fn idx(x: usize, y: usize, z: usize) -> usize {
+    (z * DUDE_H + y) * DUDE_W + x
+}
+
+fn put(buf: &mut [u8; DUDE_VOL], x: usize, y: usize, z: usize, m: u8) {
+    if x < DUDE_W && y < DUDE_H && z < DUDE_D {
+        buf[idx(x, y, z)] = m;
+    }
+}
+
+/// Build one frame of the little dude into `buf`.
+///
+/// `left_leg_z` / `right_leg_z` are 0..=2 (front/middle/back), same for
+/// arms. Idle frame uses z=1 for everything; walk frames swing legs and
+/// arms in counterphase.
+fn build_dude(
+    buf: &mut [u8; DUDE_VOL],
+    left_leg_z: usize, right_leg_z: usize,
+    arm_l_z: usize, arm_r_z: usize,
+) {
+    *buf = [0; DUDE_VOL];
+
+    // Legs (y 0..=1)
+    put(buf, 1, 0, left_leg_z,  M_WOOD);
+    put(buf, 1, 1, left_leg_z,  M_WOOD);
+    put(buf, 3, 0, right_leg_z, M_WOOD);
+    put(buf, 3, 1, right_leg_z, M_WOOD);
+
+    // Torso (x 1..=3, y 2..=4, z = 1)
+    let mut x = 1;
+    while x <= 3 {
+        let mut y = 2;
+        while y <= 4 {
+            put(buf, x, y, 1, M_SHIRT);
+            y += 1;
+        }
+        x += 1;
+    }
+
+    // Arms (x = 0 / 4, y 2..=3)
+    put(buf, 0, 2, arm_l_z, M_SHIRT);
+    put(buf, 0, 3, arm_l_z, M_SHIRT);
+    put(buf, 4, 2, arm_r_z, M_SHIRT);
+    put(buf, 4, 3, arm_r_z, M_SHIRT);
+
+    // Head (x 1..=3, y 5..=6, full z)
+    let mut x = 1;
+    while x <= 3 {
+        let mut y = 5;
+        while y <= 6 {
+            let mut z = 0;
+            while z < DUDE_D {
+                put(buf, x, y, z, M_SKIN);
+                z += 1;
+            }
+            y += 1;
+        }
+        x += 1;
+    }
 }
 
 // ── tiny no_std math (good to ~0.001 in [-pi, pi]) ─────────────────────────

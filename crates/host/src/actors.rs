@@ -1,141 +1,277 @@
 //! Actors — see SPEC.md §11.
 //!
-//! v0.0.4 minimum-viable scope:
+//! v0.0.5 scope:
 //!   - Actor table with up to 256 actors (`actor_spawn` / `actor_despawn`).
-//!   - Per-actor: position, yaw, visibility, dense voxel buffer (default 16³).
-//!   - Volume editing API: `actor_set_voxel`, `actor_fill_box`, `actor_clear`.
-//!   - Renderer composites visible actors with the world chunk.
+//!   - Per-actor: position, yaw, visibility, and a volume that is either
+//!     **Owned** (private dense + SVO) or **Shared** (`Rc<BakedVolume>`
+//!     pulled from the prefab cache, §11.4).
+//!   - `actor_spawn_from(prefab, orientation)` returns a Shared actor.
+//!   - `actor_set_prefab(id, prefab)` swaps the Shared reference; transform
+//!     is preserved.
+//!   - Volume editing API (`actor_set_voxel`, `actor_fill_box`,
+//!     `actor_clear`) **forks** a Shared actor into Owned on first edit.
 //!
 //! Deferred to later passes:
-//!   - Prefabs + copy-on-write sharing (§11.4)
-//!   - 24 fixed orientations + bake cache (§11.3, §11.5)
-//!   - Anchor offsets — currently always volume's local origin
-//!   - Macro-grid binning (§11.6) — currently iterates all visible actors
-//!   - Body attachment (§10.2)
-//!   - Volume-size mutation, prefab `actor_spawn_from`
+//!   - 24 fixed orientations + bake routine (§11.3, §11.5) — the cache key
+//!     is already `(prefab, orientation)`, but the bake itself is identity
+//!     for all orientations until the next milestone.
+//!   - Anchor offsets — currently always volume's local origin.
+//!   - Macro-grid binning (§11.6) — currently iterates all visible actors.
+//!   - Body attachment (§10.2).
+//!   - Volume-size mutation, `actor_load_volume`.
+
+use std::rc::Rc;
 
 use voxlconsl_svo::{build, ChunkData};
-use voxlconsl_types::{ActorId, U8Vec3, Vec3};
+use voxlconsl_types::{ActorId, Orientation, PrefabId, U8Vec3, Vec3};
 
-/// Default per-actor volume side length. Cart can leave most voxels empty.
+use crate::prefabs::{BakedVolume, PrefabTable};
+
+/// Default per-actor volume side length for `actor_spawn`. Cart can leave
+/// most voxels empty.
 pub const DEFAULT_VOLUME_SIDE: u8 = 16;
 const MAX_ACTORS: usize = 256;
 
-pub struct Actor {
-    pub position: Vec3,
-    pub yaw: f32,
-    pub visible: bool,
+/// An actor's volume is either privately owned (post-fork or post-`spawn`)
+/// or shared via the prefab bake cache (§11.4).
+pub enum ActorVolume {
+    /// Privately owned dense buffer + cached SVO.
+    Owned(OwnedVolume),
+    /// Shared baked volume from `PrefabTable`. Multiple actors hold an
+    /// `Rc` to the same `BakedVolume`; the first to mutate forks.
+    Shared(Rc<BakedVolume>),
+}
+
+pub struct OwnedVolume {
     /// Dense voxel buffer, size_x × size_y × size_z bytes, row-major
     /// (x fastest, then y, then z). Material `0` is empty.
-    pub volume_dense: Vec<u8>,
-    pub volume_size: U8Vec3,
-    /// Cached SVO derived from `volume_dense`. Rebuilt by `flush()` when
+    pub dense: Vec<u8>,
+    pub size: U8Vec3,
+    /// Cached SVO derived from `dense`. Rebuilt by `flush()` when
     /// `dirty` is true.
-    pub volume_chunk: ChunkData,
+    pub chunk: ChunkData,
     pub dirty: bool,
 }
 
-impl Actor {
-    fn new() -> Self {
-        let side = DEFAULT_VOLUME_SIDE;
+impl OwnedVolume {
+    fn empty(side: u8) -> Self {
         let size = U8Vec3::new(side, side, side);
         let n = (side as usize).pow(3);
         Self {
-            position: Vec3::ZERO,
-            yaw: 0.0,
-            visible: true,
-            volume_dense: vec![0; n],
-            volume_size: size,
-            volume_chunk: ChunkData::uniform(0),
+            dense: vec![0; n],
+            size,
+            chunk: ChunkData::uniform(0),
+            dirty: false,
+        }
+    }
+
+    fn from_baked(baked: &BakedVolume) -> Self {
+        Self {
+            dense: baked.dense.clone(),
+            size: baked.size,
+            chunk: baked.chunk.clone(),
             dirty: false,
         }
     }
 
     fn voxel_index(&self, x: u8, y: u8, z: u8) -> Option<usize> {
-        if x >= self.volume_size.x || y >= self.volume_size.y || z >= self.volume_size.z {
+        if x >= self.size.x || y >= self.size.y || z >= self.size.z {
             return None;
         }
-        let s = self.volume_size.x as usize;
-        let sy = self.volume_size.y as usize;
+        let s = self.size.x as usize;
+        let sy = self.size.y as usize;
         Some(((z as usize * sy) + y as usize) * s + x as usize)
     }
 
-    pub fn set_voxel(&mut self, x: u8, y: u8, z: u8, material: u8) {
+    fn set_voxel(&mut self, x: u8, y: u8, z: u8, material: u8) {
         if let Some(i) = self.voxel_index(x, y, z) {
-            if self.volume_dense[i] != material {
-                self.volume_dense[i] = material;
+            if self.dense[i] != material {
+                self.dense[i] = material;
                 self.dirty = true;
             }
         }
     }
 
-    pub fn get_voxel(&self, x: u8, y: u8, z: u8) -> u8 {
-        self.voxel_index(x, y, z)
-            .map(|i| self.volume_dense[i])
-            .unwrap_or(0)
-    }
-
-    pub fn fill_box(&mut self, min: U8Vec3, max: U8Vec3, material: u8) {
-        let xs = min.x.min(self.volume_size.x.saturating_sub(1));
-        let ys = min.y.min(self.volume_size.y.saturating_sub(1));
-        let zs = min.z.min(self.volume_size.z.saturating_sub(1));
-        let xe = max.x.min(self.volume_size.x.saturating_sub(1));
-        let ye = max.y.min(self.volume_size.y.saturating_sub(1));
-        let ze = max.z.min(self.volume_size.z.saturating_sub(1));
+    fn fill_box(&mut self, min: U8Vec3, max: U8Vec3, material: u8) {
+        let xs = min.x.min(self.size.x.saturating_sub(1));
+        let ys = min.y.min(self.size.y.saturating_sub(1));
+        let zs = min.z.min(self.size.z.saturating_sub(1));
+        let xe = max.x.min(self.size.x.saturating_sub(1));
+        let ye = max.y.min(self.size.y.saturating_sub(1));
+        let ze = max.z.min(self.size.z.saturating_sub(1));
         for z in zs..=ze {
             for y in ys..=ye {
                 for x in xs..=xe {
                     let i = self.voxel_index(x, y, z).unwrap();
-                    self.volume_dense[i] = material;
+                    self.dense[i] = material;
                 }
             }
         }
         self.dirty = true;
     }
 
-    pub fn clear(&mut self) {
-        self.volume_dense.fill(0);
+    fn clear(&mut self) {
+        self.dense.fill(0);
         self.dirty = true;
     }
 
-    /// Rebuild the SVO from the dense buffer if dirty. Renderer must call
-    /// this before reading `volume_chunk`.
-    ///
-    /// v0.0.4 uses `build::from_dense` which assumes a 32³ buffer; for
-    /// smaller actor volumes we build from a padded 32³ block. (The padded
-    /// approach is wasteful but works for the minimum-viable pass — the
-    /// proper fix is making `from_dense` accept variable extents.)
-    pub fn flush(&mut self) {
+    fn flush(&mut self) {
         if !self.dirty {
             return;
         }
         let pad_side = build::CHUNK_SIZE;
         let mut padded = vec![0u8; (pad_side * pad_side * pad_side) as usize];
-        let sx = self.volume_size.x as u32;
-        let sy = self.volume_size.y as u32;
-        let sz = self.volume_size.z as u32;
+        let sx = self.size.x as u32;
+        let sy = self.size.y as u32;
+        let sz = self.size.z as u32;
         for z in 0..sz {
             for y in 0..sy {
                 for x in 0..sx {
                     let src = ((z * sy + y) * sx + x) as usize;
                     let dst = ((z * pad_side + y) * pad_side + x) as usize;
-                    padded[dst] = self.volume_dense[src];
+                    padded[dst] = self.dense[src];
                 }
             }
         }
-        self.volume_chunk = build::from_dense(&padded);
+        self.chunk = build::from_dense(&padded);
         self.dirty = false;
+    }
+
+    fn get_voxel(&self, x: u8, y: u8, z: u8) -> u8 {
+        self.voxel_index(x, y, z)
+            .map(|i| self.dense[i])
+            .unwrap_or(0)
+    }
+}
+
+pub struct Actor {
+    pub position: Vec3,
+    pub yaw: f32,
+    pub visible: bool,
+    pub volume: ActorVolume,
+    /// Tracked for `actor_get_orientation` and as the cache key for
+    /// future re-baking. v0.0.5 always Up.
+    pub orientation: Orientation,
+    /// Set on actors spawned via `actor_spawn_from`; used when `actor_set_prefab`
+    /// or `actor_set_orientation` need to look up a baked volume.
+    pub prefab: Option<PrefabId>,
+}
+
+impl Actor {
+    fn new_owned_default() -> Self {
+        Self {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+            visible: true,
+            volume: ActorVolume::Owned(OwnedVolume::empty(DEFAULT_VOLUME_SIDE)),
+            orientation: Orientation::Up,
+            prefab: None,
+        }
+    }
+
+    fn new_shared(prefab: PrefabId, orientation: Orientation, baked: Rc<BakedVolume>) -> Self {
+        Self {
+            position: Vec3::ZERO,
+            yaw: 0.0,
+            visible: true,
+            volume: ActorVolume::Shared(baked),
+            orientation,
+            prefab: Some(prefab),
+        }
+    }
+
+    /// Renderer-facing accessor for the SVO to raycast against. For
+    /// Owned actors callers must `flush()` first; for Shared actors the
+    /// SVO is always up-to-date because the bake is immutable.
+    pub fn chunk(&self) -> &ChunkData {
+        match &self.volume {
+            ActorVolume::Owned(o) => &o.chunk,
+            ActorVolume::Shared(rc) => &rc.chunk,
+        }
+    }
+
+    pub fn volume_size(&self) -> U8Vec3 {
+        match &self.volume {
+            ActorVolume::Owned(o) => o.size,
+            ActorVolume::Shared(rc) => rc.size,
+        }
+    }
+
+    pub fn get_voxel(&self, x: u8, y: u8, z: u8) -> u8 {
+        match &self.volume {
+            ActorVolume::Owned(o) => o.get_voxel(x, y, z),
+            ActorVolume::Shared(rc) => {
+                if x >= rc.size.x || y >= rc.size.y || z >= rc.size.z {
+                    return 0;
+                }
+                let s = rc.size.x as usize;
+                let sy = rc.size.y as usize;
+                let i = ((z as usize * sy) + y as usize) * s + x as usize;
+                rc.dense[i]
+            }
+        }
+    }
+
+    /// Force the actor's volume into the Owned form, cloning the shared
+    /// `BakedVolume` if needed. After this call further mutations are
+    /// in-place and don't affect any other actors.
+    fn fork_for_mutation(&mut self) -> &mut OwnedVolume {
+        if let ActorVolume::Shared(_) = &self.volume {
+            let owned = match &self.volume {
+                ActorVolume::Shared(rc) => OwnedVolume::from_baked(rc),
+                _ => unreachable!(),
+            };
+            self.volume = ActorVolume::Owned(owned);
+            // A fork detaches from the prefab table — subsequent mutations
+            // belong to this actor alone. The prefab id is cleared so a
+            // later `actor_set_prefab` doesn't think the new owned data
+            // came from a particular prefab.
+            self.prefab = None;
+        }
+        match &mut self.volume {
+            ActorVolume::Owned(o) => o,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn set_voxel(&mut self, x: u8, y: u8, z: u8, material: u8) {
+        self.fork_for_mutation().set_voxel(x, y, z, material);
+    }
+
+    pub fn fill_box(&mut self, min: U8Vec3, max: U8Vec3, material: u8) {
+        self.fork_for_mutation().fill_box(min, max, material);
+    }
+
+    pub fn clear(&mut self) {
+        self.fork_for_mutation().clear();
+    }
+
+    /// Swap to a different baked volume from the prefab cache. The actor's
+    /// transform (position, yaw, orientation, visibility) is preserved.
+    /// Forks-on-write: if the actor was Owned, the owned buffer is dropped
+    /// and the actor becomes Shared again.
+    pub fn set_prefab(&mut self, prefab: PrefabId, baked: Rc<BakedVolume>) {
+        self.volume = ActorVolume::Shared(baked);
+        self.prefab = Some(prefab);
+        // Don't touch orientation — `actor_set_prefab` keeps the actor's
+        // current pose. The bake the caller passed in is for that
+        // orientation.
+    }
+
+    /// Flush a dirty Owned actor's SVO. Shared actors are no-ops since
+    /// their SVO is immutable.
+    pub fn flush(&mut self) {
+        if let ActorVolume::Owned(o) = &mut self.volume {
+            o.flush();
+        }
     }
 
     /// World-space AABB of the actor's volume after yaw rotation.
     /// Position is the world location of the volume's local (0, 0, 0)
     /// corner; yaw rotates around that corner about the world Y axis.
     pub fn world_aabb(&self) -> (Vec3, Vec3) {
-        let (sx, sy, sz) = (
-            self.volume_size.x as f32,
-            self.volume_size.y as f32,
-            self.volume_size.z as f32,
-        );
+        let s = self.volume_size();
+        let (sx, sy, sz) = (s.x as f32, s.y as f32, s.z as f32);
         // 8 corners of [0, size] in actor-local coords.
         let corners_local = [
             Vec3::new(0.0, 0.0, 0.0),
@@ -196,6 +332,12 @@ impl Actor {
             normal.x * siny + normal.z * cosy,
         )
     }
+
+    /// True iff this actor currently shares its volume with the prefab
+    /// table. Tests / debugging use this to verify CoW behavior.
+    pub fn is_shared(&self) -> bool {
+        matches!(self.volume, ActorVolume::Shared(_))
+    }
 }
 
 /// Slot-based table. `ActorId.0` indexes into `slots`. Despawn marks the
@@ -215,16 +357,33 @@ impl ActorTable {
         }
     }
 
+    /// Spawn an empty default-sized owned actor.
     pub fn spawn(&mut self) -> Option<ActorId> {
+        self.insert(Actor::new_owned_default())
+    }
+
+    /// Spawn an actor instancing a prefab (§11.4).
+    /// Returns `None` if the prefab id is unknown or the actor cap is hit.
+    pub fn spawn_from(
+        &mut self,
+        prefab_id: PrefabId,
+        orientation: Orientation,
+        prefabs: &mut PrefabTable,
+    ) -> Option<ActorId> {
+        let baked = prefabs.bake(prefab_id, orientation)?;
+        self.insert(Actor::new_shared(prefab_id, orientation, baked))
+    }
+
+    fn insert(&mut self, actor: Actor) -> Option<ActorId> {
         if self.live_count as usize >= MAX_ACTORS {
             return None;
         }
         let idx = if let Some(i) = self.free.pop() {
-            self.slots[i as usize] = Some(Actor::new());
+            self.slots[i as usize] = Some(actor);
             i
         } else {
             let i = self.slots.len() as u32;
-            self.slots.push(Some(Actor::new()));
+            self.slots.push(Some(actor));
             i
         };
         self.live_count += 1;
@@ -258,14 +417,125 @@ impl ActorTable {
         self.slots.iter().filter_map(|s| s.as_ref()).filter(|a| a.visible)
     }
 
-    /// Flush every dirty actor's SVO. Call once per frame before render.
+    /// Flush every dirty Owned actor's SVO. Call once per frame before render.
+    /// Shared actors are no-ops (their SVO is immutable).
     pub fn flush_all(&mut self) {
         for slot in self.slots.iter_mut().flatten() {
             slot.flush();
+        }
+    }
+
+    /// Swap an actor's prefab. Requires a `&mut PrefabTable` to look up
+    /// the bake. No-op if the actor id or prefab id is unknown.
+    pub fn set_actor_prefab(
+        &mut self,
+        id: ActorId,
+        prefab: PrefabId,
+        prefabs: &mut PrefabTable,
+    ) {
+        let orientation = match self.get(id) {
+            Some(a) => a.orientation,
+            None => return,
+        };
+        let Some(baked) = prefabs.bake(prefab, orientation) else { return };
+        if let Some(actor) = self.get_mut(id) {
+            actor.set_prefab(prefab, baked);
         }
     }
 }
 
 impl Default for ActorTable {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dense_filled(size: U8Vec3, fill: u8) -> Vec<u8> {
+        vec![fill; (size.x as usize) * (size.y as usize) * (size.z as usize)]
+    }
+
+    #[test]
+    fn spawn_from_shares_baked_volume() {
+        let mut table = ActorTable::new();
+        let mut prefabs = PrefabTable::new();
+        let size = U8Vec3::new(4, 4, 4);
+        prefabs.define(PrefabId(1), dense_filled(size, 7), size);
+
+        let a = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+        let b = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+
+        // Both actors should be Shared and reference the same Rc.
+        assert!(table.get(a).unwrap().is_shared());
+        assert!(table.get(b).unwrap().is_shared());
+
+        // Pull out the two Rcs and confirm pointer equality.
+        let (a_rc, b_rc) = match (&table.get(a).unwrap().volume, &table.get(b).unwrap().volume) {
+            (ActorVolume::Shared(ra), ActorVolume::Shared(rb)) => (Rc::clone(ra), Rc::clone(rb)),
+            _ => panic!("expected Shared volumes"),
+        };
+        assert!(Rc::ptr_eq(&a_rc, &b_rc));
+    }
+
+    #[test]
+    fn first_mutation_forks_only_the_mutated_actor() {
+        let mut table = ActorTable::new();
+        let mut prefabs = PrefabTable::new();
+        let size = U8Vec3::new(4, 4, 4);
+        prefabs.define(PrefabId(1), dense_filled(size, 7), size);
+
+        let a = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+        let b = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+
+        // Mutate `a`. It should fork to Owned; `b` stays Shared.
+        table.get_mut(a).unwrap().set_voxel(0, 0, 0, 9);
+        assert!(!table.get(a).unwrap().is_shared());
+        assert!(table.get(b).unwrap().is_shared());
+
+        // The forked `a` actually has the new voxel; `b` doesn't.
+        assert_eq!(table.get(a).unwrap().get_voxel(0, 0, 0), 9);
+        assert_eq!(table.get(b).unwrap().get_voxel(0, 0, 0), 7);
+    }
+
+    #[test]
+    fn set_prefab_swaps_reference_without_forking_other_actors() {
+        let mut table = ActorTable::new();
+        let mut prefabs = PrefabTable::new();
+        let size = U8Vec3::new(4, 4, 4);
+        prefabs.define(PrefabId(1), dense_filled(size, 7), size);
+        prefabs.define(PrefabId(2), dense_filled(size, 8), size);
+
+        let a = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+        let b = table.spawn_from(PrefabId(1), Orientation::Up, &mut prefabs).unwrap();
+
+        // Swap `a` to prefab 2.
+        table.set_actor_prefab(a, PrefabId(2), &mut prefabs);
+
+        // `a` is still Shared, but to a different bake. `b` is unchanged.
+        assert!(table.get(a).unwrap().is_shared());
+        assert_eq!(table.get(a).unwrap().get_voxel(0, 0, 0), 8);
+        assert_eq!(table.get(b).unwrap().get_voxel(0, 0, 0), 7);
+    }
+
+    #[test]
+    fn spawn_from_unknown_prefab_returns_none() {
+        let mut table = ActorTable::new();
+        let mut prefabs = PrefabTable::new();
+        assert!(table.spawn_from(PrefabId(99), Orientation::Up, &mut prefabs).is_none());
+    }
+
+    #[test]
+    fn owned_actor_supports_set_voxel_and_fill_box() {
+        // Regression coverage for the path that didn't change semantics.
+        let mut table = ActorTable::new();
+        let id = table.spawn().unwrap();
+        let a = table.get_mut(id).unwrap();
+        a.set_voxel(0, 0, 0, 5);
+        a.fill_box(U8Vec3::new(1, 0, 0), U8Vec3::new(2, 0, 0), 6);
+        a.flush();
+        assert_eq!(a.get_voxel(0, 0, 0), 5);
+        assert_eq!(a.get_voxel(1, 0, 0), 6);
+        assert_eq!(a.get_voxel(2, 0, 0), 6);
+    }
 }
