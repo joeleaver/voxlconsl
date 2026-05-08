@@ -15,7 +15,11 @@
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
 
-const CHUNK_SIDE: u32 = 32;
+/// Side length of the playable area in voxels. The world is 1024³
+/// total per the spec; the demo only uses a 64×64×N square at the
+/// (0,0,0) corner so the player can walk across the chunk-boundary
+/// at x=32 / z=32 and you can see multi-chunk traversal at work.
+const PLAY_SIDE: u32 = 64;
 
 const M_STONE: u8 = 1;
 const M_WOOD:  u8 = 2;
@@ -107,32 +111,22 @@ pub extern "C" fn init() {
     light_set_sun(Vec3::new(-0.6, 0.8, 0.4), 0, 0);
 
     // ── World geometry ────────────────────────────────────────
-    for x in 0..CHUNK_SIDE {
-        for z in 0..CHUNK_SIDE {
+    //
+    // 64×64 chequered ground spans four chunks (cx 0..1 × cz 0..1) so
+    // the player walking around proves the multi-chunk renderer works.
+    for x in 0..PLAY_SIDE {
+        for z in 0..PLAY_SIDE {
             let m = if (x + z) % 2 == 0 { M_STONE } else { M_GRASS };
             set_voxel(UVec3::new(x, 0, z), m);
         }
     }
 
-    let cx: u32 = 8;
-    let cz: u32 = 24;
-    for y in 1..6 { set_voxel(UVec3::new(cx, y, cz), M_WOOD); }
-    for dy in 0..3 {
-        let r: i32 = if dy == 1 { 2 } else { 1 };
-        let y = 6 + dy as u32;
-        for dx in -r..=r {
-            for dz in -r..=r {
-                if dx * dx + dz * dz <= r * r + 1 {
-                    let x = (cx as i32 + dx) as u32;
-                    let z = (cz as i32 + dz) as u32;
-                    set_voxel(UVec3::new(x, y, z), M_LEAF);
-                }
-            }
-        }
-    }
-    set_voxel(UVec3::new(cx, 9, cz), M_RUBY);
+    // Two trees, one in chunk (0,0,0) and a second across the boundary
+    // in chunk (1,0,1) so a single ray heading northeast traces both.
+    plant_tree(8, 24);
+    plant_tree(48, 48);
 
-    for &(x, z) in &[(4u32, 4), (28, 6), (5, 27), (26, 26), (12, 22)] {
+    for &(x, z) in &[(4u32, 4), (28, 6), (5, 27), (26, 26), (12, 22), (44, 38), (52, 16)] {
         set_voxel(UVec3::new(x, 1, z), M_GOLD);
     }
 
@@ -160,6 +154,11 @@ pub extern "C" fn init() {
     }
     if let Some(b) = actor_spawn_from(P_BARREL, Orientation::NorthUp) {
         actor_set_position(b, Vec3::new(2.0, 1.0, 20.0));
+    }
+    // Far-chunk barrel proves the macro-grid is binning into cell
+    // (1, 0, 1) and the renderer's chunk traversal reaches it.
+    if let Some(b) = actor_spawn_from(P_BARREL, Orientation::Up) {
+        actor_set_position(b, Vec3::new(58.0, 1.0, 56.0));
     }
 
     // ── Player prefabs ────────────────────────────────────────
@@ -224,8 +223,8 @@ pub extern "C" fn update(dt_ms: u32) {
 
     if let Some(player) = unsafe { PLAYER } {
         unsafe {
-            PLAYER_POS.x = (PLAYER_POS.x + movement.x * move_speed * dt).clamp(0.0, CHUNK_SIDE as f32 - 5.0);
-            PLAYER_POS.z = (PLAYER_POS.z + movement.z * move_speed * dt).clamp(0.0, CHUNK_SIDE as f32 - 3.0);
+            PLAYER_POS.x = (PLAYER_POS.x + movement.x * move_speed * dt).clamp(0.0, PLAY_SIDE as f32 - 5.0);
+            PLAYER_POS.z = (PLAYER_POS.z + movement.z * move_speed * dt).clamp(0.0, PLAY_SIDE as f32 - 3.0);
             actor_set_position(player, PLAYER_POS);
 
             // Face the direction of movement when walking.
@@ -343,6 +342,31 @@ fn build_dude(
         }
         x += 1;
     }
+}
+
+/// Plant a 5-tall trunk + leaf canopy + ruby cap centered at `(cx, cz)`.
+fn plant_tree(cx: u32, cz: u32) {
+    for y in 1..6 { set_voxel(UVec3::new(cx, y, cz), M_WOOD); }
+    let mut dy = 0;
+    while dy < 3 {
+        let r: i32 = if dy == 1 { 2 } else { 1 };
+        let y = 6 + dy as u32;
+        let mut dx = -r;
+        while dx <= r {
+            let mut dz = -r;
+            while dz <= r {
+                if dx * dx + dz * dz <= r * r + 1 {
+                    let x = (cx as i32 + dx) as u32;
+                    let z = (cz as i32 + dz) as u32;
+                    set_voxel(UVec3::new(x, y, z), M_LEAF);
+                }
+                dz += 1;
+            }
+            dx += 1;
+        }
+        dy += 1;
+    }
+    set_voxel(UVec3::new(cx, 9, cz), M_RUBY);
 }
 
 /// Build the barrel prefab into `buf`: WOOD bottom (y=0), GOLD body

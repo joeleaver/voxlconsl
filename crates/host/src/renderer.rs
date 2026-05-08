@@ -1,26 +1,24 @@
 //! Renderer — see SPEC.md §3.
 //!
-//! v0.0.7: a single-chunk pinhole-camera ray marcher with actor compositing
-//! and macro-grid actor binning (§11.6). Per-ray, we walk the macro-grid
-//! along the ray's path and gather only the actors whose AABBs overlap
-//! cells the ray actually enters; each candidate gets the same AABB →
-//! SVO-raycast pipeline as before. With one populated chunk in the
-//! current demo every actor is in cell (0, 0, 0), so the savings are
-//! purely structural — when multi-chunk worlds (§13.6) land the
-//! per-cell filtering becomes the real win.
+//! v0.0.8: pinhole-camera CPU ray marcher walking the **sparse 1024³
+//! voxel world** (§13.6). Per ray we use the macro-grid to step the
+//! 32³ chunk grid front-to-back; for each populated chunk we DDA the
+//! local SVO, and for each macro-cell we test the actors registered
+//! there. World voxels and actors participate in the same depth
+//! comparison, closest hit wins.
 //!
 //! TODO progression toward full §3:
-//!   - Multi-chunk world (§13.6) + per-chunk DDA across the macro-grid
 //!   - Real lighting model with shadows (§3.3)
 //!   - Sky gradient + sun disc (§3.4)
 //!   - Camera projections beyond perspective (§3.2)
 
-use voxlconsl_svo::{ChunkData, ray::RayHit};
+use voxlconsl_svo::{ray::RayHit, ChunkKey};
 use voxlconsl_types::{ActorId, Material, Vec3};
 
 use crate::actors::ActorTable;
 use crate::macro_grid::MacroGrid;
 use crate::palette::{SYSTEM_PALETTE, lit_color_index};
+use crate::world::ChunkState;
 
 pub const WIDTH: u32 = 256;
 pub const HEIGHT: u32 = 144;
@@ -42,8 +40,9 @@ impl Camera {
 
 /// World state the renderer reads from.
 pub struct Scene<'a> {
-    pub chunk: &'a ChunkData,
-    pub chunk_origin: Vec3,
+    /// Sparse chunk slot table indexed by `ChunkKey.0 as usize`. None
+    /// = uniform air. The macro-grid traversal indexes this directly.
+    pub chunks: &'a [Option<Box<ChunkState>>],
     pub actors: &'a ActorTable,
     pub macro_grid: &'a MacroGrid,
     pub materials: &'a [Material; 256],
@@ -100,10 +99,6 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
                 + basis.up * (-v * half_h))
                 .normalize();
 
-            // World chunk first.
-            let world_origin = camera.eye - scene.chunk_origin;
-            let mut closest = scene.chunk.raycast(world_origin, dir, max_t);
-
             // Bump the per-ray stamp. On wrap (every 256 rays) reset
             // `seen_actor` so old stamps don't ghost as "already seen."
             ray_stamp = ray_stamp.wrapping_add(1);
@@ -112,9 +107,31 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
                 ray_stamp = 1;
             }
 
-            // Walk the macro-grid; for each cell the ray enters, fold
-            // its actor candidates into the depth comparison.
+            // Walk the macro-grid front-to-back; for each cell, test
+            // the world chunk that lives there (if any), then the
+            // actors binned into that cell. The cell-side traversal
+            // is the chunk-side traversal — they share a coord system.
+            let mut closest: Option<RayHit> = None;
             for (cx, cy, cz) in scene.macro_grid.ray_iter(camera.eye, dir, max_t) {
+                let bound = closest.as_ref().map(|h| h.t).unwrap_or(max_t);
+
+                // World chunk in this cell.
+                let key = ChunkKey::new(cx as u8, cy as u8, cz as u8);
+                if let Some(cs) = scene.chunks[key.0 as usize].as_deref() {
+                    let chunk_origin = Vec3::new(
+                        cx as f32 * 32.0,
+                        cy as f32 * 32.0,
+                        cz as f32 * 32.0,
+                    );
+                    let local_origin = camera.eye - chunk_origin;
+                    if let Some(hit) = cs.chunk.raycast(local_origin, dir, bound) {
+                        if closest.as_ref().map(|c| hit.t < c.t).unwrap_or(true) {
+                            closest = Some(hit);
+                        }
+                    }
+                }
+
+                // Actors binned into this cell.
                 let bound = closest.as_ref().map(|h| h.t).unwrap_or(max_t);
                 for &actor_idx in scene.macro_grid.cell_actors(cx, cy, cz) {
                     let i = actor_idx as usize;

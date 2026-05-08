@@ -64,8 +64,7 @@ impl BrowserHost {
         world.macro_grid.rebuild(&world.actors);
 
         let scene = Scene {
-            chunk: world.chunk(),
-            chunk_origin: voxlconsl_types::Vec3::ZERO,
+            chunks: world.chunks_slice(),
             actors: &world.actors,
             macro_grid: &world.macro_grid,
             materials: &world.materials,
