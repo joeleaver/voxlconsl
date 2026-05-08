@@ -1,0 +1,15 @@
+[package]
+name = "voxlconsl-bundler"
+description = "Reads a cart project directory and produces a .voxl binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+voxlconsl-types = { workspace = true, features = ["bytemuck"] }
+voxlconsl-svo = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }

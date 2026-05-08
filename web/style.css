@@ -1,0 +1,39 @@
+html, body {
+    margin: 0;
+    padding: 0;
+    background: #0a0a0a;
+    color: #ddd;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    height: 100%;
+}
+
+main {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 1rem;
+    min-height: 100vh;
+}
+
+.screen-frame {
+    /* Fixed 4× upscale of the 256×144 framebuffer. */
+    width: 1024px;
+    height: 576px;
+    box-shadow: 0 0 0 1px #333, 0 8px 40px rgba(0, 0, 0, 0.6);
+    background: #000;
+}
+
+#screen {
+    width: 100%;
+    height: 100%;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    display: block;
+}
+
+#status {
+    font-size: 0.8rem;
+    color: #888;
+    letter-spacing: 0.05em;
+}

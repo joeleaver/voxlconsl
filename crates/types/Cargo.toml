@@ -1,0 +1,17 @@
+[package]
+name = "voxlconsl-types"
+description = "Shared types for the voxlconsl fantasy console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytemuck = { workspace = true, optional = true }
+libm = "0.2"
+
+[features]
+# When enabled, common POD types implement Pod/Zeroable so they can be
+# memcpy'd into the cart binary or DMA'd to a framebuffer without ceremony.
+bytemuck = ["dep:bytemuck"]

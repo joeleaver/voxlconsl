@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/svo",
+    "crates/host",
+    "crates/host-browser",
+    "crates/sdk",
+    "crates/bundler",
+    "crates/cli",
+    "examples/hello-cube",
+]
+
+# host-browser and example carts are wasm32-only cdylibs. Keep them out of the
+# default `cargo build` so plain `cargo check`/`cargo build` from the workspace
+# root still work for the native crates.
+default-members = [
+    "crates/types",
+    "crates/svo",
+    "crates/host",
+    "crates/sdk",
+    "crates/bundler",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/joeleaver/voxlconsl"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates — referenced from siblings via path
+voxlconsl-types = { path = "crates/types", version = "0.0.1" }
+voxlconsl-svo = { path = "crates/svo", version = "0.0.1" }
+voxlconsl-host = { path = "crates/host", version = "0.0.1" }
+voxlconsl-sdk = { path = "crates/sdk", version = "0.0.1" }
+voxlconsl-bundler = { path = "crates/bundler", version = "0.0.1" }
+
+# Third-party — pinned at workspace level so all crates use the same version
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

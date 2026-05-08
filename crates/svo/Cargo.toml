@@ -1,0 +1,11 @@
+[package]
+name = "voxlconsl-svo"
+description = "Sparse voxel octree — canonical voxel storage for voxlconsl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+voxlconsl-types = { workspace = true }

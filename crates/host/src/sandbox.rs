@@ -1,0 +1,298 @@
+//! Cart sandbox — runs cart `.wasm` modules under `wasmi`.
+//!
+//! See SPEC.md §9 (browser host) and §8 (host API surface).
+//!
+//! v0.0.3 surface (cart imports):
+//!
+//!   set_voxel(x, y, z, material)
+//!   fill_box(min_x, min_y, min_z, max_x, max_y, max_z, material)
+//!   clear_world()
+//!   material_define(slot, color, emission, flags)
+//!   camera_set_lookat(ex, ey, ez, tx, ty, tz, ux, uy, uz)
+//!   camera_set_fov(fov_y_deg)
+//!   light_set_sun(dx, dy, dz, _color, _intensity)
+//!   sky_set_gradient(top, horizon)
+//!
+//! v0.0.3 cart exports: `init`, `update(dt_ms)`, `render()`.
+
+use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
+
+use voxlconsl_types::{ActionKind, BindingHint, Material, MaterialFlags, Vec3};
+
+use crate::renderer::Camera;
+use crate::world::WorldState;
+
+/// A loaded, ready-to-tick cart.
+///
+/// `init` has already been called by `Cart::load`; what remains is per-frame
+/// `update` and `render`.
+pub struct Cart {
+    store: Store<WorldState>,
+    update_fn: TypedFunc<u32, ()>,
+    render_fn: TypedFunc<(), ()>,
+}
+
+#[derive(Debug)]
+pub enum CartError {
+    Wasm(wasmi::Error),
+    MissingExport(&'static str),
+}
+
+impl From<wasmi::Error> for CartError {
+    fn from(e: wasmi::Error) -> Self { Self::Wasm(e) }
+}
+
+impl Cart {
+    /// Load and instantiate a cart from raw `.wasm` bytes. Calls the cart's
+    /// `init` export immediately so the cart can populate the world.
+    pub fn load(wasm_bytes: &[u8]) -> Result<Self, CartError> {
+        let engine = Engine::default();
+        let module = Module::new(&engine, wasm_bytes)?;
+        let mut store = Store::new(&engine, WorldState::new());
+
+        let mut linker = Linker::new(&engine);
+        register_host_imports(&mut linker)?;
+
+        let pre = linker.instantiate(&mut store, &module)?;
+        let instance = pre.start(&mut store)?;
+
+        let init_fn = instance
+            .get_typed_func::<(), ()>(&store, "init")
+            .map_err(|_| CartError::MissingExport("init"))?;
+        let update_fn = instance
+            .get_typed_func::<u32, ()>(&store, "update")
+            .map_err(|_| CartError::MissingExport("update"))?;
+        let render_fn = instance
+            .get_typed_func::<(), ()>(&store, "render")
+            .map_err(|_| CartError::MissingExport("render"))?;
+
+        // Run cart init() so it can populate the world.
+        init_fn.call(&mut store, ())?;
+
+        Ok(Self { store, update_fn, render_fn })
+    }
+
+    pub fn update(&mut self, dt_ms: u32) -> Result<(), CartError> {
+        self.update_fn.call(&mut self.store, dt_ms)?;
+        Ok(())
+    }
+
+    pub fn render(&mut self) -> Result<(), CartError> {
+        self.render_fn.call(&mut self.store, ())?;
+        Ok(())
+    }
+
+    pub fn world(&mut self) -> &mut WorldState {
+        self.store.data_mut()
+    }
+}
+
+fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::Error> {
+    // World mutation (§3.6)
+    linker.func_wrap(
+        "env", "set_voxel",
+        |mut caller: Caller<WorldState>, x: u32, y: u32, z: u32, material: u32| {
+            caller.data_mut().set_voxel(x, y, z, material as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "fill_box",
+        |mut caller: Caller<WorldState>,
+         min_x: u32, min_y: u32, min_z: u32,
+         max_x: u32, max_y: u32, max_z: u32,
+         material: u32| {
+            caller.data_mut().fill_box(min_x, min_y, min_z, max_x, max_y, max_z, material as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "clear_world",
+        |mut caller: Caller<WorldState>| {
+            caller.data_mut().clear_world();
+        },
+    )?;
+
+    // Material table (v0.0.3 placeholder for materials.toml-driven loading)
+    linker.func_wrap(
+        "env", "material_define",
+        |mut caller: Caller<WorldState>,
+         slot: u32, color: u32, emission: u32, flags: u32| {
+            let mat = Material {
+                color: color as u8,
+                emission: emission as u8,
+                flags: MaterialFlags(flags as u16),
+                ca_threshold: 0,
+                ca_lifetime: 0,
+                ca_viscosity: 0,
+                _reserved: [0; 9],
+            };
+            caller.data_mut().set_material(slot as u8, mat);
+        },
+    )?;
+
+    // Camera (§3.2)
+    linker.func_wrap(
+        "env", "camera_set_lookat",
+        |mut caller: Caller<WorldState>,
+         ex: f32, ey: f32, ez: f32,
+         tx: f32, ty: f32, tz: f32,
+         ux: f32, uy: f32, uz: f32| {
+            let world = caller.data_mut();
+            world.camera = Camera {
+                eye: Vec3::new(ex, ey, ez),
+                target: Vec3::new(tx, ty, tz),
+                up: Vec3::new(ux, uy, uz),
+                fov_y_deg: world.camera.fov_y_deg,
+            };
+        },
+    )?;
+    linker.func_wrap(
+        "env", "camera_set_fov",
+        |mut caller: Caller<WorldState>, fov_y_deg: f32| {
+            caller.data_mut().camera.fov_y_deg = fov_y_deg;
+        },
+    )?;
+
+    // Lighting (§3.3) — color/intensity unused in v0.0.3's flat model
+    linker.func_wrap(
+        "env", "light_set_sun",
+        |mut caller: Caller<WorldState>,
+         dx: f32, dy: f32, dz: f32,
+         _color: u32, _intensity: u32| {
+            caller.data_mut().sun_dir = Vec3::new(dx, dy, dz);
+        },
+    )?;
+
+    // Sky (§3.4)
+    linker.func_wrap(
+        "env", "sky_set_gradient",
+        |mut caller: Caller<WorldState>, top: u32, horizon: u32| {
+            let world = caller.data_mut();
+            world.sky_top = top as u8;
+            world.sky_horizon = horizon as u8;
+        },
+    )?;
+
+    // Input (§6) — declaration is one-action-at-a-time; cart calls
+    // input_declare_action N times during init() and stores the handles.
+    linker.func_wrap(
+        "env", "input_declare_action",
+        |mut caller: Caller<WorldState>,
+         kind: u32, hint: u32, name_ptr: u32, name_len: u32| -> u32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return u32::MAX,
+            };
+            let mut buf = vec![0u8; name_len as usize];
+            if memory.read(&caller, name_ptr as usize, &mut buf).is_err() {
+                return u32::MAX;
+            }
+            let name = String::from_utf8_lossy(&buf).into_owned();
+            let kind = match kind {
+                0 => ActionKind::Button,
+                1 => ActionKind::Axis1D,
+                2 => ActionKind::Axis2D,
+                3 => ActionKind::Pointer,
+                _ => return u32::MAX,
+            };
+            let hint = match hint {
+                0 => BindingHint::None,
+                1 => BindingHint::PrimaryMovement,
+                2 => BindingHint::Aim,
+                3 => BindingHint::PrimaryFire,
+                4 => BindingHint::SecondaryFire,
+                5 => BindingHint::Confirm,
+                6 => BindingHint::Cancel,
+                7 => BindingHint::Menu,
+                8 => BindingHint::Pause,
+                9 => BindingHint::PointerOnly,
+                _ => BindingHint::None,
+            };
+            caller.data_mut().input.declare(name, kind, hint).0
+        },
+    )?;
+    linker.func_wrap(
+        "env", "input_action_button",
+        |caller: Caller<WorldState>, h: u32| -> u32 {
+            caller.data().input.button(voxlconsl_types::ActionHandle(h)) as u32
+        },
+    )?;
+    linker.func_wrap(
+        "env", "input_action_pressed",
+        |caller: Caller<WorldState>, h: u32| -> u32 {
+            caller.data().input.button_pressed(voxlconsl_types::ActionHandle(h)) as u32
+        },
+    )?;
+    linker.func_wrap(
+        "env", "input_action_released",
+        |caller: Caller<WorldState>, h: u32| -> u32 {
+            caller.data().input.button_released(voxlconsl_types::ActionHandle(h)) as u32
+        },
+    )?;
+    linker.func_wrap(
+        "env", "input_action_held_ms",
+        |caller: Caller<WorldState>, h: u32| -> u32 {
+            caller.data().input.button_held_ms(voxlconsl_types::ActionHandle(h))
+        },
+    )?;
+    linker.func_wrap(
+        "env", "input_action_axis1d",
+        |caller: Caller<WorldState>, h: u32| -> f32 {
+            caller.data().input.axis1d(voxlconsl_types::ActionHandle(h))
+        },
+    )?;
+    linker.func_wrap(
+        "env", "input_action_axis2d",
+        |mut caller: Caller<WorldState>, h: u32, out_x: u32, out_y: u32| {
+            let (x, y) = caller.data().input.axis2d(voxlconsl_types::ActionHandle(h));
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return,
+            };
+            let _ = memory.write(&mut caller, out_x as usize, &x.to_le_bytes());
+            let _ = memory.write(&mut caller, out_y as usize, &y.to_le_bytes());
+        },
+    )?;
+    linker.func_wrap(
+        "env", "input_action_active",
+        |caller: Caller<WorldState>, h: u32| -> u32 {
+            caller.data().input.is_active(voxlconsl_types::ActionHandle(h)) as u32
+        },
+    )?;
+
+    // Misc (§8.3)
+    linker.func_wrap(
+        "env", "log",
+        |caller: Caller<WorldState>, ptr: u32, len: u32| {
+            // Read the cart's memory at [ptr, ptr+len) as UTF-8 and emit it.
+            // Best-effort; ignore errors silently.
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return,
+            };
+            let mut buf = vec![0u8; len as usize];
+            if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+                return;
+            }
+            // Best-effort UTF-8; just dump bytes if invalid.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let s = String::from_utf8_lossy(&buf);
+                web_sys_log(&format!("[cart] {s}"));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let s = String::from_utf8_lossy(&buf);
+                eprintln!("[cart] {s}");
+            }
+        },
+    )?;
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn web_sys_log(_msg: &str) {
+    // The `voxlconsl-host` crate avoids depending on web-sys; the browser
+    // host crate sets this up. For now, drop the message — TODO: thread
+    // through via a host-provided log callback.
+}
