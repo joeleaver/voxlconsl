@@ -5,21 +5,25 @@ html, body {
     color: #ddd;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     height: 100%;
+    overflow: hidden;
 }
 
 main {
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 1rem;
     min-height: 100vh;
+    box-sizing: border-box;
 }
 
 .screen-frame {
-    /* Fixed 4× upscale of the 256×144 framebuffer. */
-    width: 1024px;
-    height: 576px;
+    /* Fixed 4× upscale of the 256×144 framebuffer. The screen frame is
+       exactly 1024×576 — no extra chrome — so it fits a 16:9 iframe
+       without needing scrollbars. The status text overlays the canvas. */
+    position: relative;
+    width: min(1024px, 100vw);
+    aspect-ratio: 16 / 9;
+    max-height: 100vh;
     box-shadow: 0 0 0 1px #333, 0 8px 40px rgba(0, 0, 0, 0.6);
     background: #000;
 }
@@ -33,7 +37,15 @@ main {
 }
 
 #status {
-    font-size: 0.8rem;
-    color: #888;
-    letter-spacing: 0.05em;
+    position: absolute;
+    bottom: 0.4rem;
+    left: 0;
+    right: 0;
+    font-size: 0.7rem;
+    line-height: 1;
+    color: rgba(255, 255, 255, 0.55);
+    text-align: center;
+    pointer-events: none;
+    text-shadow: 0 0 4px rgba(0, 0, 0, 0.9);
+    letter-spacing: 0.04em;
 }

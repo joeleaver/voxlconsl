@@ -2,7 +2,9 @@
 
 A fantasy console where the only graphics primitive is a voxel.
 
-The platform spec is `SPEC.md` at the project root. Code in `crates/` implements that spec.
+- **Live emulator + docs:** [joeleaver.github.io/voxlconsl](https://joeleaver.github.io/voxlconsl/)
+- **Specification:** [`SPEC.md`](SPEC.md) at the project root.
+- Code in `crates/` implements that spec; `examples/hello-cube/` is the first cart.
 
 ## Workspace
 

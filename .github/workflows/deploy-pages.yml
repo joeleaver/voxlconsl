@@ -1,0 +1,85 @@
+name: Deploy site to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Single concurrency group — never run two deploys against each other.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install wasm-bindgen-cli + mdbook (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.100,mdbook@0.4
+
+      - name: Build the browser emulator
+        run: ./scripts/build-web.sh release
+
+      - name: Stage the spec into the book source
+        # docs/src/spec.md is a symlink to ../../SPEC.md. Replace it with
+        # a real file so mdbook + actions/upload-pages-artifact handle it
+        # uniformly even on platforms that mishandle symlinks.
+        run: |
+          rm -f docs/src/spec.md
+          cp SPEC.md docs/src/spec.md
+
+      - name: Build the mdBook
+        run: mdbook build docs
+
+      - name: Assemble the deploy directory
+        # Layout:
+        #   site/                <- mdBook output
+        #   site/emulator/       <- web/ shell + wasm-bindgen output
+        run: |
+          mkdir -p site
+          cp -r docs/book/* site/
+          mkdir -p site/emulator
+          cp -r web/* site/emulator/
+          # Drop a trivial .nojekyll so files starting with `_` are served.
+          touch site/.nojekyll
+
+      - name: Upload artifact for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

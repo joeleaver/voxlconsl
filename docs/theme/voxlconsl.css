@@ -1,0 +1,51 @@
+/* voxlconsl mdBook theme overrides */
+
+.vx-hero {
+    margin: 1.5rem 0 2rem;
+    padding: 1rem;
+    background: var(--quote-bg);
+    border-left: 4px solid var(--icons-hover);
+    border-radius: 4px;
+    text-align: center;
+}
+
+.vx-emulator-embed {
+    width: 100%;
+    max-width: 1024px;
+    aspect-ratio: 16 / 9;
+    border: 1px solid var(--table-border-color);
+    background: #000;
+    display: block;
+    margin: 0 auto;
+    /* Pixelated upscale of the host's framebuffer. */
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+}
+
+.vx-hero-caption {
+    margin-top: 0.75rem;
+    font-size: 0.9rem;
+    color: var(--fg);
+    opacity: 0.85;
+}
+
+kbd {
+    display: inline-block;
+    padding: 0.1em 0.5em;
+    border: 1px solid var(--table-border-color);
+    border-radius: 3px;
+    background: var(--quote-bg);
+    font-family: var(--mono-font);
+    font-size: 0.85em;
+    line-height: 1;
+}
+
+/* Tighten up dense tables a touch. */
+.content table {
+    margin: 1rem 0;
+}
+
+.content table td,
+.content table th {
+    padding: 0.4rem 0.6rem;
+}
