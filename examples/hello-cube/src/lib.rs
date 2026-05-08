@@ -20,10 +20,12 @@ const M_RUBY:  u8 = 4;
 const M_GOLD:  u8 = 5;
 const M_GRASS: u8 = 6;
 
-// Camera state — driven by input each frame.
-static mut CAM_YAW: f32 = 0.0;          // around world Y
-static mut CAM_PITCH: f32 = 0.4;        // looking slightly down
-static mut CAM_DISTANCE: f32 = 38.0;    // orbit radius
+// Camera state — driven by input each frame. Initial values pick a nice
+// 3/4 orbit angle so the first rendered frame already shows the scene
+// well (instead of looking dead-on at the tree's face from yaw = 0).
+static mut CAM_YAW: f32 = 0.7;          // around world Y
+static mut CAM_PITCH: f32 = 0.5;        // looking slightly down
+static mut CAM_DISTANCE: f32 = 26.0;    // orbit radius
 
 // Action handles — populated in init(), read in update/render.
 static mut MOVE_ACTION: ActionHandle = ActionHandle(0);
