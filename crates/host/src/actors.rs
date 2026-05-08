@@ -467,6 +467,24 @@ impl ActorTable {
         self.slots.iter().filter_map(|s| s.as_ref()).filter(|a| a.visible)
     }
 
+    /// Visit every visible actor along with its slot index. The slot
+    /// index is what the macro-grid stores per cell, and what the
+    /// renderer uses to look the actor back up via `get(ActorId(idx))`.
+    pub fn for_each_visible_with_index(&self, mut f: impl FnMut(u32, &Actor)) {
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(actor) = slot {
+                if actor.visible {
+                    f(i as u32, actor);
+                }
+            }
+        }
+    }
+
+    /// Maximum addressable slot count. Used by callers that need a
+    /// dense per-actor scratch array (e.g. the renderer's per-ray
+    /// dedup bitset).
+    pub fn capacity(&self) -> usize { self.slots.len() }
+
     /// Flush every dirty Owned actor's SVO. Call once per frame before render.
     /// Shared actors are no-ops (their SVO is immutable).
     pub fn flush_all(&mut self) {

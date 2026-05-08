@@ -1,21 +1,25 @@
 //! Renderer — see SPEC.md §3.
 //!
-//! v0.0.4: a single-chunk pinhole-camera ray marcher with actor compositing.
-//! For each ray we trace the world chunk and every visible actor's volume,
-//! keeping the closest hit. Macro-grid binning (§11.6) is TODO; v0.0.4
-//! tests every actor against every ray, which is fine at small actor counts.
+//! v0.0.7: a single-chunk pinhole-camera ray marcher with actor compositing
+//! and macro-grid actor binning (§11.6). Per-ray, we walk the macro-grid
+//! along the ray's path and gather only the actors whose AABBs overlap
+//! cells the ray actually enters; each candidate gets the same AABB →
+//! SVO-raycast pipeline as before. With one populated chunk in the
+//! current demo every actor is in cell (0, 0, 0), so the savings are
+//! purely structural — when multi-chunk worlds (§13.6) land the
+//! per-cell filtering becomes the real win.
 //!
 //! TODO progression toward full §3:
-//!   - Multi-chunk world (§13.6)
-//!   - Macro-grid actor binning (§11.6)
+//!   - Multi-chunk world (§13.6) + per-chunk DDA across the macro-grid
 //!   - Real lighting model with shadows (§3.3)
 //!   - Sky gradient + sun disc (§3.4)
 //!   - Camera projections beyond perspective (§3.2)
 
 use voxlconsl_svo::{ChunkData, ray::RayHit};
-use voxlconsl_types::{Material, Vec3};
+use voxlconsl_types::{ActorId, Material, Vec3};
 
-use crate::actors::{Actor, ActorTable};
+use crate::actors::ActorTable;
+use crate::macro_grid::MacroGrid;
 use crate::palette::{SYSTEM_PALETTE, lit_color_index};
 
 pub const WIDTH: u32 = 256;
@@ -41,6 +45,7 @@ pub struct Scene<'a> {
     pub chunk: &'a ChunkData,
     pub chunk_origin: Vec3,
     pub actors: &'a ActorTable,
+    pub macro_grid: &'a MacroGrid,
     pub materials: &'a [Material; 256],
     pub sun_dir: Vec3,
     /// Sky color shown when a ray misses everything. Palette index.
@@ -64,13 +69,24 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
     let sun_dir = scene.sun_dir.normalize();
     let sky_rgb = SYSTEM_PALETTE[scene.sky.min(63) as usize];
 
-    // Collect visible actors with their world AABBs once per frame so we
-    // don't recompute them for every ray. v0.0.4 macro-grid binning is TBD.
-    let mut visible_actors: Vec<(&Actor, Vec3, Vec3)> = Vec::with_capacity(64);
-    for a in scene.actors.iter_visible() {
-        let (mn, mx) = a.world_aabb();
-        visible_actors.push((a, mn, mx));
-    }
+    // Pre-compute world AABBs for every visible actor so the per-ray
+    // pass doesn't redo the corner transforms. The actor index is the
+    // slot index, matching what the macro-grid stores.
+    let mut actor_aabbs: Vec<(Vec3, Vec3)> = Vec::with_capacity(scene.actors.capacity());
+    actor_aabbs.resize(scene.actors.capacity(), (Vec3::ZERO, Vec3::ZERO));
+    let mut actor_present: Vec<bool> = vec![false; scene.actors.capacity()];
+    scene.actors.for_each_visible_with_index(|i, a| {
+        actor_aabbs[i as usize] = a.world_aabb();
+        actor_present[i as usize] = true;
+    });
+
+    // Per-ray "already considered" bitmap. We iterate the macro-grid
+    // cells along each ray and an actor can appear in several cells; the
+    // bitset turns those duplicates into O(1) skips.
+    let mut seen_actor: Vec<u8> = vec![0; scene.actors.capacity()];
+    // Stamp counter — bumped per ray. Avoids the cost of clearing
+    // `seen_actor` to zero each ray.
+    let mut ray_stamp: u8 = 0;
 
     let max_t = 1024.0;
 
@@ -88,22 +104,47 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
             let world_origin = camera.eye - scene.chunk_origin;
             let mut closest = scene.chunk.raycast(world_origin, dir, max_t);
 
-            // Each visible actor.
-            for &(actor, ref aabb_min, ref aabb_max) in &visible_actors {
+            // Bump the per-ray stamp. On wrap (every 256 rays) reset
+            // `seen_actor` so old stamps don't ghost as "already seen."
+            ray_stamp = ray_stamp.wrapping_add(1);
+            if ray_stamp == 0 {
+                seen_actor.iter_mut().for_each(|s| *s = 0);
+                ray_stamp = 1;
+            }
+
+            // Walk the macro-grid; for each cell the ray enters, fold
+            // its actor candidates into the depth comparison.
+            for (cx, cy, cz) in scene.macro_grid.ray_iter(camera.eye, dir, max_t) {
                 let bound = closest.as_ref().map(|h| h.t).unwrap_or(max_t);
-                if !ray_aabb_hit(camera.eye, dir, *aabb_min, *aabb_max, bound) {
-                    continue;
-                }
-                let (lo, ld) = actor.world_to_local_ray(camera.eye, dir);
-                if let Some(mut hit) = actor.chunk().raycast(lo, ld, bound) {
-                    // Rotate the hit's local-space normal back into world space
-                    // for lighting math. The hit's `t` is preserved across
-                    // pure-rotation transforms.
-                    let nl = Vec3::new(hit.normal.0 as f32, hit.normal.1 as f32, hit.normal.2 as f32);
-                    let nw = actor.local_to_world_normal(nl);
-                    hit.normal = (nw.x.round() as i32, nw.y.round() as i32, nw.z.round() as i32);
-                    if closest.as_ref().map(|c| hit.t < c.t).unwrap_or(true) {
-                        closest = Some(hit);
+                for &actor_idx in scene.macro_grid.cell_actors(cx, cy, cz) {
+                    let i = actor_idx as usize;
+                    if seen_actor[i] == ray_stamp { continue; }
+                    seen_actor[i] = ray_stamp;
+                    if !actor_present[i] { continue; }
+                    let (aabb_min, aabb_max) = actor_aabbs[i];
+                    if !ray_aabb_hit(camera.eye, dir, aabb_min, aabb_max, bound) {
+                        continue;
+                    }
+                    let actor = match scene.actors.get(ActorId(actor_idx)) {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let (lo, ld) = actor.world_to_local_ray(camera.eye, dir);
+                    if let Some(mut hit) = actor.chunk().raycast(lo, ld, bound) {
+                        let nl = Vec3::new(
+                            hit.normal.0 as f32,
+                            hit.normal.1 as f32,
+                            hit.normal.2 as f32,
+                        );
+                        let nw = actor.local_to_world_normal(nl);
+                        hit.normal = (
+                            nw.x.round() as i32,
+                            nw.y.round() as i32,
+                            nw.z.round() as i32,
+                        );
+                        if closest.as_ref().map(|c| hit.t < c.t).unwrap_or(true) {
+                            closest = Some(hit);
+                        }
                     }
                 }
             }

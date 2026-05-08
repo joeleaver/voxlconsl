@@ -11,6 +11,7 @@ use voxlconsl_types::{Material, Vec3};
 
 use crate::actors::ActorTable;
 use crate::input::InputState;
+use crate::macro_grid::MacroGrid;
 use crate::prefabs::PrefabTable;
 use crate::renderer::Camera;
 
@@ -33,6 +34,7 @@ pub struct WorldState {
     pub input: InputState,
     pub actors: ActorTable,
     pub prefabs: PrefabTable,
+    pub macro_grid: MacroGrid,
     dirty: bool,
 }
 
@@ -53,6 +55,7 @@ impl WorldState {
             input: InputState::new(),
             actors: ActorTable::new(),
             prefabs: PrefabTable::new(),
+            macro_grid: MacroGrid::new(),
             dirty: true,
         }
     }

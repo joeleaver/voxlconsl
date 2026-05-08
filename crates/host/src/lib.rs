@@ -19,6 +19,7 @@ pub mod audio;
 pub mod input;
 pub mod physics;
 pub mod actors;
+pub mod macro_grid;
 pub mod prefabs;
 pub mod runtime;
 pub mod world;
