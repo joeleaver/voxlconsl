@@ -9,6 +9,7 @@ members = [
     "crates/bundler",
     "crates/cli",
     "examples/hello-cube",
+    "examples/big-world",
 ]
 
 # host-browser and example carts are wasm32-only cdylibs. Keep them out of the

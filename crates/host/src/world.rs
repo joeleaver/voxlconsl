@@ -1,7 +1,7 @@
 //! World state shared between cart-driven mutation and the renderer.
 //!
-//! v0.0.9: cart-managed multi-scene model. The cart can address up to
-//! **256 scenes**, each a 1024³ voxel grid (sparse 32³ chunk grid per
+//! v0.1.0: cart-managed multi-scene model. The cart can address up to
+//! **256 scenes**, each a 512³ voxel grid (sparse 16³ chunk grid per
 //! SPEC.md §13.6). All voxel mutations target the **active scene**;
 //! `scene_set_active(id)` switches the active scene and lazy-allocates
 //! it on first touch.
@@ -17,10 +17,10 @@
 //! - `scenes: Vec<Option<Box<Scene>>>` length 256 — 2 KB upfront slot
 //!   table, niche-optimized to 8 bytes per slot.
 //! - Each populated `Scene` holds its own `Vec<Option<Box<ChunkState>>>`
-//!   length 32768 — 256 KB per scene; only populated chunks add their
+//!   length 4096 — 32 KB per scene; only populated chunks add their
 //!   ~33 KB dense buffer.
-//! - Worst case (all 256 scenes populated): 64 MB just for slot tables,
-//!   plus chunk dense data. Practical carts populate a handful.
+//! - Worst case (all 256 scenes populated): 8 MB for slot tables, plus
+//!   chunk dense data. Practical carts populate a handful.
 
 use voxlconsl_svo::{build, ChunkData, ChunkKey};
 use voxlconsl_types::{Material, Vec3};
@@ -33,9 +33,9 @@ use crate::renderer::Camera;
 
 const CHUNK_SIDE: u32 = build::CHUNK_SIZE;
 const CHUNK_VOXELS: usize = (CHUNK_SIDE * CHUNK_SIDE * CHUNK_SIDE) as usize;
-const WORLD_CHUNKS: u32 = 32;
+const WORLD_CHUNKS: u32 = 16;
 const N_CHUNKS: usize = (WORLD_CHUNKS * WORLD_CHUNKS * WORLD_CHUNKS) as usize;
-/// World side in voxels per scene (1024).
+/// World side in voxels per scene (512).
 pub const WORLD_SIDE: u32 = WORLD_CHUNKS * CHUNK_SIDE;
 /// Maximum number of scenes per cart.
 pub const MAX_SCENES: usize = 256;

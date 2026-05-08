@@ -114,8 +114,8 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
-    // Scenes (§3.6) — multi-scene mutable voxel grids. Each scene is a
-    // 1024³ world; the cart can address up to 256 of them. Mutations
+    // Scenes (§3.7) — multi-scene mutable voxel grids. Each scene is a
+    // 512³ world; the cart can address up to 256 of them. Mutations
     // and the renderer always target the active scene.
     linker.func_wrap(
         "env", "scene_set_active",

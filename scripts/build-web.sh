@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Build the browser host and wire up the wasm-bindgen JS shim.
 #
+# Usage:
+#   ./scripts/build-web.sh                          # release, hello-cube
+#   ./scripts/build-web.sh release big-world        # release, big-world cart
+#   ./scripts/build-web.sh debug                    # debug, hello-cube
+#   CART=big-world ./scripts/build-web.sh release   # env-var form
+#
 # Steps:
 #   1. Build the example cart (wasm32, release).
 #   2. Copy the cart's .wasm into a stable location for `include_bytes!`.
@@ -23,12 +29,13 @@ case "$PROFILE" in
         OUT_DIR="target/wasm32-unknown-unknown/debug"
         ;;
     *)
-        echo "usage: $0 [release|debug]" >&2
+        echo "usage: $0 [release|debug] [cart-name]" >&2
         exit 1
         ;;
 esac
 
-CART="${CART:-hello-cube}"
+# Cart name: positional second arg wins, then $CART env var, then default.
+CART="${2:-${CART:-hello-cube}}"
 EMBEDDED_WASM="crates/host-browser/embedded-cart.wasm"
 
 echo "[build-web] building cart: $CART ($PROFILE)..."

@@ -104,20 +104,21 @@ pub fn child_offset(valid_mask: u8, octant: u8) -> Option<u8> {
     Some(lower.count_ones() as u8)
 }
 
-/// 15-bit packed `(cx, cy, cz)` chunk coordinate, 5 bits per axis. See §13.6.
+/// 12-bit packed `(cx, cy, cz)` chunk coordinate, 4 bits per axis (16
+/// chunks per axis × 32 voxels each = 512³ world). See §13.6.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ChunkKey(pub u16);
 
 impl ChunkKey {
     pub const fn new(cx: u8, cy: u8, cz: u8) -> Self {
-        debug_assert!(cx < 32 && cy < 32 && cz < 32);
-        Self((cx as u16) | ((cy as u16) << 5) | ((cz as u16) << 10))
+        debug_assert!(cx < 16 && cy < 16 && cz < 16);
+        Self((cx as u16) | ((cy as u16) << 4) | ((cz as u16) << 8))
     }
 
-    pub const fn cx(self) -> u8 { (self.0 & 0x1F) as u8 }
-    pub const fn cy(self) -> u8 { ((self.0 >> 5) & 0x1F) as u8 }
-    pub const fn cz(self) -> u8 { ((self.0 >> 10) & 0x1F) as u8 }
+    pub const fn cx(self) -> u8 { (self.0 & 0x0F) as u8 }
+    pub const fn cy(self) -> u8 { ((self.0 >> 4) & 0x0F) as u8 }
+    pub const fn cz(self) -> u8 { ((self.0 >> 8) & 0x0F) as u8 }
 }
 
 // TODO: incremental mutation (§13.5) — descend / set / collapse upward
@@ -160,9 +161,10 @@ mod tests {
 
     #[test]
     fn chunk_key_round_trip() {
-        let k = ChunkKey::new(5, 12, 31);
+        // 4 bits per axis → max 15 per coord.
+        let k = ChunkKey::new(5, 12, 15);
         assert_eq!(k.cx(), 5);
         assert_eq!(k.cy(), 12);
-        assert_eq!(k.cz(), 31);
+        assert_eq!(k.cz(), 15);
     }
 }

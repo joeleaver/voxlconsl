@@ -1,6 +1,6 @@
 //! Renderer — see SPEC.md §3.
 //!
-//! v0.0.8: pinhole-camera CPU ray marcher walking the **sparse 1024³
+//! v0.1.0: pinhole-camera CPU ray marcher walking the **sparse 512³
 //! voxel world** (§13.6). Per ray we use the macro-grid to step the
 //! 32³ chunk grid front-to-back; for each populated chunk we DDA the
 //! local SVO, and for each macro-cell we test the actors registered
@@ -87,7 +87,8 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
     // `seen_actor` to zero each ray.
     let mut ray_stamp: u8 = 0;
 
-    let max_t = 1024.0;
+    // Generous cap; macro_grid::ray_iter clips to WORLD_SIDE internally.
+    let max_t = 512.0;
 
     for py in 0..HEIGHT {
         let v = ((py as f32 + 0.5) / HEIGHT as f32) * 2.0 - 1.0;

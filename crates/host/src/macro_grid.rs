@@ -1,7 +1,7 @@
 //! Macro-grid actor binning — see SPEC.md §11.6.
 //!
-//! A coarse 32³ grid of cells (32 world voxels per cell) covering the
-//! full 1024³ world. Each frame the host bins every visible actor's
+//! A coarse 16³ grid of cells (32 world voxels per cell) covering the
+//! full 512³ world. Each frame the host bins every visible actor's
 //! world-space AABB into the cells it overlaps; per-ray traversal then
 //! walks the macro-grid via Amanatides–Woo, gathering candidate actor
 //! IDs only from cells the ray enters.
@@ -19,8 +19,8 @@ use voxlconsl_types::Vec3;
 
 use crate::actors::ActorTable;
 
-/// Cells per axis. `MACRO_SIDE * CELL_VOXELS = 1024` (the world side).
-pub const MACRO_SIDE: u32 = 32;
+/// Cells per axis. `MACRO_SIDE * CELL_VOXELS = 512` (the world side).
+pub const MACRO_SIDE: u32 = 16;
 /// World voxels per macro-cell along one axis.
 pub const CELL_VOXELS: f32 = 32.0;
 /// Total world side in voxels (covered by the macro-grid).
@@ -406,8 +406,8 @@ mod tests {
     #[test]
     fn diagonal_ray_visits_at_least_world_side_cells() {
         // A ray from (0,0,0) along (1,1,1) crosses the cube; AW yields
-        // 3*MACRO_SIDE - 2 = 94 cells in the worst case (each axis
-        // takes MACRO_SIDE-1 steps and they interleave).
+        // up to 3*MACRO_SIDE - 2 cells (each axis takes MACRO_SIDE-1
+        // steps and they interleave).
         let g = MacroGrid::new();
         let cells: Vec<_> = g.ray_iter(
             Vec3::new(0.5, 0.5, 0.5),

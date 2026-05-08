@@ -11,7 +11,7 @@ A fantasy console where the only graphics primitive is a voxel.
 
 | | |
 |---|---|
-| World | 1024 × 1024 × 1024 voxel grid (integer coordinates, Y-up) |
+| World | Up to 256 **scenes** per cart, each a 512 × 512 × 512 voxel grid (integer coordinates, Y-up); see §3.7 |
 | Output framebuffer | **256 × 144** (16:9), scaled to physical display by each port |
 | Refresh rate | 60 Hz |
 | Color | 64-color fixed system palette + 256-entry per-cart material table |
@@ -26,7 +26,9 @@ Render output resolution is part of the console's identity and does not change p
 
 ## 2. Voxel model
 
-**World grid:** 1024³ logical voxels addressed `(x, y, z)`, origin at the corner, Y up. Empty voxels are value `0`.
+**World grid (per scene):** 512³ logical voxels addressed `(x, y, z)`, origin at the corner, Y up. Empty voxels are value `0`. A cart may address up to 256 scenes (§3.7); 512³ is the *per-scene* ceiling, not the per-cart ceiling.
+
+**Why 512³ and not larger.** 512³ is the largest scene the priority-1 hardware target (ESP32-P4, 32 MB PSRAM) can hold densely populated within the §13.8 resident budget while leaving headroom for code, audio, actor volumes, and per-frame working set. Carts targeting smaller MCUs (ESP32-S3, STM32H7) author at lower densities — see §13.8 for per-target footprint guidance.
 
 **Voxel value:** 8-bit index into the cart's **material table** (256 entries). Index `0` is reserved for "empty / air."
 
@@ -123,7 +125,7 @@ fn sky_set_sun_disc(color: u8, disc_size: f32);                // optional; size
 
 Rays that miss all geometry sample the sky: linear gradient between `horizon` (at ray.y = 0) and `top` (at ray.y = +1), with the sun disc rendered when the ray direction is within `disc_size` radians of the directional-light direction set in §3.3.
 
-There is no cubemap or procedural atmosphere primitive. Carts wanting richer skies — clouds, mountains, floating islands — paint them as voxels in the world's outer shell. The 1024³ grid is intentionally large enough to leave room for distant scenery beyond a typical 256³ playable area; view distance + fog do the fade.
+There is no cubemap or procedural atmosphere primitive. Carts wanting richer skies — clouds, mountains, floating islands — paint them as voxels in the world's outer shell. The 512³ per-scene grid leaves room for distant scenery beyond a typical 128–256³ playable area; view distance + fog do the fade.
 
 ### 3.5 Pause and cutscenes
 
@@ -150,7 +152,7 @@ fn fill_box(min: UVec3, max: UVec3, material: u8);
 fn clear_world();
 ```
 
-`UVec3` components are world-voxel coordinates `0..1024`; values outside that range are clamped or rejected (host's choice — implementation must be consistent across ports).
+`UVec3` components are world-voxel coordinates `0..512`; values outside that range are clamped or rejected (host's choice — implementation must be consistent across ports).
 
 All voxel reads, writes, and rendering target the **active scene** (see §3.7). `clear_world()` resets the active scene's voxel grid to all-air; other scenes are unaffected. Use sparingly; carts that want a fresh slate per level are better off authoring a separate scene up front.
 
@@ -158,7 +160,7 @@ Mutations seed the Layer 3 active set automatically (see §10.3) for any voxel w
 
 ### 3.7 Scenes
 
-A **scene** is one 1024³ voxel grid the cart can address by `SceneId(u8)`. Each cart may use up to **256 scenes**. Scenes are the cart's unit of "level," "room," "stage," or anything else with a distinct voxel layout. The host doesn't impose semantics — it just keeps each scene's chunks separate and gives the cart a single API call to switch which one is active.
+A **scene** is one 512³ voxel grid the cart can address by `SceneId(u8)`. Each cart may use up to **256 scenes**. Scenes are the cart's unit of "level," "room," "stage," or anything else with a distinct voxel layout. The host doesn't impose semantics — it just keeps each scene's chunks separate and gives the cart a single API call to switch which one is active.
 
 ```rust
 fn scene_set_active(scene: SceneId);
@@ -179,7 +181,7 @@ Scene 0 is active at boot. `scene_set_active` switches the active scene; an unal
 
 This is deliberately minimal: the host *only* swaps which voxel grid is active. Cleanup on transition (despawn enemies, hide UI actors, clear sticky physics state) is cart-side. Carts that want elaborate transitions compose them on top of the primitive.
 
-**Memory cost.** Empty world: ~2 KB for the scene slot table. Each populated scene adds 256 KB for its chunk slot table; populated chunks add their ~33 KB dense buffer. A typical multi-room cart with ~5 scenes × 50 chunks each is ~10 MB resident, well within the §2 budget.
+**Memory cost.** Empty world: ~2 KB for the scene slot table. Each populated scene adds 32 KB for its chunk slot table; populated chunks add their ~33 KB dense buffer. A typical multi-room cart with ~5 scenes × 50 chunks each is ~10 MB resident, well within the §13.8 budget.
 
 ### 3.8 Performance budget
 
@@ -911,7 +913,7 @@ This means recordings are portable across user rebindings, across ports (a recor
 
 ## 11. Actors
 
-Actors are the unit of "thing that moves" — anything not part of the static 1024³ world grid. Player, enemies, projectiles, doors, vehicles, particles, decorative props.
+Actors are the unit of "thing that moves" — anything not part of the static 512³ scene voxel grid. Player, enemies, projectiles, doors, vehicles, particles, decorative props.
 
 ### 11.1 Model
 
@@ -1014,7 +1016,7 @@ There is no API path that triggers a bake implicitly per frame. Carts treat orie
 Each frame, before ray-marching:
 
 1. The host computes each visible actor's world-space AABB from `position`, `yaw`, `orientation`, `anchor`, and `volume` bounds.
-2. Actors are binned into a coarse macro-grid: 32³ macro-cells across the 1024³ world, each macro-cell spanning 32 world voxels. Each cell maintains a list of overlapping actor IDs.
+2. Actors are binned into a coarse macro-grid: 16³ macro-cells across the active scene's 512³ world, each macro-cell spanning 32 world voxels (one macro-cell per chunk). Each cell maintains a list of overlapping actor IDs.
 3. During DDA traversal, when a ray enters a macro-cell, it iterates that cell's actor list — for each candidate, AABB intersect first; on hit, transform the ray into actor-local space (subtract `position`, apply inverse `yaw`) and DDA the actor's volume buffer.
 
 The closest hit (world or actor) wins. Lighting uses the world's directional light + ambient identically for both — actors and world are visually one space.
@@ -1189,9 +1191,9 @@ Offset  Field          Size    Notes
 5       flags          u8      bit 0: has_anchor; bit 1: has_markers; bit 2: has_ca_seeds
 6       encoding       u8      0=dense, 1=rle, 2=sparse_list, 3=svo
 7       reserved       u8      0
-8       size_x         u16     extents in voxels, max 1024
-10      size_y         u16     max 1024
-12      size_z         u16     max 1024
+8       size_x         u16     extents in voxels, max 512
+10      size_y         u16     max 512
+12      size_z         u16     max 512
 14      voxel_count    u16     informational (saturates at 0xFFFF); voxel data is authoritative
 ```
 
@@ -1568,7 +1570,7 @@ One algorithm, four callers.
 
 The world is organized in two levels:
 
-1. **Chunk grid:** the 1024³ world is tiled by a 32×32×32 grid of chunks, each chunk a 32³ volume of voxels. Empty chunks (entirely material 0 / air) are not stored.
+1. **Chunk grid:** the 512³ per-scene world is tiled by a 16×16×16 grid of chunks, each chunk a 32³ volume of voxels. Empty chunks (entirely material 0 / air) are not stored.
 2. **Per-chunk SVO:** each non-empty chunk is encoded as an SVO of depth 5 (32 = 2⁵).
 
 The two-tier model is identical on disk and in RAM. It enables per-chunk streaming, LRU eviction of inactive chunks, and per-chunk modification without touching the rest of the world.
@@ -1725,12 +1727,20 @@ Per chunk:
 | Typical outdoor terrain | 1–10 KB (~250–2,500 nodes) |
 | Pathological worst case (every voxel a leaf) | ~150 KB (~37K nodes) |
 
-World working set (typical view radius):
+Per-chunk RAM cost in the reference host: 32 KB dense buffer (always resident) + the SVO above, ≈ **40–60 KB per populated chunk** for typical content.
 
-- 200–500 active chunks × ~5 KB average = 1–2.5 MB resident.
-- Hashmap overhead for 500 entries: a few KB.
+Per-scene fixed cost: 32 KB chunk slot table (4096 slots × 8 bytes) + active scene's chunks. Empty world: 2 KB scene table + 0.
 
-Comfortably within §2's 16–20 MB resident budget, leaving room for actor volumes and headroom for denser scenes.
+**Realistic playable footprint by target.** A scene's *addressable* size is always 512³, but *populated* chunk count is what RAM constrains. Density guidance:
+
+| Target | RAM (PSRAM) | Voxel-data budget | ≈ chunks resident | Realistic populated footprint |
+|---|---|---|---|---|
+| **STM32H7** | ~1 MB SRAM | ~256 KB | 4–8 chunks | 64×64 ground, no hills |
+| **ESP32-S3** | 8 MB | ~5 MB | ~100 chunks | 256×256 ground + scattered decor |
+| **ESP32-P4** (priority 1) | 32 MB | ~25 MB | ~500 chunks | 512×512 ground + hills + trees |
+| Browser / desktop | gigabytes | unconstrained | thousands | 512³ fully populated if you want |
+
+The ESP32-P4 row is the **design point** — the spec's 512³ ceiling is sized so a P4 cart can populate the full 512×512 ground with terrain detail, hills, and decoration within budget. Carts that target smaller MCUs author at correspondingly smaller densities; the SDK + tooling will surface a "doesn't fit on $TARGET" warning when the bundler can prove it (post v1).
 
 ### 13.9 Future work (parking lot)
 

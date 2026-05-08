@@ -15,7 +15,7 @@
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
 
-/// Side length of the playable area in voxels. Each scene is 1024³
+/// Side length of the playable area in voxels. Each scene is 512³
 /// total per the spec; the demo only uses a 64×64×N square at the
 /// (0,0,0) corner so the player can walk across the chunk-boundary
 /// at x=32 / z=32 and you can see multi-chunk traversal at work.
@@ -228,14 +228,21 @@ pub extern "C" fn update(dt_ms: u32) {
     // Camera mouse aim feeds yaw/pitch.
     unsafe {
         CAM_YAW += ax * 0.005;
-        CAM_PITCH += -ay * 0.005;
+        // Non-inverted Y (FPS feel): mouse down → look down. In orbit
+        // terms, look-down means the eye sits above the target →
+        // pitch positive → pitch *increases* with positive ay.
+        CAM_PITCH += ay * 0.005;
         CAM_PITCH = CAM_PITCH.clamp(-1.2, 1.2);
     }
 
     // WASD drives the dude relative to camera-facing direction.
     let move_speed = 6.0_f32;
     let cam_yaw = unsafe { CAM_YAW };
-    let forward = Vec3::new(sine(cam_yaw), 0.0, cosine(cam_yaw));
+    // forward = where the camera *looks*, not where the eye sits. Orbit
+    // cam puts the eye at (sin*d, _, cos*d) from target, so look_dir
+    // is the negation; W must move along look_dir for "forward" to
+    // mean what the player sees.
+    let forward = Vec3::new(-sine(cam_yaw), 0.0, -cosine(cam_yaw));
     let right = Vec3::new(cosine(cam_yaw), 0.0, -sine(cam_yaw));
 
     let movement = Vec3::new(
