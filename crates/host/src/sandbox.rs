@@ -17,7 +17,7 @@
 
 use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
-use voxlconsl_types::{ActionKind, BindingHint, Material, MaterialFlags, Vec3};
+use voxlconsl_types::{ActionKind, ActorId, BindingHint, Material, MaterialFlags, U8Vec3, Vec3};
 
 use crate::renderer::Camera;
 use crate::world::WorldState;
@@ -172,13 +172,117 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
-    // Actors (§11.7) — only `actor_set_prefab` is wired in v0.0.x as a no-op
-    // stub so cart code using the §11.9 Flipbook helper is forward-compatible.
-    // The full actor system lights up when §11 is implemented.
+    // Actors (§11.7) — minimum-viable v0.0.4 surface. `actor_set_prefab`
+    // remains a no-op stub since prefabs/CoW arrive later. Spawn / despawn /
+    // transform / volume editing are real.
+    linker.func_wrap(
+        "env", "actor_spawn",
+        |mut caller: Caller<WorldState>| -> u32 {
+            caller
+                .data_mut()
+                .actors
+                .spawn()
+                .map(|id| id.0)
+                .unwrap_or(u32::MAX)
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_despawn",
+        |mut caller: Caller<WorldState>, id: u32| {
+            caller.data_mut().actors.despawn(ActorId(id));
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_count",
+        |caller: Caller<WorldState>| -> u32 {
+            caller.data().actors.count()
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_set_position",
+        |mut caller: Caller<WorldState>, id: u32, x: f32, y: f32, z: f32| {
+            if let Some(a) = caller.data_mut().actors.get_mut(ActorId(id)) {
+                a.position = Vec3::new(x, y, z);
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_get_position",
+        |mut caller: Caller<WorldState>, id: u32, out_x: u32, out_y: u32, out_z: u32| {
+            let p = caller
+                .data()
+                .actors
+                .get(ActorId(id))
+                .map(|a| a.position)
+                .unwrap_or(Vec3::ZERO);
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return,
+            };
+            let _ = memory.write(&mut caller, out_x as usize, &p.x.to_le_bytes());
+            let _ = memory.write(&mut caller, out_y as usize, &p.y.to_le_bytes());
+            let _ = memory.write(&mut caller, out_z as usize, &p.z.to_le_bytes());
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_set_yaw",
+        |mut caller: Caller<WorldState>, id: u32, yaw: f32| {
+            if let Some(a) = caller.data_mut().actors.get_mut(ActorId(id)) {
+                a.yaw = yaw;
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_get_yaw",
+        |caller: Caller<WorldState>, id: u32| -> f32 {
+            caller.data().actors.get(ActorId(id)).map(|a| a.yaw).unwrap_or(0.0)
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_set_visible",
+        |mut caller: Caller<WorldState>, id: u32, visible: u32| {
+            if let Some(a) = caller.data_mut().actors.get_mut(ActorId(id)) {
+                a.visible = visible != 0;
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_set_voxel",
+        |mut caller: Caller<WorldState>, id: u32, x: u32, y: u32, z: u32, material: u32| {
+            if let Some(a) = caller.data_mut().actors.get_mut(ActorId(id)) {
+                a.set_voxel(x as u8, y as u8, z as u8, material as u8);
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_fill_box",
+        |mut caller: Caller<WorldState>, id: u32,
+         min_x: u32, min_y: u32, min_z: u32,
+         max_x: u32, max_y: u32, max_z: u32,
+         material: u32| {
+            if let Some(a) = caller.data_mut().actors.get_mut(ActorId(id)) {
+                a.fill_box(
+                    U8Vec3::new(min_x as u8, min_y as u8, min_z as u8),
+                    U8Vec3::new(max_x as u8, max_y as u8, max_z as u8),
+                    material as u8,
+                );
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_clear",
+        |mut caller: Caller<WorldState>, id: u32| {
+            if let Some(a) = caller.data_mut().actors.get_mut(ActorId(id)) {
+                a.clear();
+            }
+        },
+    )?;
+
+    // Prefab swap (§11.9 animation) — still a no-op until prefabs land.
     linker.func_wrap(
         "env", "actor_set_prefab",
         |_caller: Caller<WorldState>, _actor_id: u32, _prefab_id: u32| {
-            // no-op until the actor system is implemented
+            // no-op until the prefab system is implemented
         },
     )?;
 

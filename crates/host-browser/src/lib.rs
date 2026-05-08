@@ -60,10 +60,12 @@ impl BrowserHost {
         // Pull the world state the cart just configured and ray-march it.
         let world = self.cart.world();
         world.flush();
+        world.actors.flush_all();
 
         let scene = Scene {
             chunk: world.chunk(),
             chunk_origin: voxlconsl_types::Vec3::ZERO,
+            actors: &world.actors,
             materials: &world.materials,
             sun_dir: world.sun_dir,
             sky: world.sky_top,

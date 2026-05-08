@@ -9,6 +9,7 @@
 use voxlconsl_svo::{build, ChunkData};
 use voxlconsl_types::{Material, Vec3};
 
+use crate::actors::ActorTable;
 use crate::input::InputState;
 use crate::renderer::Camera;
 
@@ -29,6 +30,7 @@ pub struct WorldState {
     pub sky_top: u8,
     pub sky_horizon: u8,
     pub input: InputState,
+    pub actors: ActorTable,
     dirty: bool,
 }
 
@@ -47,6 +49,7 @@ impl WorldState {
             sky_top: ((7 << 2) | 0),    // deep blue, shade 0
             sky_horizon: ((6 << 2) | 0), // sky blue, shade 0
             input: InputState::new(),
+            actors: ActorTable::new(),
             dirty: true,
         }
     }

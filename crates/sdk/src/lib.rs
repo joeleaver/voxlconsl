@@ -37,6 +37,22 @@ mod host {
         pub fn light_set_sun(dx: f32, dy: f32, dz: f32, color: u32, intensity: u32);
         pub fn sky_set_gradient(top: u32, horizon: u32);
 
+        pub fn actor_spawn() -> u32;
+        pub fn actor_despawn(actor_id: u32);
+        pub fn actor_count() -> u32;
+        pub fn actor_set_position(actor_id: u32, x: f32, y: f32, z: f32);
+        pub fn actor_get_position(actor_id: u32, out_x: *mut f32, out_y: *mut f32, out_z: *mut f32);
+        pub fn actor_set_yaw(actor_id: u32, yaw: f32);
+        pub fn actor_get_yaw(actor_id: u32) -> f32;
+        pub fn actor_set_visible(actor_id: u32, visible: u32);
+        pub fn actor_set_voxel(actor_id: u32, x: u32, y: u32, z: u32, material: u32);
+        pub fn actor_fill_box(
+            actor_id: u32,
+            min_x: u32, min_y: u32, min_z: u32,
+            max_x: u32, max_y: u32, max_z: u32,
+            material: u32,
+        );
+        pub fn actor_clear(actor_id: u32);
         pub fn actor_set_prefab(actor_id: u32, prefab_id: u32);
 
         pub fn input_declare_action(kind: u32, hint: u32, name_ptr: *const u8, name_len: u32) -> u32;
@@ -121,6 +137,69 @@ pub fn log(msg: &str) {
 // ============================================================================
 // Actors — see SPEC.md §11.
 // ============================================================================
+
+/// Spawn a new actor. Returns `None` when the per-cart actor cap is hit.
+pub fn actor_spawn() -> Option<ActorId> {
+    let id = unsafe { host::actor_spawn() };
+    if id == u32::MAX { None } else { Some(ActorId(id)) }
+}
+
+pub fn actor_despawn(actor: ActorId) {
+    unsafe { host::actor_despawn(actor.0) }
+}
+
+pub fn actor_count() -> u32 {
+    unsafe { host::actor_count() }
+}
+
+pub fn actor_set_position(actor: ActorId, pos: Vec3) {
+    unsafe { host::actor_set_position(actor.0, pos.x, pos.y, pos.z) }
+}
+
+pub fn actor_get_position(actor: ActorId) -> Vec3 {
+    let mut x: f32 = 0.0;
+    let mut y: f32 = 0.0;
+    let mut z: f32 = 0.0;
+    unsafe { host::actor_get_position(actor.0, &mut x, &mut y, &mut z) };
+    Vec3::new(x, y, z)
+}
+
+pub fn actor_set_yaw(actor: ActorId, yaw: f32) {
+    unsafe { host::actor_set_yaw(actor.0, yaw) }
+}
+
+pub fn actor_get_yaw(actor: ActorId) -> f32 {
+    unsafe { host::actor_get_yaw(actor.0) }
+}
+
+pub fn actor_set_visible(actor: ActorId, visible: bool) {
+    unsafe { host::actor_set_visible(actor.0, visible as u32) }
+}
+
+pub fn actor_set_voxel(actor: ActorId, pos: U8Vec3, material: u8) {
+    unsafe {
+        host::actor_set_voxel(
+            actor.0,
+            pos.x as u32, pos.y as u32, pos.z as u32,
+            material as u32,
+        )
+    }
+}
+
+pub fn actor_fill_box(actor: ActorId, min: U8Vec3, max: U8Vec3, material: u8) {
+    unsafe {
+        host::actor_fill_box(
+            actor.0,
+            min.x as u32, min.y as u32, min.z as u32,
+            max.x as u32, max.y as u32, max.z as u32,
+            material as u32,
+        )
+    }
+}
+
+pub fn actor_clear(actor: ActorId) {
+    unsafe { host::actor_clear(actor.0) }
+}
 
 /// Swap an actor's prefab. The basis of flipbook animation (§11.9).
 ///
