@@ -172,6 +172,16 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
+    // Actors (§11.7) — only `actor_set_prefab` is wired in v0.0.x as a no-op
+    // stub so cart code using the §11.9 Flipbook helper is forward-compatible.
+    // The full actor system lights up when §11 is implemented.
+    linker.func_wrap(
+        "env", "actor_set_prefab",
+        |_caller: Caller<WorldState>, _actor_id: u32, _prefab_id: u32| {
+            // no-op until the actor system is implemented
+        },
+    )?;
+
     // Input (§6) — declaration is one-action-at-a-time; cart calls
     // input_declare_action N times during init() and stores the handles.
     linker.func_wrap(

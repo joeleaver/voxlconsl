@@ -27,6 +27,9 @@ what's deferred.
 - **Build pipeline** — `scripts/build-web.sh` compiles cart, embeds
   it in the host, builds host WASM, runs wasm-bindgen.
 - **Documentation** — this site, GitHub Pages-deployed mdBook.
+- **Animation** ([§11.9](spec.md#119-animation)) — flipbook helper
+  (`voxlconsl_sdk::animation::Flipbook`) and `actor_set_prefab` wired
+  through the SDK; host stub is a no-op until the actor system lands.
 
 ## Up next
 

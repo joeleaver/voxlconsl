@@ -37,6 +37,8 @@ mod host {
         pub fn light_set_sun(dx: f32, dy: f32, dz: f32, color: u32, intensity: u32);
         pub fn sky_set_gradient(top: u32, horizon: u32);
 
+        pub fn actor_set_prefab(actor_id: u32, prefab_id: u32);
+
         pub fn input_declare_action(kind: u32, hint: u32, name_ptr: *const u8, name_len: u32) -> u32;
         pub fn input_action_button(h: u32) -> u32;
         pub fn input_action_pressed(h: u32) -> u32;
@@ -115,6 +117,22 @@ pub fn sky_set_gradient(top: u8, horizon: u8) {
 pub fn log(msg: &str) {
     unsafe { host::log(msg.as_ptr(), msg.len() as u32) }
 }
+
+// ============================================================================
+// Actors — see SPEC.md §11.
+// ============================================================================
+
+/// Swap an actor's prefab. The basis of flipbook animation (§11.9).
+///
+/// The actor's transform (position, yaw, orientation, anchor, visibility)
+/// is preserved; only the volume reference changes. The host shares baked
+/// volumes between actors instancing the same `(prefab, orientation)`
+/// pair via copy-on-write, so prefab swaps are pointer-cheap.
+pub fn actor_set_prefab(actor: ActorId, prefab: PrefabId) {
+    unsafe { host::actor_set_prefab(actor.0, prefab.0 as u32) }
+}
+
+pub mod animation;
 
 // ============================================================================
 // Input — see SPEC.md §6.

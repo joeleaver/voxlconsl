@@ -1005,6 +1005,9 @@ fn actor_set_anchor(id: ActorId, anchor: Vec3);
 fn actor_set_visible(id: ActorId, visible: bool);
 fn actor_get_bounds(id: ActorId) -> (Vec3, Vec3);  // world-space AABB
 
+// Prefab swap — the basis of flipbook animation (§11.9)
+fn actor_set_prefab(id: ActorId, prefab: PrefabId);  // swaps the actor's volume reference
+
 // Volume editing — forks if currently prefab-shared
 fn actor_set_voxel(id: ActorId, pos: U8Vec3, material: u8);
 fn actor_fill_box(id: ActorId, min: U8Vec3, max: U8Vec3, material: u8);
@@ -1023,6 +1026,90 @@ Actors are not persisted across cart boots. Carts wanting stateful actors (dropp
 Actor IDs are stable for the actor's lifetime within a session. After despawn, an ID may be recycled.
 
 Nested / parented actors (parent-relative transforms, hierarchical spawns) are **not** in v1 — they create surprisingly large surface area for what they buy. Carts compose multi-part entities by tracking parent transforms in cart code and updating child positions each tick.
+
+### 11.9 Animation
+
+Carts animate actors via **flipbook prefab-swap**: the actor's `prefab` field cycles through a list of `PrefabId`s over time. Each "frame" of an animation is a separate prefab in the cart's prefab table — e.g., `dude_walk_0`, `dude_walk_1`, `dude_walk_2`, `dude_walk_3` are four distinct authored volumes, played in sequence.
+
+**Why flipbook (and not skeletal):**
+
+- Voxel grids read badly at non-90° rotations — sub-voxel-aligned voxels look broken rather than smooth. Continuous bone rotation isn't a good fit for the medium.
+- The CoW prefab system (§11.4) makes prefab-swap effectively free at runtime: every prefab is baked exactly once per `(prefab, orientation)` pair across the whole cart, and any actor playing the animation just rotates a pointer reference through the baked-volume cache. Twenty walking dudes share four baked volumes.
+- Flipbook's per-frame authoring matches the voxel/pixel-art tradition where animation is a sequence of discrete poses.
+
+**Authoring** is the same workflow as any other prefabs (§12.6.1):
+
+```toml
+# cart.toml
+[prefabs]
+dude_idle    = "world/prefabs/dude_idle.vxv"
+dude_walk_0  = "world/prefabs/dude_walk_0.vxv"
+dude_walk_1  = "world/prefabs/dude_walk_1.vxv"
+dude_walk_2  = "world/prefabs/dude_walk_2.vxv"
+dude_walk_3  = "world/prefabs/dude_walk_3.vxv"
+```
+
+Each name maps to a `PrefabId` constant the SDK exposes at bundle time.
+
+**Runtime** uses one host import (`actor_set_prefab`, §11.7) plus a cart-side timing helper. The helper lives in `voxlconsl-sdk::animation::Flipbook`; the host has no animation-specific state. The platform never tracks "what animation is this actor playing" — it just receives prefab swaps.
+
+The `Flipbook` helper API:
+
+```rust
+pub struct Flipbook { /* ... */ }
+
+impl Flipbook {
+    /// Build a clip from a list of prefab IDs and a uniform per-frame duration.
+    pub const fn new(frames: &'static [PrefabId], frame_duration_ms: u32, looping: bool) -> Self;
+
+    /// Advance the playhead by `dt_ms`. Should be called once per frame
+    /// from `update`.
+    pub fn tick(&mut self, dt_ms: u32);
+
+    /// The prefab ID of the current frame. Pass to `actor_set_prefab`.
+    pub fn current(&self) -> PrefabId;
+    pub fn current_frame(&self) -> usize;
+
+    pub fn reset(&mut self);
+    pub fn is_done(&self) -> bool;        // for non-looping clips
+
+    /// Edge: true on the tick the playhead just landed on `frame`.
+    /// Useful for triggering frame-synced events (footstep SFX, hit-frame
+    /// damage application, etc.).
+    pub fn just_entered_frame(&self, frame: usize) -> bool;
+}
+```
+
+**Cart-side usage:**
+
+```rust
+static mut WALK: Flipbook = Flipbook::new(
+    &[WALK_0, WALK_1, WALK_2, WALK_3],
+    120,
+    true,
+);
+
+fn update(dt_ms: u32) {
+    let (mx, my) = input_action_axis2d(MOVE);
+    let moving = mx.abs() > 0.1 || my.abs() > 0.1;
+
+    let clip = unsafe { &mut WALK };
+    if moving { clip.tick(dt_ms); } else { clip.reset(); }
+
+    let prefab = if moving { clip.current() } else { IDLE };
+    actor_set_prefab(player_actor, prefab);
+
+    if moving && clip.just_entered_frame(0) {
+        sfx_play(FOOTSTEP_LEFT, /* ... */);
+    } else if moving && clip.just_entered_frame(2) {
+        sfx_play(FOOTSTEP_RIGHT, /* ... */);
+    }
+}
+```
+
+**Memory cost:** the only per-actor cost is the `ActorId` and its existing transform fields. Animation state (elapsed time, frame index) lives on the cart side in cart memory — the host knows nothing about it. Multiple actors playing the same `Flipbook` can each carry their own copy if their playback is desynchronized, or share a single one if they're locked together.
+
+**Skeletal animation** (parted actors with parent-relative bone transforms, smooth bone rotation, blendable clips) is parking-lotted to v2. It would require continuous sub-voxel rotation of voxel sub-volumes, which doesn't read well in the medium without aggressive snapping — at which point you're authoring discrete poses anyway, which is what flipbook already does.
 
 ---
 

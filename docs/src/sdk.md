@@ -56,9 +56,44 @@ fn input_action_axis1d(h: ActionHandle) -> f32;
 fn input_action_axis2d(h: ActionHandle) -> (f32, f32);
 fn input_action_active(h: ActionHandle) -> bool;
 
+// Actors (§11) — `actor_set_prefab` is the only one wired in v0.0.x;
+// the full actor system arrives later. Currently a no-op host stub so
+// cart code using Flipbook is forward-compatible.
+fn actor_set_prefab(actor: ActorId, prefab: PrefabId);
+
 // Misc (§8.3)
 fn log(msg: &str);
 ```
+
+### Animation
+
+The SDK ships a small cart-side animation helper at
+`voxlconsl_sdk::animation::Flipbook`. It cycles an actor through a list
+of prefab IDs over time — the v1 animation model per
+[§11.9 of the spec](spec.md#119-animation).
+
+```rust
+use voxlconsl_sdk::animation::Flipbook;
+
+static mut WALK: Flipbook = Flipbook::new(
+    &[WALK_0, WALK_1, WALK_2, WALK_3],
+    120,    // ms per frame
+    true,   // looping
+);
+
+fn update(dt_ms: u32) {
+    let clip = unsafe { &mut WALK };
+    clip.tick(dt_ms);
+    actor_set_prefab(player_actor, clip.current());
+
+    if clip.just_entered_frame(0) { sfx_play(FOOTSTEP_LEFT, /* ... */); }
+    if clip.just_entered_frame(2) { sfx_play(FOOTSTEP_RIGHT, /* ... */); }
+}
+```
+
+Pure cart-side. The host doesn't track animation state — it just
+receives prefab swaps. See the [spec §11.9 rationale](spec.md#119-animation)
+for why flipbook (and not skeletal) is the right fit for voxels.
 
 ## What's not wired up yet
 
