@@ -9,13 +9,14 @@ voxlconsl/
 ├── crates/                 # platform crates
 │   ├── types/              # shared types: Vec3, Material, ActionDecl, ...
 │   ├── svo/                # sparse voxel octree (§13 of the spec)
-│   ├── host/               # runtime: renderer, palette, world, sandbox, input
+│   ├── host/               # runtime: renderer, palette, world, actors,
+│   │                       #   prefabs, sandbox, input
 │   ├── host-browser/       # browser port (wasm32 cdylib)
 │   ├── sdk/                # cart-side crate (no_std)
 │   ├── bundler/            # `.voxl` cart bundler (skeleton)
 │   └── cli/                # `voxlconsl` binary (skeleton)
 ├── examples/
-│   └── hello-cube/         # first cart — 3.5 KB no_std WASM
+│   └── hello-cube/         # first cart — no_std WASM
 ├── docs/                   # this site (mdBook)
 ├── web/                    # browser shell — index.html, main.js, style.css
 └── scripts/

@@ -47,9 +47,9 @@ The runtime. Module layout mirrors the spec sections:
 ## `voxlconsl-host-browser`
 
 The browser port (SPEC.md §9). Compiles to `wasm32-unknown-unknown` and
-is loaded by `web/main.js` via wasm-bindgen. v0.0.3 includes a cart
-binary via `include_bytes!`; future versions will load `.voxl` files
-dynamically.
+is loaded by `web/main.js` via wasm-bindgen. v0.0.x embeds the cart
+binary via `include_bytes!`; once the §7 cart format lands the host
+will load `.voxl` files dynamically.
 
 [`crates/host-browser/`](https://github.com/joeleaver/voxlconsl/tree/main/crates/host-browser)
 
@@ -77,7 +77,8 @@ Skeleton. Will be the `voxlconsl` binary with subcommands `new`,
 
 ## `examples/hello-cube`
 
-The first cart. ~140 lines, 3.5 KB compiled. Demonstrates the full
-v0.0.3 SDK surface.
+The first cart. Demonstrates the v0.0.6 SDK surface end-to-end:
+materials, world geometry, prefabs (player + barrel), `actor_spawn_from`
+at three orientations, and a `Flipbook`-driven walk cycle.
 
 [`examples/hello-cube/`](https://github.com/joeleaver/voxlconsl/tree/main/examples/hello-cube)

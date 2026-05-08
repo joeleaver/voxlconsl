@@ -27,7 +27,7 @@ pub extern "C" fn render() { ... }    // each frame, after update
 Carts must export all three. The host treats missing exports as a load
 error.
 
-## What's wired up today (v0.0.3)
+## What's wired up today (v0.0.6)
 
 ```rust
 // World mutation (§3.6)
@@ -56,10 +56,31 @@ fn input_action_axis1d(h: ActionHandle) -> f32;
 fn input_action_axis2d(h: ActionHandle) -> (f32, f32);
 fn input_action_active(h: ActionHandle) -> bool;
 
-// Actors (§11) — `actor_set_prefab` is the only one wired in v0.0.x;
-// the full actor system arrives later. Currently a no-op host stub so
-// cart code using Flipbook is forward-compatible.
+// Actors (§11) — lifecycle
+fn actor_spawn() -> Option<ActorId>;
+fn actor_spawn_from(prefab: PrefabId, orientation: Orientation) -> Option<ActorId>;
+fn actor_despawn(actor: ActorId);
+fn actor_count() -> u32;
+
+// Actors — transform
+fn actor_set_position(actor: ActorId, pos: Vec3);
+fn actor_get_position(actor: ActorId) -> Vec3;
+fn actor_set_yaw(actor: ActorId, yaw: f32);
+fn actor_get_yaw(actor: ActorId) -> f32;
+fn actor_set_orientation(actor: ActorId, orientation: Orientation);   // §11.5
+fn actor_get_orientation(actor: ActorId) -> Orientation;
+fn actor_set_visible(actor: ActorId, visible: bool);
+
+// Actors — volume editing (forks prefab-shared actors on first edit)
+fn actor_set_voxel(actor: ActorId, pos: U8Vec3, material: u8);
+fn actor_fill_box(actor: ActorId, min: U8Vec3, max: U8Vec3, material: u8);
+fn actor_clear(actor: ActorId);
+
+// Actors — prefab swap (basis of flipbook animation, §11.9)
 fn actor_set_prefab(actor: ActorId, prefab: PrefabId);
+
+// Prefabs (§11.4) — v0.0.x stand-in for §7 cart-format-driven loading
+fn prefab_define(prefab: PrefabId, dense: &[u8], size: U8Vec3);
 
 // Misc (§8.3)
 fn log(msg: &str);
@@ -75,32 +96,57 @@ of prefab IDs over time — the v1 animation model per
 ```rust
 use voxlconsl_sdk::animation::Flipbook;
 
-static mut WALK: Flipbook = Flipbook::new(
-    &[WALK_0, WALK_1, WALK_2, WALK_3],
-    120,    // ms per frame
-    true,   // looping
-);
+const WALK_FRAMES: &[PrefabId] = &[WALK_0, WALK_1, WALK_2, WALK_1];
+static mut WALK: Flipbook = Flipbook::new(WALK_FRAMES, 120, true);
 
 fn update(dt_ms: u32) {
-    let clip = unsafe { &mut WALK };
+    let clip = unsafe { &mut *(&raw mut WALK) };
     clip.tick(dt_ms);
     actor_set_prefab(player_actor, clip.current());
 
-    if clip.just_entered_frame(0) { sfx_play(FOOTSTEP_LEFT, /* ... */); }
-    if clip.just_entered_frame(2) { sfx_play(FOOTSTEP_RIGHT, /* ... */); }
+    if clip.just_entered_frame(0) { /* play left footstep SFX */ }
+    if clip.just_entered_frame(2) { /* play right footstep SFX */ }
 }
 ```
 
 Pure cart-side. The host doesn't track animation state — it just
-receives prefab swaps. See the [spec §11.9 rationale](spec.md#119-animation)
-for why flipbook (and not skeletal) is the right fit for voxels.
+receives prefab swaps. The CoW prefab system (§11.4) makes prefab-swap
+effectively free: every prefab is baked once per
+`(prefab, orientation)` pair across the whole cart, and any actor
+playing the animation just rotates a pointer reference through the
+baked-volume cache. Twenty walking dudes share four baked volumes.
+
+See the [spec §11.9 rationale](spec.md#119-animation) for why flipbook
+(and not skeletal) is the right fit for voxels.
+
+### Orientations
+
+The 24 cube-symmetry orientations (§11.3) are exposed on
+`voxlconsl_types::Orientation` and re-exported by the SDK. Each variant
+is a `(up_world, fwd_world)` pair of signed unit axes:
+
+```rust
+// Pre-bake a barrel at three orientations: upright, tipped east, tipped north.
+let a = actor_spawn_from(P_BARREL, Orientation::Up).unwrap();
+let b = actor_spawn_from(P_BARREL, Orientation::EastUp).unwrap();
+let c = actor_spawn_from(P_BARREL, Orientation::NorthUp).unwrap();
+
+// Re-orient at runtime — pointer-cheap if the actor is still
+// prefab-shared; rotates the dense in place for owned (post-edit) actors.
+actor_set_orientation(a, Orientation::UpRot90);
+```
+
+The host bakes one volume per unique `(prefab, orientation)` pair and
+shares duplicates via copy-on-write. See SPEC.md §11.4 / §11.5 for the
+full bake-trigger table.
 
 ## What's not wired up yet
 
-Most of the spec, honestly — this is pre-alpha. The audio, physics,
-actors, pointer input, system actions, and full camera surface
-(`Projection`, Euler-style camera setters, view distance, fog, render
-rect) are all still TODO. The [roadmap](roadmap.md) tracks priorities.
+Plenty of the spec — this is pre-alpha. The audio, physics queries,
+pointer input, system actions, full camera surface (`Projection`,
+`camera_set_euler`, view distance, fog, render rect), CA simulation,
+and multi-chunk world are all still TODO. The [roadmap](roadmap.md)
+tracks priorities.
 
 ## Setting up a cart project
 
@@ -158,4 +204,4 @@ cargo build --target wasm32-unknown-unknown --release
 
 The output `.wasm` is a complete cart binary. (Cart format support — the
 real `.voxl` container with metadata, materials, audio, etc. — is still
-in progress; v0.0.3 carts are raw `.wasm` files.)
+in progress; v0.0.x carts are raw `.wasm` files.)

@@ -57,14 +57,20 @@ started; the live emulator above is what runs today:
 
 - Browser host built on `wasmi` for cart sandboxing (running inside the
   host's own WASM, three nested layers cleanly).
-- Sparse voxel octree per the spec, ~1,000 lines of Rust, ray-marching
-  the test scene at 60 Hz.
+- Sparse voxel octree per the spec, ray-marching the test scene at
+  60 Hz with actor compositing — world voxels and actor volumes
+  participate in the same depth comparison.
+- Full actor system: lifecycle, transforms, voxel editing, prefabs +
+  copy-on-write, all 24 cube-symmetry orientations, and a flipbook
+  animation helper.
 - Action-based input working end-to-end (browser → host → cart and back).
-- A 3.5 KB `hello-cube` example cart exercises the full SDK surface.
+- The `hello-cube` example cart exercises the SDK end-to-end — a
+  controllable, walk-cycle-animated character plus three barrel
+  actors at different orientations.
 
-Audio, physics, multi-chunk worlds, and a real `.voxl` cart-format parser
-are next. See the [roadmap](roadmap.md) for what's planned and what's
-already locked.
+Audio, physics queries, multi-chunk worlds, and a real `.voxl`
+cart-format parser are next. See the [roadmap](roadmap.md) for what's
+planned and what's already locked.
 
 ## Where to go from here
 
