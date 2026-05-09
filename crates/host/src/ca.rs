@@ -181,10 +181,12 @@ fn granular_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
     world.ca.evict(x, y, z);
 }
 
-/// Liquid rule (water-like): fall straight down, slide on diagonals
-/// like sand, then **also** spread laterally across same-y air. The
-/// extra lateral step is what makes water level out flat instead of
-/// piling like granular grains.
+/// Liquid rule (water-like): fall straight down or — when pressured
+/// from above by another liquid voxel — spread laterally across same-y
+/// air whose floor is solid. **No diagonal slides**: those are the
+/// granular-rule's job and they make falling drops settle into
+/// pyramidal piles. Skipping them here is what makes water lay out
+/// flat instead of accreting into a sand-shaped mound.
 ///
 /// v0.1.x is single-voxel-per-cell mass-conservative flow — every move
 /// is a swap, never a duplication. The level-state byte (§10.3 bits
@@ -202,24 +204,6 @@ fn liquid_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
         return;
     }
 
-    // Try diagonal slides first (granular-style).
-    const DIRS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
-    for &(dx, dz) in &DIRS {
-        let nx = x as i32 + dx;
-        let nz = z as i32 + dz;
-        if nx < 0 || nx >= WORLD_SIDE as i32 { continue; }
-        if nz < 0 || nz >= WORLD_SIDE as i32 { continue; }
-        let nx = nx as u32;
-        let nz = nz as u32;
-        if world.read_material(nx, y, nz) == 0
-            && world.read_material(nx, y - 1, nz) == 0
-        {
-            world.set_voxel(x, y, z, 0);
-            world.set_voxel(nx, y - 1, nz, m);
-            return;
-        }
-    }
-
     // Lateral spread — only when this voxel is *pressured from above*
     // by another liquid voxel. A lone settled voxel sitting on solid
     // ground has no reason to move, so it stays put. A continuous
@@ -229,12 +213,12 @@ fn liquid_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
     //
     // (Without this gate a single voxel oscillates between cardinal
     // neighbors forever: each move opens up the cell it just left,
-    // and the rule sees that cell as a valid lateral spread target
-    // next tick.)
+    // and the rule sees that cell as a valid spread target next tick.)
     let above = if y + 1 < WORLD_SIDE { world.read_material(x, y + 1, z) } else { 0 };
     let pressured = above != 0
         && world.materials[above as usize].flags.contains(MaterialFlags::LIQUID);
     if pressured {
+        const DIRS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
         for &(dx, dz) in &DIRS {
             let nx = x as i32 + dx;
             let nz = z as i32 + dz;
@@ -243,9 +227,8 @@ fn liquid_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
             let nx = nx as u32;
             let nz = nz as u32;
             if world.read_material(nx, y, nz) != 0 { continue; }
-            // Don't spread laterally onto open air — only over solid
-            // floor — so water sitting on a staircase doesn't pour
-            // off both sides every frame.
+            // Spread only over solid floor so water sitting on a
+            // staircase doesn't pour off both sides every frame.
             if world.read_material(nx, y - 1, nz) != 0 {
                 world.set_voxel(x, y, z, 0);
                 world.set_voxel(nx, y, nz, m);
@@ -393,6 +376,65 @@ mod tests {
         }
         assert!(neighbor_water > 0,
             "pressured water didn't spread to any neighbor");
+    }
+
+    #[test]
+    fn liquid_stream_lays_flat_not_pyramidal() {
+        // A continuous source of falling water voxels should spread out
+        // along the ground rather than stacking into a sand-shaped pile.
+        // Drop one voxel per simulated frame from y=8 onto a flat stone
+        // floor; after a number of drops, more water voxels should be
+        // at y=1 (the ground row) than at y=2 (one above ground).
+        // Without this rule shape, the granular-style diagonal slide
+        // would settle each drop adjacent to the column and the
+        // bottom row never gets wider than 5–7 voxels, with the
+        // remainder building up vertically.
+        let mut world = WorldState::new();
+        world.materials[1] = Material {
+            flags: MaterialFlags::empty().with(MaterialFlags::LIQUID),
+            ..Material::default()
+        };
+        world.materials[2] = Material::default();
+        // 21×21 stone floor centered at (10, 10) so spreading isn't
+        // wall-bound.
+        for dz in -10i32..=10 {
+            for dx in -10..=10 {
+                let nx = (10i32 + dx) as u32;
+                let nz = (10i32 + dz) as u32;
+                world.set_voxel(nx, 0, nz, 2);
+            }
+        }
+        // Drop 60 water voxels into the same column with a tick after
+        // each — i.e., simulate a stream.
+        for _ in 0..60 {
+            // Only place if the spawn cell is air; otherwise the host
+            // hook would skip the write anyway.
+            if world.read_material(10, 8, 10) == 0 {
+                world.set_voxel(10, 8, 10, 1);
+            }
+            tick(&mut world);
+        }
+        // Let any in-flight grains land + settle.
+        for _ in 0..40 { tick(&mut world); }
+
+        let mut at_y1 = 0;
+        let mut at_y2 = 0;
+        for dz in -10i32..=10 {
+            for dx in -10..=10 {
+                let nx = (10i32 + dx) as u32;
+                let nz = (10i32 + dz) as u32;
+                if world.read_material(nx, 1, nz) == 1 { at_y1 += 1; }
+                if world.read_material(nx, 2, nz) == 1 { at_y2 += 1; }
+            }
+        }
+        // Liquid should spread out along the floor, not pile vertically.
+        // We assert both that the bottom row has many voxels AND that
+        // it's wider than the second row.
+        assert!(at_y1 >= 8,
+            "expected a wide bottom row of water; only {} voxels at y=1", at_y1);
+        assert!(at_y1 > at_y2,
+            "water piled vertically (y=1: {}, y=2: {}); expected y=1 > y=2",
+            at_y1, at_y2);
     }
 
     #[test]
