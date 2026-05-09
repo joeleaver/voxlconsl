@@ -18,6 +18,7 @@ pub mod palette;
 pub mod audio;
 pub mod input;
 pub mod physics;
+pub mod ca;
 pub mod actors;
 pub mod macro_grid;
 pub mod prefabs;

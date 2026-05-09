@@ -23,9 +23,10 @@
 //!   chunk dense data. Practical carts populate a handful.
 
 use voxlconsl_svo::{build, ChunkData, ChunkKey};
-use voxlconsl_types::{Material, Vec3};
+use voxlconsl_types::{Material, MaterialFlags, Vec3};
 
 use crate::actors::ActorTable;
+use crate::ca::CaState;
 use crate::input::InputState;
 use crate::macro_grid::MacroGrid;
 use crate::prefabs::PrefabTable;
@@ -110,6 +111,7 @@ pub struct WorldState {
     pub actors: ActorTable,
     pub prefabs: PrefabTable,
     pub macro_grid: MacroGrid,
+    pub ca: CaState,
 }
 
 impl WorldState {
@@ -132,7 +134,24 @@ impl WorldState {
             actors: ActorTable::new(),
             prefabs: PrefabTable::new(),
             macro_grid: MacroGrid::new(),
+            ca: CaState::new(),
         }
+    }
+
+    /// Read the material at a world coord directly from the active
+    /// scene's dense buffer. Unlike the renderer's chunk SVO traversal,
+    /// this sees uncommitted writes that haven't been flushed yet.
+    /// Out-of-bounds and unallocated chunks return 0 (air).
+    pub fn read_material(&self, x: u32, y: u32, z: u32) -> u8 {
+        if x >= WORLD_SIDE || y >= WORLD_SIDE || z >= WORLD_SIDE { return 0; }
+        let scene = match self.active_scene_ref() { Some(s) => s, None => return 0 };
+        let (cx, cy, cz, lx, ly, lz) = split_world_coords(x, y, z);
+        let key = ChunkKey::new(cx, cy, cz);
+        let cs = match scene.chunks.get(key.0 as usize).and_then(|c| c.as_deref()) {
+            Some(c) => c,
+            None => return 0,
+        };
+        cs.dense[local_index(lx, ly, lz)]
     }
 
     /// Switch the active scene. The new scene is lazy-allocated if it
@@ -182,9 +201,18 @@ impl WorldState {
         }
         let cs = slot.as_mut().unwrap();
         let i = local_index(lx, ly, lz);
-        if cs.dense[i] != material {
+        let prev = cs.dense[i];
+        if prev != material {
             cs.dense[i] = material;
             cs.dirty = true;
+            // CA hook: any change to or from a CA-flagged material
+            // wakes the voxel + its 6-neighbors, so adjacent grains
+            // can resume falling when air opens up beneath them.
+            if material_has_ca(&self.materials, material)
+                || material_has_ca(&self.materials, prev)
+            {
+                self.ca.mark_active(x, y, z);
+            }
         }
     }
 
@@ -207,6 +235,12 @@ impl WorldState {
         if material == 0 && self.active_scene_ref().is_none() {
             return;
         }
+        // CA hook fires once per fill_box on the boundary voxels of the
+        // box rather than per cell — we just need adjacent grains to
+        // know something changed. Computed before the &mut borrow of
+        // scene is taken below.
+        let mark_ca = material_has_ca(&self.materials, material);
+
         let scene = self.ensure_active_scene();
 
         let cx_min = xs >> 5;
@@ -246,6 +280,21 @@ impl WorldState {
                     cs.dirty = true;
                 }
             }
+        }
+
+        if mark_ca {
+            // Mark the corners of the filled region. Granular sims
+            // care about boundary cells; interior voxels of a uniform
+            // fill don't need individual wake-ups since they can't
+            // move past each other anyway.
+            self.ca.mark_active(xs, ys, zs);
+            self.ca.mark_active(xe, ys, zs);
+            self.ca.mark_active(xs, ye, zs);
+            self.ca.mark_active(xe, ye, zs);
+            self.ca.mark_active(xs, ys, ze);
+            self.ca.mark_active(xe, ys, ze);
+            self.ca.mark_active(xs, ye, ze);
+            self.ca.mark_active(xe, ye, ze);
         }
     }
 
@@ -302,6 +351,17 @@ impl WorldState {
             .map(|s| s.populated_chunk_count())
             .unwrap_or(0)
     }
+}
+
+/// True if material `m` has any of the CA-eligible flags set.
+fn material_has_ca(materials: &[Material; 256], m: u8) -> bool {
+    if m == 0 { return false; }
+    let any = MaterialFlags::GRANULAR
+        | MaterialFlags::LIQUID
+        | MaterialFlags::GAS
+        | MaterialFlags::FLAMMABLE
+        | MaterialFlags::FIRE;
+    materials[m as usize].flags.0 & any != 0
 }
 
 impl Default for WorldState {

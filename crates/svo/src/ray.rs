@@ -127,24 +127,17 @@ fn traverse(
 
 /// Slab-method ray-AABB intersection. Returns `(t_enter, t_exit)` or `None`
 /// when the ray misses entirely.
+///
+/// Each axis is handled separately so axis-aligned rays (one or more
+/// `dir` components exactly zero) don't tunnel through `0 * ∞ = NaN`
+/// when `origin` lies on a slab boundary. A zero-direction axis
+/// contributes the unconstrained slab `[-∞, +∞]` if `origin` lies
+/// inside `[min, max]` on that axis, and rejects the ray entirely
+/// otherwise.
 fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<(f32, f32)> {
-    let inv = dir.componentwise_recip();
-    let t1 = (
-        (min.x - origin.x) * inv.x,
-        (min.y - origin.y) * inv.y,
-        (min.z - origin.z) * inv.z,
-    );
-    let t2 = (
-        (max.x - origin.x) * inv.x,
-        (max.y - origin.y) * inv.y,
-        (max.z - origin.z) * inv.z,
-    );
-    let tmin_x = t1.0.min(t2.0);
-    let tmin_y = t1.1.min(t2.1);
-    let tmin_z = t1.2.min(t2.2);
-    let tmax_x = t1.0.max(t2.0);
-    let tmax_y = t1.1.max(t2.1);
-    let tmax_z = t1.2.max(t2.2);
+    let (tmin_x, tmax_x) = axis_slab(origin.x, dir.x, min.x, max.x)?;
+    let (tmin_y, tmax_y) = axis_slab(origin.y, dir.y, min.y, max.y)?;
+    let (tmin_z, tmax_z) = axis_slab(origin.z, dir.z, min.z, max.z)?;
 
     let t_enter = tmin_x.max(tmin_y).max(tmin_z);
     let t_exit = tmax_x.min(tmax_y).min(tmax_z);
@@ -152,6 +145,18 @@ fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<(f32, f32)>
         None
     } else {
         Some((t_enter, t_exit))
+    }
+}
+
+#[inline]
+fn axis_slab(o: f32, d: f32, lo: f32, hi: f32) -> Option<(f32, f32)> {
+    if d == 0.0 {
+        if o < lo || o > hi { None } else { Some((f32::NEG_INFINITY, f32::INFINITY)) }
+    } else {
+        let inv = 1.0 / d;
+        let t1 = (lo - o) * inv;
+        let t2 = (hi - o) * inv;
+        Some((t1.min(t2), t1.max(t2)))
     }
 }
 

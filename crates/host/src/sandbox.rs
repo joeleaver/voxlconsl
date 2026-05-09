@@ -108,6 +108,44 @@ impl Cart {
     }
 }
 
+/// Bring the active scene's chunk SVOs and the actor macro-grid back
+/// in sync with cart-side mutations. Cheap when nothing changed.
+fn prepare_for_queries(world: &mut WorldState) {
+    world.flush();
+    world.actors.flush_all();
+    world.macro_grid.rebuild(&world.actors);
+}
+
+fn write_hit(
+    caller: &mut Caller<WorldState>,
+    out_ptr: u32,
+    hit: Option<voxlconsl_types::Hit>,
+) -> u32 {
+    let hit = match hit { Some(h) => h, None => return 0 };
+    let bytes = crate::physics::encode_hit(&hit);
+    let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+        Some(m) => m,
+        None => return 0,
+    };
+    let _ = memory.write(caller, out_ptr as usize, &bytes);
+    1
+}
+
+fn write_sweep_hit(
+    caller: &mut Caller<WorldState>,
+    out_ptr: u32,
+    hit: Option<voxlconsl_types::SweepHit>,
+) -> u32 {
+    let hit = match hit { Some(h) => h, None => return 0 };
+    let bytes = crate::physics::encode_sweep_hit(&hit);
+    let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+        Some(m) => m,
+        None => return 0,
+    };
+    let _ = memory.write(caller, out_ptr as usize, &bytes);
+    1
+}
+
 fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::Error> {
     // World mutation (§3.6)
     linker.func_wrap(
@@ -472,6 +510,132 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "input_action_active",
         |caller: Caller<WorldState>, h: u32| -> u32 {
             caller.data().input.is_active(voxlconsl_types::ActionHandle(h)) as u32
+        },
+    )?;
+
+    // Physics queries (§10.1)
+    //
+    // All six imports flush dirty chunk SVOs + the actor macro-grid
+    // before answering, so cart code that mutates the world and
+    // immediately queries it sees the post-write state. Flushes are
+    // cheap when nothing changed (just walks dirty flags).
+    linker.func_wrap(
+        "env", "raycast",
+        |mut caller: Caller<WorldState>,
+         ox: f32, oy: f32, oz: f32,
+         dx: f32, dy: f32, dz: f32,
+         max_dist: f32,
+         out_ptr: u32| -> u32 {
+            prepare_for_queries(caller.data_mut());
+            let hit = crate::physics::raycast(
+                caller.data(),
+                Vec3::new(ox, oy, oz),
+                Vec3::new(dx, dy, dz),
+                max_dist,
+            );
+            write_hit(&mut caller, out_ptr, hit)
+        },
+    )?;
+    linker.func_wrap(
+        "env", "raycast_world_only",
+        |mut caller: Caller<WorldState>,
+         ox: f32, oy: f32, oz: f32,
+         dx: f32, dy: f32, dz: f32,
+         max_dist: f32,
+         out_ptr: u32| -> u32 {
+            prepare_for_queries(caller.data_mut());
+            let hit = crate::physics::raycast_world_only(
+                caller.data(),
+                Vec3::new(ox, oy, oz),
+                Vec3::new(dx, dy, dz),
+                max_dist,
+            );
+            write_hit(&mut caller, out_ptr, hit)
+        },
+    )?;
+    linker.func_wrap(
+        "env", "aabb_overlap_world",
+        |mut caller: Caller<WorldState>,
+         min_x: f32, min_y: f32, min_z: f32,
+         max_x: f32, max_y: f32, max_z: f32| -> u32 {
+            prepare_for_queries(caller.data_mut());
+            crate::physics::aabb_overlap_world(
+                caller.data(),
+                Vec3::new(min_x, min_y, min_z),
+                Vec3::new(max_x, max_y, max_z),
+            ) as u32
+        },
+    )?;
+    linker.func_wrap(
+        "env", "aabb_overlap_actors",
+        |mut caller: Caller<WorldState>,
+         min_x: f32, min_y: f32, min_z: f32,
+         max_x: f32, max_y: f32, max_z: f32| -> u64 {
+            prepare_for_queries(caller.data_mut());
+            crate::physics::aabb_overlap_actors(
+                &caller.data().actors,
+                Vec3::new(min_x, min_y, min_z),
+                Vec3::new(max_x, max_y, max_z),
+            ).0
+        },
+    )?;
+    linker.func_wrap(
+        "env", "sweep_aabb",
+        |mut caller: Caller<WorldState>,
+         min_x: f32, min_y: f32, min_z: f32,
+         max_x: f32, max_y: f32, max_z: f32,
+         mx: f32, my: f32, mz: f32,
+         out_ptr: u32| -> u32 {
+            prepare_for_queries(caller.data_mut());
+            let hit = crate::physics::sweep_aabb(
+                caller.data(),
+                Vec3::new(min_x, min_y, min_z),
+                Vec3::new(max_x, max_y, max_z),
+                Vec3::new(mx, my, mz),
+            );
+            write_sweep_hit(&mut caller, out_ptr, hit)
+        },
+    )?;
+    linker.func_wrap(
+        "env", "material_at",
+        |mut caller: Caller<WorldState>, x: u32, y: u32, z: u32| -> u32 {
+            prepare_for_queries(caller.data_mut());
+            crate::physics::material_at(caller.data(), x, y, z) as u32
+        },
+    )?;
+
+    // CA (§10.3) — sparse cellular-automata sim for granular / liquid /
+    // gas / flammable / fire materials. v0.1.x ships granular fully;
+    // other rules dispatch through the same active set but no-op.
+    linker.func_wrap(
+        "env", "ca_set_budget",
+        |mut caller: Caller<WorldState>, voxels_per_frame: u32| {
+            caller.data_mut().ca.budget = voxels_per_frame;
+        },
+    )?;
+    linker.func_wrap(
+        "env", "ca_get_budget",
+        |caller: Caller<WorldState>| -> u32 {
+            caller.data().ca.budget
+        },
+    )?;
+    linker.func_wrap(
+        "env", "ca_mark_active",
+        |mut caller: Caller<WorldState>, x: u32, y: u32, z: u32| {
+            caller.data_mut().ca.mark_active(x, y, z);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "ca_active_count",
+        |caller: Caller<WorldState>| -> u32 {
+            caller.data().ca.active_count() as u32
+        },
+    )?;
+    linker.func_wrap(
+        "env", "ca_set_global_param",
+        |_caller: Caller<WorldState>, _param: u32, _value: f32| {
+            // Reserved for v2 — no global params tunable in v1's
+            // granular-only sim.
         },
     )?;
 

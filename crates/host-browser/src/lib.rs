@@ -58,6 +58,12 @@ impl BrowserHost {
         // that the cart has had a chance to query input this frame.
         self.cart.world().input.end_of_frame(dt_ms as u32);
 
+        // Tick the CA sim (§10.3 layer 3). Must run before flush so the
+        // SVO rebuild captures any voxel mutations from sand/water/etc.
+        // CA tick reads/writes the dense buffer directly and re-marks
+        // dirty chunks for flush.
+        voxlconsl_host::ca::tick(self.cart.world());
+
         // Pull the world state the cart just configured and ray-march it.
         let world = self.cart.world();
         world.flush();

@@ -16,6 +16,7 @@ pub use voxlconsl_types::*;
 /// All multi-component values are passed as a flat list of primitives —
 /// WASM's ABI doesn't natively carry tuples or structs (§8.4).
 mod host {
+    use super::{Hit, SweepHit};
     unsafe extern "C" {
         pub fn set_voxel(x: u32, y: u32, z: u32, material: u32);
         pub fn fill_box(
@@ -77,6 +78,42 @@ mod host {
         pub fn input_action_active(h: u32) -> u32;
 
         pub fn log(ptr: *const u8, len: u32);
+
+        // Physics queries (§10.1)
+        pub fn raycast(
+            ox: f32, oy: f32, oz: f32,
+            dx: f32, dy: f32, dz: f32,
+            max_dist: f32,
+            out_hit: *mut Hit,
+        ) -> u32;
+        pub fn raycast_world_only(
+            ox: f32, oy: f32, oz: f32,
+            dx: f32, dy: f32, dz: f32,
+            max_dist: f32,
+            out_hit: *mut Hit,
+        ) -> u32;
+        pub fn aabb_overlap_world(
+            min_x: f32, min_y: f32, min_z: f32,
+            max_x: f32, max_y: f32, max_z: f32,
+        ) -> u32;
+        pub fn aabb_overlap_actors(
+            min_x: f32, min_y: f32, min_z: f32,
+            max_x: f32, max_y: f32, max_z: f32,
+        ) -> u64;
+        pub fn sweep_aabb(
+            min_x: f32, min_y: f32, min_z: f32,
+            max_x: f32, max_y: f32, max_z: f32,
+            mx: f32, my: f32, mz: f32,
+            out_hit: *mut SweepHit,
+        ) -> u32;
+        pub fn material_at(x: u32, y: u32, z: u32) -> u32;
+
+        // CA (§10.3)
+        pub fn ca_set_budget(voxels_per_frame: u32);
+        pub fn ca_get_budget() -> u32;
+        pub fn ca_mark_active(x: u32, y: u32, z: u32);
+        pub fn ca_active_count() -> u32;
+        pub fn ca_set_global_param(param: u32, value: f32);
     }
 }
 
@@ -308,6 +345,8 @@ pub fn actor_get_orientation(actor: ActorId) -> Orientation {
 }
 
 pub mod animation;
+pub mod ca;
+pub mod physics;
 pub mod text;
 
 // ============================================================================

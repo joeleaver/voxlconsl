@@ -24,20 +24,58 @@ pub enum Shape {
     Sphere { radius: f32 },
 }
 
-/// Result of `raycast` and `material_at` queries (§10.1).
+/// Result of a [`raycast`](crate::physics) query (§10.1).
+///
+/// `repr(C)` so the SDK and host agree on the wire layout for the
+/// `*mut Hit` out pointer the cart passes through the host import.
+/// `material` is a u8; the trailing `_pad` keeps `normal` properly
+/// 4-byte-aligned.
 #[derive(Copy, Clone, Debug)]
+#[repr(C)]
 pub struct Hit {
     pub pos: UVec3,
     pub material: u8,
+    pub _pad: [u8; 3],
     pub normal: IVec3,
     pub t: f32,
+    /// `u32::MAX` when the hit is against the world; otherwise the id
+    /// of the actor whose volume was struck. SDK exposes this as
+    /// `Option<ActorId>` via [`Hit::actor_id`].
+    pub actor: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<Hit>() == 36);
+
+impl Hit {
+    pub const NO_ACTOR: u32 = u32::MAX;
+
+    pub fn actor_id(&self) -> Option<ActorId> {
+        if self.actor == Self::NO_ACTOR { None } else { Some(ActorId(self.actor)) }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
+#[repr(C)]
 pub struct SweepHit {
     pub t: f32,
     pub normal: IVec3,
-    pub blocked_by_actor: Option<ActorId>,
+    /// `u32::MAX` when the sweep was blocked by world voxels; otherwise
+    /// the id of the actor that blocked it.
+    pub blocked_by_actor: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<SweepHit>() == 20);
+
+impl SweepHit {
+    pub const NO_ACTOR: u32 = u32::MAX;
+
+    pub fn blocked_by_actor_id(&self) -> Option<ActorId> {
+        if self.blocked_by_actor == Self::NO_ACTOR {
+            None
+        } else {
+            Some(ActorId(self.blocked_by_actor))
+        }
+    }
 }
 
 /// Snapshot of a body's state, returned by `body_get`.

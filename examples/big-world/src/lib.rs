@@ -20,7 +20,12 @@
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
+use voxlconsl_sdk::physics;
 use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
+
+// Frames-per-sand-drop. With ~22 fps gameplay this gives ~5 drops/s.
+const SAND_DROP_PERIOD: u32 = 4;
+static mut SAND_DROP_COUNTER: u32 = 0;
 
 const WORLD: u32 = 512;
 
@@ -44,6 +49,9 @@ const M_SKIN:  u8 = 6;
 const M_SHIRT: u8 = 7;
 const M_SIGN_BODY: u8 = 8;
 const M_SIGN_FACE: u8 = 9;
+const M_RETICLE:   u8 = 10;
+const M_SAND:      u8 = 11;
+const M_WATER:     u8 = 12;
 
 // ── Player ────────────────────────────────────────────────────────────────
 const DUDE_W: usize = 5;
@@ -76,6 +84,10 @@ static mut CAM_YAW: f32 = 0.7;
 static mut CAM_PITCH: f32 = 0.45;
 static mut CAM_DISTANCE: f32 = 28.0;
 
+// Targeting reticle — last-painted voxel position, so we can clear it
+// before painting the next frame's hit point. None on first frame.
+static mut RETICLE_POS: Option<UVec3> = None;
+
 // Action handles.
 static mut MOVE_ACTION: ActionHandle = ActionHandle(0);
 static mut AIM_ACTION:  ActionHandle = ActionHandle(0);
@@ -95,6 +107,25 @@ pub extern "C" fn init() {
     // letters glow off the front of the slab.
     material_define(M_SIGN_BODY, Material::pack_color( 0, 0), 0, MaterialFlags::empty());
     material_define(M_SIGN_FACE, Material::pack_color(13, 3), 12, MaterialFlags::empty());
+    // Bright red glowing reticle voxel — painted each frame at the
+    // player's look-at point via the new physics::raycast import.
+    material_define(M_RETICLE,   Material::pack_color(10, 3), 14, MaterialFlags::empty());
+    // Sand: granular CA flag drives the pile-into-angle-of-repose
+    // behavior in §10.3. Color is a warm tan in the Yellow ramp.
+    material_define(
+        M_SAND,
+        Material::pack_color(12, 2),
+        0,
+        MaterialFlags::empty().with(MaterialFlags::GRANULAR),
+    );
+    // Water: LIQUID flag drives the lateral-spread CA rule. Color is
+    // a saturated cyan so the contrast with the dirt below reads.
+    material_define(
+        M_WATER,
+        Material::pack_color(5, 2),
+        0,
+        MaterialFlags::empty().with(MaterialFlags::LIQUID),
+    );
 
     sky_set_gradient(Material::pack_color(7, 0), Material::pack_color(6, 0));
     light_set_sun(Vec3::new(-0.6, 0.8, 0.4), 0, 0);
@@ -331,6 +362,66 @@ pub extern "C" fn update(dt_ms: u32) {
             if want != CURRENT_FRAME {
                 actor_set_prefab(player, want);
                 CURRENT_FRAME = want;
+            }
+        }
+    }
+
+    // ── Targeting reticle ─────────────────────────────────────
+    //
+    // Demonstrates physics::raycast_world_only (§10.1). We probe a
+    // column 6 voxels east + south of the player by casting a ray
+    // straight down from y=100 and finding the topmost ground voxel.
+    // A 3×3 emissive pad gets painted on top so the orbit cam can
+    // see it next to the dude. The previous frame's pad gets cleared
+    // first so the marker tracks the player as they move.
+    //
+    // (The probe-column approach sidesteps the actor-composite issue:
+    // a marker painted in the player's column would be hidden behind
+    // the dude, since actors render over world voxels in §11.6.)
+    unsafe {
+        let reticle = &mut *(&raw mut RETICLE_POS);
+        if let Some(prev) = reticle.take() {
+            fill_box(
+                UVec3::new(prev.x.saturating_sub(1), prev.y, prev.z.saturating_sub(1)),
+                UVec3::new(prev.x + 1, prev.y, prev.z + 1),
+                0,
+            );
+        }
+        let probe_x = (PLAYER_POS.x as u32).saturating_add(6);
+        let probe_z = (PLAYER_POS.z as u32).saturating_add(6);
+        let probe_origin = Vec3::new(probe_x as f32, 100.0, probe_z as f32);
+        let probe_dir = Vec3::new(0.0, -1.0, 0.0);
+        if let Some(hit) = physics::raycast_world_only(probe_origin, probe_dir, 200.0) {
+            let cx = ((hit.pos.x as i32) + hit.normal.x).clamp(2, 509) as u32;
+            let cy = ((hit.pos.y as i32) + hit.normal.y).clamp(2, 509) as u32;
+            let cz = ((hit.pos.z as i32) + hit.normal.z).clamp(2, 509) as u32;
+            fill_box(
+                UVec3::new(cx.saturating_sub(1), cy, cz.saturating_sub(1)),
+                UVec3::new(cx + 1, cy, cz + 1),
+                M_RETICLE,
+            );
+            *reticle = Some(UVec3::new(cx, cy, cz));
+        }
+
+        // ── Sand + water drops (CA §10.3 demo) ─────────────────
+        //
+        // Sand drops on the player's east-south side; water on the
+        // east-north side. Watch the sand pile up at the angle of
+        // repose while the water spreads flat. Both materials run
+        // through the same active-set sim — only their flags differ.
+        SAND_DROP_COUNTER = SAND_DROP_COUNTER.saturating_add(1);
+        if SAND_DROP_COUNTER >= SAND_DROP_PERIOD {
+            SAND_DROP_COUNTER = 0;
+            let sand_x = (PLAYER_POS.x as u32).saturating_add(6);
+            let sand_z = (PLAYER_POS.z as u32).saturating_add(6);
+            let water_x = (PLAYER_POS.x as u32).saturating_add(6);
+            let water_z = (PLAYER_POS.z as u32).saturating_sub(6);
+            let drop_y = 60u32;
+            if physics::material_at(sand_x, drop_y, sand_z) == 0 {
+                set_voxel(UVec3::new(sand_x, drop_y, sand_z), M_SAND);
+            }
+            if physics::material_at(water_x, drop_y, water_z) == 0 {
+                set_voxel(UVec3::new(water_x, drop_y, water_z), M_WATER);
             }
         }
     }
