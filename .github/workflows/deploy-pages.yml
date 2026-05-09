@@ -43,7 +43,10 @@ jobs:
           tool: wasm-bindgen-cli@0.2.100,mdbook@0.4
 
       - name: Build the browser emulator
-        run: ./scripts/build-web.sh release
+        # big-world is the demo cart for v0.1.3+: title screen using
+        # voxlconsl_sdk::text, targeting reticle via physics::raycast,
+        # and sand+water drops driving the §10.3 CA sim.
+        run: ./scripts/build-web.sh release big-world
 
       - name: Stage the spec into the book source
         # docs/src/spec.md is a symlink to ../../SPEC.md. Replace it with
