@@ -1149,6 +1149,74 @@ fn update(dt_ms: u32) {
 
 **Skeletal animation** (parted actors with parent-relative bone transforms, smooth bone rotation, blendable clips) is parking-lotted to v2. It would require continuous sub-voxel rotation of voxel sub-volumes, which doesn't read well in the medium without aggressive snapping — at which point you're authoring discrete poses anyway, which is what flipbook already does.
 
+### 11.10 Text rendering
+
+Text in voxlconsl is voxels. There is no glyph rasterizer in the host, no overlay layer, no 2D framebuffer — letters are voxels carved into the world or into actor volumes, lit and ray-marched by the same pipeline as everything else. This matches §3.5's note that dialog text is "cart-rendered into actor volumes positioned in front of the camera — text is voxels, like everything else."
+
+The SDK ships `voxlconsl_sdk::text`, a pure cart-side helper that consumes `.vfnt` fonts (§12.7) and paints voxel text into either world voxels or a caller-provided dense buffer. The host is unaware of fonts or text — it just receives `set_voxel` calls or has a `prefab_define` data buffer handed to it.
+
+**Two paint paths:**
+
+```rust
+pub enum Axis { XY, XZ, YZ }  // which plane the 2D glyph lives in;
+                              // the perpendicular axis is the extrusion direction
+
+pub static FONT_ANSI: Font<'static>;  // 10×11 ASCII (codepoints 32–126)
+pub static FONT_DCP1: Font<'static>;  // 16×18 ASCII (codepoints 32–126)
+
+impl<'a> Font<'a> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, FontError>;
+    pub fn cell_width(&self) -> u8;
+    pub fn cell_height(&self) -> u8;
+    pub fn glyph_count(&self) -> u16;
+}
+
+/// Paint text into world voxels via `set_voxel`. For permanent signs.
+pub fn paint_world(
+    font: &Font,
+    origin: UVec3,
+    axis: Axis,
+    color: u8,
+    face_color: Option<u8>,
+    scale: u8,
+    depth: u32,
+    s: &str,
+);
+
+/// Rasterize text into a caller-provided dense buffer. The cart can hand
+/// the buffer to `prefab_define` and spawn an actor — the basis of HUD,
+/// dialog boxes, and billboardable signage.
+pub fn rasterize_into(
+    font: &Font,
+    buf: &mut [u8],
+    buf_size: U8Vec3,
+    axis: Axis,
+    color: u8,
+    face_color: Option<u8>,
+    scale: u8,
+    depth: u32,
+    s: &str,
+) -> U8Vec3;  // extents written
+
+/// Compute extents (cell_w*scale*chars × cell_h*scale × depth) for layout.
+pub fn measure(font: &Font, scale: u8, depth: u32, s: &str) -> U8Vec3;
+```
+
+**Depth and face_color.** The `.vfnt` format itself is strictly 2D — every glyph is a flat bitmap. The 3D shape comes at paint time:
+
+- **`depth: u32`** repeats the 2D glyph `depth` slices along the axis perpendicular to the chosen plane. `depth = 1` is a thin slab; `depth = 8+` is a chunky 3D sign.
+- **`face_color: Option<u8>`** paints the first slice (the slice at the lower coord on the extrusion axis) with material `m`; the remaining `depth - 1` slices use `color`. Lets carts author glowing fronts on wooden signs, RUBY-faced letters carved into stone, etc., without authoring 3D fonts. Pass `None` for a uniform color across all slices.
+
+Carts that want the face on the *back* swap front/back materials and adjust `origin` accordingly; the helper deliberately picks one convention rather than exposing every flip.
+
+**`scale`** is a per-axis voxel multiplier in the painted plane. `scale = 1` paints one voxel per glyph bit; `scale = 3` paints a 3×3 voxel block per bit. `depth` is independent of `scale`.
+
+**Layout.** Glyphs are placed left-to-right with no inter-letter gap (the font's cell already includes its own padding). Multi-line layouts are cart-side: split on `\n`, advance origin by `cell_h * scale + line_spacing` per line, call `paint_world`/`rasterize_into` per line.
+
+**Why both paint paths.** `paint_world` covers permanent text (signs in the world, carved-stone messages, world-as-UI) where the text shouldn't follow the camera. `rasterize_into` covers dynamic text (dialog boxes, HUD, score counters, billboards) where the cart wants to spawn the text as an actor it can position, hide, animate, or yaw to face the camera. Forcing one to emulate the other costs either a per-frame world-rewrite or a per-sign actor.
+
+**Deferred to a later session.** Variable-width / proportional glyphs (flag bit reserved), anti-aliased / multi-color glyphs (flag bit reserved), built-in 8×8 font, billboard helper (carts can `actor_set_yaw` themselves), dialog-box / panel helper, PNG-to-`.vfnt` and TTF-to-`.vfnt` build-time converters.
+
 ---
 
 ## 12. Authoring & toolchain
@@ -1545,7 +1613,44 @@ default = 1
 
 The importer flips coordinates Z-up → Y-up automatically. Models with multiple shapes are flattened into a single `.vxv` by default; pass `--split-models` to emit one file per shape.
 
-### 12.7 Editor cart (roadmap)
+### 12.7 The `.vfnt` format (voxel font)
+
+`.vfnt` is voxlconsl's native bitmap-font format. Carts use it via the cart-side text renderer (§11.10, `voxlconsl_sdk::text`) which extrudes the 2D glyphs through a third axis to paint voxel text into the world or into actor volumes. The format is fixed-width and 2D — runtime `scale` and `depth` parameters in the paint API cover the dynamic-size and 3D-extrusion intents, so the file stays small and authoring stays trivial.
+
+The SDK ships two built-in fonts (both ASCII printable, codepoints 32–126) so simple carts can paint text without authoring a `.vfnt`:
+
+- `FONT_ANSI` — 10×11, derived from the figlet "ANSI Regular" face. Clean blocky letterforms; a sensible default for HUD and dialog.
+- `FONT_DCP1` — 16×18, derived from the figlet "Delta Corps Priest 1" face. Stylized chiseled-serif look; suits title signage and stone-carved messaging.
+
+Carts that want custom typefaces ship `.vfnt` blobs alongside their other assets and parse them via `Font::from_bytes(&'static [u8])`. The repo includes `scripts/flf_to_vfnt.py` which converts figlet `.flf` source fonts into `.vfnt` blobs (auto-detecting whether the source uses `#`-style or unicode-half-block rendering).
+
+**Header (16 bytes, all little-endian):**
+
+```
+Offset  Field          Size    Notes
+------  -------------  ------  --------------------------------------------------------------
+0       magic          4 B     "VFN1" (0x56 0x46 0x4E 0x31)
+4       version        u8      format version (currently 1)
+5       cell_w         u8      base glyph width in voxels (1..=64)
+6       cell_h         u8      base glyph height in voxels (1..=64)
+7       flags          u8      0 in v1; reserved bits: 0=variable-width, 1=anti-aliased
+8       glyph_count    u16     number of glyphs in the index
+10      reserved       u8 × 6  zero
+```
+
+**Glyph index** (immediately follows the header): `glyph_count` records of 8 bytes each, sorted ascending by codepoint:
+
+```
+codepoint   u32   Unicode scalar value
+bitmap_off  u32   byte offset of this glyph's bitmap, measured from the start
+                  of the bitmap section
+```
+
+**Bitmap section** (immediately follows the index): a flat byte sequence. Each glyph occupies `ceil(cell_w * cell_h / 8)` bytes containing `cell_w * cell_h` bits, MSB-first, laid out row-major (left-to-right, top-to-bottom). A set bit means "this voxel is part of the glyph"; a clear bit means "skip this voxel". Glyph bitmaps are tightly packed back-to-back; offsets in the index point to the first byte of each glyph and bits don't span glyph boundaries (each glyph rounds up to a whole byte).
+
+**Sizing.** Multiple `.vfnt` files can ship at different cell sizes (5×7, 8×8, etc.) and a cart can hold several fonts simultaneously. There is no internal palette — color is supplied by the painter call, not the font.
+
+### 12.8 Editor cart (roadmap)
 
 Authoring `.vxv` in v1 means MagicaVoxel + importer, or a programmatic pipeline. A native voxlconsl world editor — built as a regular cart running on the platform — is an explicit roadmap goal, mirroring the synth-editor pattern from §5.7.
 

@@ -20,8 +20,20 @@
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
+use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
 
 const WORLD: u32 = 512;
+
+// ── Scenes ──────────────────────────────────────────────────────────────
+// Scene 0 is the title screen the cart boots into; FIRE transitions
+// the player into the gameplay world (scene 1).
+const SCENE_TITLE: SceneId = SceneId(0);
+const SCENE_GAME:  SceneId = SceneId(1);
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum GameState { Title, Playing }
+static mut STATE: GameState = GameState::Title;
+static mut TITLE_CLOCK_MS: u32 = 0;
 
 const M_STONE: u8 = 1;
 const M_DIRT:  u8 = 2;
@@ -30,6 +42,8 @@ const M_WOOD:  u8 = 4;
 const M_LEAF:  u8 = 5;
 const M_SKIN:  u8 = 6;
 const M_SHIRT: u8 = 7;
+const M_SIGN_BODY: u8 = 8;
+const M_SIGN_FACE: u8 = 9;
 
 // ── Player ────────────────────────────────────────────────────────────────
 const DUDE_W: usize = 5;
@@ -77,9 +91,19 @@ pub extern "C" fn init() {
     material_define(M_LEAF,  Material::pack_color( 2, 2), 0, MaterialFlags::empty());
     material_define(M_SKIN,  Material::pack_color( 1, 3), 0, MaterialFlags::empty());
     material_define(M_SHIRT, Material::pack_color( 7, 2), 0, MaterialFlags::empty());
+    // Sign body = warm dark wood; face = bright emissive accent so the
+    // letters glow off the front of the slab.
+    material_define(M_SIGN_BODY, Material::pack_color( 0, 0), 0, MaterialFlags::empty());
+    material_define(M_SIGN_FACE, Material::pack_color(13, 3), 12, MaterialFlags::empty());
 
     sky_set_gradient(Material::pack_color(7, 0), Material::pack_color(6, 0));
     light_set_sun(Vec3::new(-0.6, 0.8, 0.4), 0, 0);
+
+    // The cart owns two scenes: a clean void where the title text
+    // floats (scene 0) and the gameplay world below (scene 1). We
+    // build scene 1 first, then scene 0, leaving 0 active so the cart
+    // boots into the title.
+    scene_set_active(SCENE_GAME);
 
     // ── Terrain ───────────────────────────────────────────────
     //
@@ -133,6 +157,61 @@ pub extern "C" fn init() {
         }
     }
 
+    // ── Title scene ───────────────────────────────────────────
+    //
+    // A clean void with the title text floating at world-center. The
+    // render() callback orbits a camera around it. FIRE pulls the
+    // player into SCENE_GAME (handled in update()).
+    //
+    // Title text uses FONT_DCP1 (16×18 chiseled-serif). The subtitle
+    // uses FONT_ANSI for the smaller "PRESS FIRE" line. Both go in
+    // the XY plane, so the +Z face is what the orbit camera reads when
+    // it passes through cam_yaw == 0.
+    //
+    // face_color is painted on the slice closest to the lower coord on
+    // the extrusion axis. To put the emissive face on the +Z side
+    // (the side the camera sees from cam_yaw≈0), the cart passes the
+    // dark body material as face_color and the bright face material
+    // as the main color — the spec's documented front/back swap.
+    scene_set_active(SCENE_TITLE);
+    let title_extents = measure(&FONT_DCP1, 2, 12, "voxlconsl");
+    let title_origin = UVec3::new(
+        256u32.saturating_sub(title_extents.x as u32 / 2),
+        256u32.saturating_sub(title_extents.y as u32 / 2),
+        256u32.saturating_sub(title_extents.z as u32 / 2),
+    );
+    paint_world(
+        &FONT_DCP1,
+        title_origin,
+        Axis::XY,
+        M_SIGN_FACE,
+        Some(M_SIGN_BODY),
+        2,         // 2× scale → 32×36 voxel letters, 9 chars × 32 = 288 wide
+        12,        // depth — chunky 3D slab
+        "voxlconsl",
+    );
+
+    let sub_extents = measure(&FONT_ANSI, 1, 4, "PRESS FIRE");
+    let sub_origin = UVec3::new(
+        256u32.saturating_sub(sub_extents.x as u32 / 2),
+        title_origin.y.saturating_sub(20),  // below the main title
+        title_origin.z + 4,                  // sits in front of title's mid-depth
+    );
+    paint_world(
+        &FONT_ANSI,
+        sub_origin,
+        Axis::XY,
+        M_SIGN_FACE,
+        None,
+        1,
+        4,
+        "PRESS FIRE",
+    );
+
+    // Switch back to the gameplay scene to define the player prefab and
+    // spawn the actor; the title scene stays clean of game-world data.
+    scene_set_active(SCENE_GAME);
+
     // ── Player prefab + actor ─────────────────────────────────
     unsafe {
         // IDLE: legs straight (z=1), arms at sides (z=1).
@@ -156,6 +235,9 @@ pub extern "C" fn init() {
         PLAYER = Some(id);
         actor_set_position(id, PLAYER_POS);
         CURRENT_FRAME = P_IDLE;
+        // Hide the dude until the player presses FIRE; actors are
+        // cart-global and we don't want him in the title scene's frame.
+        actor_set_visible(id, false);
     }
 
     // ── Input ─────────────────────────────────────────────────
@@ -164,10 +246,28 @@ pub extern "C" fn init() {
         AIM_ACTION  = input_declare_action(ActionKind::Axis2D, BindingHint::Aim, "aim");
         FIRE_ACTION = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "fire");
     }
+
+    // Boot into the title screen.
+    scene_set_active(SCENE_TITLE);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn update(dt_ms: u32) {
+    // Title-screen state: orbit camera + wait for FIRE to start the game.
+    if unsafe { STATE } == GameState::Title {
+        unsafe { TITLE_CLOCK_MS = TITLE_CLOCK_MS.saturating_add(dt_ms); }
+        if input_action_pressed(unsafe { FIRE_ACTION }) {
+            unsafe {
+                STATE = GameState::Playing;
+                if let Some(p) = PLAYER {
+                    actor_set_visible(p, true);
+                }
+            }
+            scene_set_active(SCENE_GAME);
+        }
+        return;
+    }
+
     let dt = (dt_ms as f32) / 1000.0;
     let (mx, my) = input_action_axis2d(unsafe { MOVE_ACTION });
     let (ax, ay) = input_action_axis2d(unsafe { AIM_ACTION });
@@ -238,6 +338,32 @@ pub extern "C" fn update(dt_ms: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn render() {
+    // Title screen: orbit a camera around the floating title text. The
+    // sign sits at world-center; we sweep yaw slowly and tilt slightly
+    // up to show the chiseled-serif tops.
+    if unsafe { STATE } == GameState::Title {
+        let t = unsafe { TITLE_CLOCK_MS } as f32 / 1000.0;
+        // The title is a flat slab in the XY plane — only its +Z face
+        // reads as letters; full-orbit views show edge-on ribs. Sway
+        // gently within ±15° instead so the camera always looks at the
+        // face, with a touch of motion to feel alive.
+        let yaw = sine(t * 0.4) * 0.26;
+        // Subtitle sits 20 voxels below the title (y≈218). Target a
+        // point between them so the vertical FOV frames both.
+        let target = Vec3::new(256.0, 248.0, 256.0);
+        let dist = 240.0;
+        let cam_pitch = 0.06;
+        let cos_pitch = cosine(cam_pitch);
+        let eye = Vec3::new(
+            target.x + dist * sine(yaw) * cos_pitch,
+            target.y + dist * sine(cam_pitch),
+            target.z + dist * cosine(yaw) * cos_pitch,
+        );
+        camera_set_lookat(eye, target, Vec3::Y);
+        camera_set_fov(50.0);
+        return;
+    }
+
     let (yaw, pitch, dist) = unsafe { (CAM_YAW, CAM_PITCH, CAM_DISTANCE) };
     let pos = unsafe { PLAYER_POS };
 

@@ -26,3 +26,7 @@ Cargo.lock.bak
 .idea/
 .vscode/
 
+# Python (scripts/flf_to_vfnt.py and friends)
+__pycache__/
+*.pyc
+

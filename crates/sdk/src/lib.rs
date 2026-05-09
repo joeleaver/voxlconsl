@@ -308,6 +308,7 @@ pub fn actor_get_orientation(actor: ActorId) -> Orientation {
 }
 
 pub mod animation;
+pub mod text;
 
 // ============================================================================
 // Input — see SPEC.md §6.
