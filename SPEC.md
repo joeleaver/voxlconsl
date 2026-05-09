@@ -634,27 +634,60 @@ Ports without haptic hardware ignore the call. Carts must not gate gameplay on r
 
 ## 7. Cart format (`.voxl`)
 
-Single binary file, max 32 MB. Chunked layout, all multi-byte values little-endian.
+Single binary file, hard cap 32 MB. Chunked layout, all multi-byte values little-endian. The header carries an authoritative section table; the bundler may emit sections in any order and may omit any section other than `Code`.
+
+**Header (32 bytes):**
 
 ```
-+------------------+
-| Header (32 B)    |  magic "VOXLCONSL\0", version, section table
-+------------------+
-| Metadata         |  title, author, version, palette tag, controls hint
-+------------------+
-| Code (WASM)      |  ≤ 1 MB, the cart binary
-+------------------+
-| Materials        |  ≤ 4 KB, 256 × material struct
-+------------------+
-| World (SVO)      |  ≤ 24.5 MB, compressed sparse voxel octree
-+------------------+
-| Audio            |  ≤ 1.5 MB, patches + sample bank + MIDI songs
-+------------------+
-| Save schema      |  optional, declares persistent state shape
-+------------------+
+Offset  Field           Size    Notes
+------  --------------  ------  --------------------------------------
+0       magic           10 B    "VOXLCONSL\0"
+                                (0x56 0x4F 0x58 0x4C 0x43 0x4F 0x4E
+                                 0x53 0x4C 0x00)
+10      version         u16     format version (currently 1)
+12      flags           u16     0 in v1; reserved
+14      section_count   u8      number of section table entries (≤ 16
+                                in v1; the section table immediately
+                                follows the header)
+15      reserved        u8      0
+16      total_size      u32     file size in bytes (must equal the
+                                actual length on disk)
+20      crc32           u32     CRC-32/ISO-HDLC of the entire file with
+                                this 4-byte field zeroed at the time
+                                of computation
+24      reserved        8 B     zero
 ```
 
-Section sizes above are *defaults*; the header's section table is authoritative. The 32 MB total is a hard cap.
+**Section table** — `section_count` × 16 bytes, immediately after the header:
+
+```
+Offset  Field                Size    Notes
+------  -------------------  ------  --------------------------------------
+0       id                   u16     well-known section id (table below)
+2       flags                u16     bit 0: compressed (zstd); 0 in v1
+4       offset               u32     byte offset of this section's data
+                                     from the start of the file
+8       size                 u32     bytes on disk
+12      uncompressed_size    u32     decompressed length (== size when
+                                     uncompressed)
+```
+
+A given section id appears at most once. Sections may live in any order on disk; readers MUST consult the section table rather than assuming a layout.
+
+**Section ids (v1):**
+
+| ID | Name        | Contents |
+|---|---|---|
+| 0 | Metadata    | UTF-8 TOML string holding the resolved `[cart]` manifest table (name, title, author, version, spec_version, description, license). Informational; the runtime does not require it. |
+| 1 | Code        | Raw WASM module bytes, ≤ 1 MB recommended. **Required** in v1 — a cart with no Code section is rejected at load. |
+| 2 | Materials   | 256 × packed material struct (§2.4). When present the host pre-populates the material table at boot; runtime `material_define` calls remain authoritative and may override. |
+| 3 | World       | SVO-encoded world chunks (§13). When present the host pre-populates active-scene chunks before `init` runs. |
+| 4 | Audio       | Audio asset blob — synth patches, sample bank, MIDI songs (§5). |
+| 5 | SaveSchema  | UTF-8 TOML string declaring persistent state shape. Documentation-only in v1 (§7 persistent-state note below). |
+
+**v1 minimum cart.** A valid v1 cart need only carry the Code section. Any other section is optional; the runtime treats absence as the natural default (no metadata displayed, materials defined entirely at runtime, world starts empty, no audio assets, no save schema). This lets early carts ship without forcing every subsystem (audio, world bundling, etc.) through the bundler before it's ready.
+
+**Section ids 6..=255** are reserved for future use; readers MUST tolerate (skip) unknown section ids in newer carts on a best-effort basis as long as the rest of the file validates.
 
 **Persistent state:** carts may declare a save block (≤ 64 KB) the host writes to local storage / flash. The cart manages its own serialization — the host treats the save block as opaque bytes. Carts read and write via `save_read` / `save_write` (§8). The optional `save.toml` schema in cart sources is **documentation only in v1**: it lets the editor and tooling display field labels but is not embedded in the cart, not enforced at runtime, and does not perform migration. Schema-driven save formats with versioned migration are parking-lotted to v2.
 

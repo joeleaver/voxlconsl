@@ -1,6 +1,6 @@
 //! The `voxlconsl` CLI. See SPEC.md §12.4.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -21,6 +21,9 @@ enum Command {
     Bundle {
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Override the output path (default: <path>/target/<cart_name>.voxl).
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// Launch a .voxl in the desktop reference host.
     Run {
@@ -51,8 +54,11 @@ fn main() {
         Command::New { name } => {
             eprintln!("voxlconsl new {name}: not yet implemented");
         }
-        Command::Bundle { path } => {
-            eprintln!("voxlconsl bundle {}: not yet implemented", path.display());
+        Command::Bundle { path, output } => {
+            if let Err(e) = run_bundle(&path, output.as_deref()) {
+                eprintln!("voxlconsl bundle: {e}");
+                std::process::exit(1);
+            }
         }
         Command::Run { cart } => {
             eprintln!("voxlconsl run {}: not yet implemented", cart.display());
@@ -72,4 +78,32 @@ fn main() {
             );
         }
     }
+}
+
+fn run_bundle(path: &Path, output: Option<&Path>) -> Result<(), String> {
+    let bytes = voxlconsl_bundler::bundle_cart(path).map_err(|e| e.to_string())?;
+    // Default output: <path>/target/<cart_name>.voxl. We re-parse the
+    // manifest just for the cart name so the bundler stays focused on
+    // emitting bytes.
+    let out_path = match output {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let manifest = std::fs::read_to_string(path.join("cart.toml"))
+                .map_err(|e| format!("read cart.toml: {e}"))?;
+            let value: toml::Value = toml::from_str(&manifest)
+                .map_err(|e| format!("parse cart.toml: {e}"))?;
+            let name = value
+                .get("cart")
+                .and_then(|c| c.get("name"))
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| "cart.toml missing [cart].name".to_string())?;
+            let target_dir = path.join("target");
+            std::fs::create_dir_all(&target_dir)
+                .map_err(|e| format!("mkdir target: {e}"))?;
+            target_dir.join(format!("{name}.voxl"))
+        }
+    };
+    std::fs::write(&out_path, &bytes).map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    eprintln!("wrote {} ({} bytes)", out_path.display(), bytes.len());
+    Ok(())
 }

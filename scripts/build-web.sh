@@ -9,7 +9,8 @@
 #
 # Steps:
 #   1. Build the example cart (wasm32, release).
-#   2. Copy the cart's .wasm into a stable location for `include_bytes!`.
+#   2. Bundle it into a .voxl via `voxlconsl-cli bundle`, copying the
+#      result to a stable location for `include_bytes!`.
 #   3. Build the browser host (wasm32, release or debug).
 #   4. Run wasm-bindgen on the host's .wasm into web/pkg.
 
@@ -36,14 +37,20 @@ esac
 
 # Cart name: positional second arg wins, then $CART env var, then default.
 CART="${2:-${CART:-hello-cube}}"
-EMBEDDED_WASM="crates/host-browser/embedded-cart.wasm"
+EMBEDDED_VOXL="crates/host-browser/embedded-cart.voxl"
 
 echo "[build-web] building cart: $CART ($PROFILE)..."
 cargo build --target wasm32-unknown-unknown -p "$CART" "${BUILD_FLAGS[@]}"
 
-CART_OUT="$OUT_DIR/${CART//-/_}.wasm"
-cp "$CART_OUT" "$EMBEDDED_WASM"
-echo "[build-web] cart wasm: $(wc -c < "$EMBEDDED_WASM") bytes -> $EMBEDDED_WASM"
+# The bundler runs `cargo build --release` again from inside the cart
+# directory per cart.toml's `[code].build` line. That's redundant when
+# we just built above; the second invocation is a no-op rebuild that
+# costs only the build-graph walk (~50 ms). Worth it for the
+# spec-conformant pipeline.
+echo "[build-web] bundling cart -> .voxl..."
+cargo run --release -p voxlconsl-cli -- bundle "examples/$CART" \
+    --output "$EMBEDDED_VOXL"
+echo "[build-web] cart voxl: $(wc -c < "$EMBEDDED_VOXL") bytes -> $EMBEDDED_VOXL"
 
 echo "[build-web] building voxlconsl-host-browser ($PROFILE)..."
 cargo build --target wasm32-unknown-unknown -p voxlconsl-host-browser "${BUILD_FLAGS[@]}"

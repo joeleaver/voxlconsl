@@ -1,0 +1,12 @@
+[cart]
+name         = "big-world"
+title        = "Big World"
+version      = "0.1.1"
+spec_version = "0.1"
+author       = "voxlconsl"
+description  = "Renderer stress test + title-screen demo for the cart-side text renderer (§11.10)."
+license      = "MIT OR Apache-2.0"
+
+[code]
+build  = "cargo build --release --target wasm32-unknown-unknown -p big-world"
+output = "../../target/wasm32-unknown-unknown/release/big_world.wasm"

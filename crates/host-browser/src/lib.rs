@@ -1,9 +1,9 @@
 //! Browser host for voxlconsl — the reference implementation (SPEC.md §9).
 //!
-//! v0.0.3: loads a cart `.wasm` (compiled separately and embedded via
-//! `include_bytes!`), runs it inside `wasmi`, and renders whatever world
-//! state the cart populates each frame. The "test scene" is now a real
-//! cart, not host-side hardcoded geometry.
+//! Loads a `.voxl` cart binary embedded at build time, runs it inside
+//! `wasmi`, and renders whatever world state the cart populates each
+//! frame. `Cart::load` auto-detects `.voxl` vs raw `.wasm` so this
+//! crate doesn't need to care about the format.
 
 use wasm_bindgen::prelude::*;
 
@@ -13,9 +13,10 @@ use voxlconsl_host::sandbox::Cart;
 
 const FB_BYTES: usize = (WIDTH as usize) * (HEIGHT as usize) * 4;
 
-/// The hello-cube cart, built by scripts/build-web.sh and copied to a stable
-/// path before this crate is compiled.
-const EMBEDDED_CART: &[u8] = include_bytes!("../embedded-cart.wasm");
+/// Embedded cart `.voxl`, produced by `scripts/build-web.sh` (which runs
+/// `voxlconsl bundle` and copies the resulting blob here before this
+/// crate is compiled).
+const EMBEDDED_CART: &[u8] = include_bytes!("../embedded-cart.voxl");
 
 #[wasm_bindgen]
 pub struct BrowserHost {

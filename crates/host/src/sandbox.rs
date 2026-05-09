@@ -20,6 +20,7 @@ use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
 use voxlconsl_types::{
     ActionKind, ActorId, BindingHint, Material, MaterialFlags, Orientation, PrefabId,
     U8Vec3, Vec3,
+    cart_format::{Cart as VoxlCart, CartError as VoxlError, MAGIC as VOXL_MAGIC},
 };
 
 use crate::renderer::Camera;
@@ -39,16 +40,33 @@ pub struct Cart {
 pub enum CartError {
     Wasm(wasmi::Error),
     MissingExport(&'static str),
+    Voxl(VoxlError),
 }
 
 impl From<wasmi::Error> for CartError {
     fn from(e: wasmi::Error) -> Self { Self::Wasm(e) }
 }
 
+impl From<VoxlError> for CartError {
+    fn from(e: VoxlError) -> Self { Self::Voxl(e) }
+}
+
 impl Cart {
-    /// Load and instantiate a cart from raw `.wasm` bytes. Calls the cart's
-    /// `init` export immediately so the cart can populate the world.
-    pub fn load(wasm_bytes: &[u8]) -> Result<Self, CartError> {
+    /// Load and instantiate a cart. Accepts either a `.voxl` cart binary
+    /// (auto-detected via the `VOXLCONSL\0` magic) or raw `.wasm` bytes
+    /// for tests and migration. Calls the cart's `init` export
+    /// immediately so the cart can populate the world.
+    pub fn load(bytes: &[u8]) -> Result<Self, CartError> {
+        // Auto-detect: try the .voxl path when the magic matches; fall
+        // back to raw WASM otherwise. Lets us flip browser-host /
+        // CLI / tests at our own pace.
+        let wasm_bytes: &[u8] = if bytes.len() >= VOXL_MAGIC.len() && bytes[..VOXL_MAGIC.len()] == VOXL_MAGIC {
+            let cart = VoxlCart::parse(bytes)?;
+            cart.code()
+        } else {
+            bytes
+        };
+
         let engine = Engine::default();
         let module = Module::new(&engine, wasm_bytes)?;
         let mut store = Store::new(&engine, WorldState::new());

@@ -15,6 +15,7 @@ pub mod camera;
 pub mod actor;
 pub mod physics;
 pub mod audio;
+pub mod cart_format;
 
 pub use actor::*;
 pub use audio::*;

@@ -1,0 +1,12 @@
+[cart]
+name         = "hello-cube"
+title        = "Hello Cube"
+version      = "0.1.1"
+spec_version = "0.1"
+author       = "voxlconsl"
+description  = "The reference cart — controllable flipbook character, prefab barrels, multi-chunk overworld + dungeon scene."
+license      = "MIT OR Apache-2.0"
+
+[code]
+build  = "cargo build --release --target wasm32-unknown-unknown -p hello-cube"
+output = "../../target/wasm32-unknown-unknown/release/hello_cube.wasm"
