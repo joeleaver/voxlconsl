@@ -24,8 +24,13 @@ use voxlconsl_sdk::physics;
 use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
 
 // Frames-per-sand-drop. With ~22 fps gameplay this gives ~5 drops/s.
-const SAND_DROP_PERIOD: u32 = 4;
+// Water drops on a slower cadence than sand: the v0.1.x liquid CA rule
+// spreads laterally one cell per pressure-event, and at 4-frame intervals
+// the source mass piles vertically faster than it can spread out.
+const SAND_DROP_PERIOD:  u32 = 4;
+const WATER_DROP_PERIOD: u32 = 16;
 static mut SAND_DROP_COUNTER: u32 = 0;
+static mut WATER_DROP_COUNTER: u32 = 0;
 
 const WORLD: u32 = 512;
 
@@ -427,20 +432,25 @@ pub extern "C" fn update(dt_ms: u32) {
         // ── Sand + water drops (CA §10.3 demo) ─────────────────
         //
         // Sand drops on the player's east-south side; water on the
-        // east-north side. Watch the sand pile up at the angle of
-        // repose while the water spreads flat. Both materials run
-        // through the same active-set sim — only their flags differ.
+        // east-north side. Sand piles at its angle of repose; water
+        // spreads laterally. Water uses a longer drop period because
+        // the v0.1.x lateral-spread rule is slower than a 4-frame
+        // cadence — see the comment on liquid_tick in ca.rs.
+        let drop_y = 60u32;
         SAND_DROP_COUNTER = SAND_DROP_COUNTER.saturating_add(1);
         if SAND_DROP_COUNTER >= SAND_DROP_PERIOD {
             SAND_DROP_COUNTER = 0;
             let sand_x = (PLAYER_POS.x as u32).saturating_add(6);
             let sand_z = (PLAYER_POS.z as u32).saturating_add(6);
-            let water_x = (PLAYER_POS.x as u32).saturating_add(6);
-            let water_z = (PLAYER_POS.z as u32).saturating_sub(6);
-            let drop_y = 60u32;
             if physics::material_at(sand_x, drop_y, sand_z) == 0 {
                 set_voxel(UVec3::new(sand_x, drop_y, sand_z), M_SAND);
             }
+        }
+        WATER_DROP_COUNTER = WATER_DROP_COUNTER.saturating_add(1);
+        if WATER_DROP_COUNTER >= WATER_DROP_PERIOD {
+            WATER_DROP_COUNTER = 0;
+            let water_x = (PLAYER_POS.x as u32).saturating_add(6);
+            let water_z = (PLAYER_POS.z as u32).saturating_sub(6);
             if physics::material_at(water_x, drop_y, water_z) == 0 {
                 set_voxel(UVec3::new(water_x, drop_y, water_z), M_WATER);
             }

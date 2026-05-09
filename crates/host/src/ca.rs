@@ -185,13 +185,21 @@ fn granular_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
 /// from above by another liquid voxel — spread laterally across same-y
 /// air whose floor is solid. **No diagonal slides**: those are the
 /// granular-rule's job and they make falling drops settle into
-/// pyramidal piles. Skipping them here is what makes water lay out
-/// flat instead of accreting into a sand-shaped mound.
+/// pyramidal piles.
 ///
-/// v0.1.x is single-voxel-per-cell mass-conservative flow — every move
-/// is a swap, never a duplication. The level-state byte (§10.3 bits
-/// 0–3) is reserved for the future sub-cell renderer; the rule itself
-/// treats every liquid voxel as a full unit.
+/// Limitation: this is mass-conservative single-voxel-per-cell flow,
+/// without a level state. A pile under a continuous source spreads
+/// outward but the *top* voxels of the pile see only air above and
+/// fail the pressure check, so they evict and freeze in place. The
+/// puddle ends up shaped like a flat-stepped pyramid that doesn't
+/// re-flatten after the source stops. Proper Minecraft-style flow
+/// (state byte bits 0–3 = level 0..15, donate-to-lower-neighbor
+/// equilibration) is parking-lotted to a follow-up CA pass; carts
+/// today should rate-limit the source so the spread can keep up.
+///
+/// The `level` state byte (§10.3 bits 0–3) is reserved for that
+/// future renderer + flow upgrade; the rule itself treats every
+/// liquid voxel as a full unit.
 fn liquid_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
     if y == 0 {
         world.ca.evict(x, y, z);
@@ -436,6 +444,7 @@ mod tests {
             "water piled vertically (y=1: {}, y=2: {}); expected y=1 > y=2",
             at_y1, at_y2);
     }
+
 
     #[test]
     fn liquid_lone_voxel_does_not_flicker() {
