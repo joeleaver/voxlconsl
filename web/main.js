@@ -2,8 +2,8 @@
 //
 // Loads the wasm-bindgen-generated JS, instantiates a BrowserHost, and runs
 // a requestAnimationFrame loop that copies the host's framebuffer into a
-// canvas via putImageData. Captures keyboard + mouse events and forwards
-// them to the host as input.
+// canvas via putImageData. Captures keyboard, mouse, and wheel events and
+// forwards them to the host as input.
 
 import init, { BrowserHost } from "./pkg/voxlconsl_host_browser.js";
 
@@ -51,6 +51,29 @@ async function start() {
     const h = host.height();
     const imageData = ctx.createImageData(w, h);
 
+    // ── Pointer-lock state ──────────────────────────────────────────────
+    //
+    // The cart treats mouse motion as `Aim` input. To get clean FPS-style
+    // continuous look without the cursor drifting off the canvas, click on
+    // the canvas to grab the pointer; press Escape (browser default) to
+    // release it. Mouse-delta forwarding is gated on the lock state so
+    // the camera doesn't drift while the user is just hovering.
+    let pointerLocked = false;
+    canvas.addEventListener("click", () => {
+        if (!pointerLocked) {
+            // Modern browsers return a Promise; older ones don't. Either
+            // way, the `pointerlockchange` listener below handles success.
+            const r = canvas.requestPointerLock();
+            if (r && typeof r.catch === "function") {
+                r.catch((err) => console.warn("pointer lock failed:", err));
+            }
+        }
+    });
+    document.addEventListener("pointerlockchange", () => {
+        pointerLocked = document.pointerLockElement === canvas;
+        canvas.classList.toggle("locked", pointerLocked);
+    });
+
     // ── Input wiring ─────────────────────────────────────────────────
     // Keyboard events: capture press/release for keys we care about.
     window.addEventListener("keydown", (e) => {
@@ -69,12 +92,25 @@ async function start() {
         if (id !== undefined) host.set_key(id, false);
     });
 
-    // Mouse delta: only accumulate when the canvas has pointer lock or
-    // when the mouse is over the canvas.
+    // Mouse delta: only accumulate when the canvas has pointer lock.
+    // movementX/Y is the per-event delta; suppressing it when unlocked
+    // keeps the cart's camera still while the user is just hovering or
+    // reading the page.
     canvas.addEventListener("mousemove", (e) => {
-        // movementX/Y is the per-event delta, available without lock.
-        host.add_mouse_delta(e.movementX, e.movementY);
+        if (pointerLocked) {
+            host.add_mouse_delta(e.movementX, e.movementY);
+        }
     });
+
+    // Mouse wheel → host's wheel-delta channel. We only forward when
+    // locked so the page can still scroll normally above/below the
+    // canvas. Normalizing by 100 turns one wheel notch into ≈ ±1.0
+    // (matching the `BindingHint::Zoom` convention: positive = zoom in).
+    canvas.addEventListener("wheel", (e) => {
+        if (!pointerLocked) return;
+        e.preventDefault();
+        host.add_wheel_delta(-e.deltaY / 100);
+    }, { passive: false });
 
     status.textContent = `running ${w}×${h}`;
 
@@ -95,7 +131,8 @@ async function start() {
         if (frameCursor === 0) {
             const avg = FRAME_TIMES.reduce((a, b) => a + b, 0) / FRAME_TIMES.length;
             const fps = 1000 / avg;
-            status.textContent = `running ${w}×${h} · ${fps.toFixed(1)} fps · WASD pan, mouse aim`;
+            const hint = pointerLocked ? "Esc to release" : "click canvas to play";
+            status.textContent = `running ${w}×${h} · ${fps.toFixed(1)} fps · ${hint}`;
         }
 
         requestAnimationFrame(frame);

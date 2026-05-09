@@ -574,7 +574,8 @@ Each port's auto-binder produces default action → physical-input mappings from
 | Hint | No gamepad connected | Gamepad connected |
 |---|---|---|
 | `PrimaryMovement` | WASD | Left stick |
-| `Aim` | Mouse delta | Right stick |
+| `Aim` | Mouse delta (only when canvas has pointer lock) | Right stick |
+| `Zoom` | Mouse wheel | Right trigger axis |
 | `PrimaryFire` | Left mouse / J | A button |
 | `SecondaryFire` | Right mouse / K | B button |
 | `Confirm` | Enter / J | A |
@@ -594,6 +595,7 @@ Mouse drives the right-stick equivalent *only when no gamepad is connected*; wit
 |---|---|
 | `PrimaryMovement` | Left stick |
 | `Aim` | Right stick |
+| `Zoom` | Right trigger axis (LT/RT differential) |
 | `PrimaryFire` / `Confirm` | A |
 | `SecondaryFire` / `Cancel` | B |
 | `Pause` | Start |

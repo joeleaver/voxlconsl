@@ -95,4 +95,11 @@ impl BrowserHost {
     pub fn add_mouse_delta(&mut self, dx: f32, dy: f32) {
         self.cart.world().input.add_mouse_delta(dx, dy);
     }
+
+    /// Accumulate wheel motion since the last frame. Pass
+    /// `-event.deltaY / 100` so one notch is ≈ ±1.0 with positive =
+    /// scroll-up = zoom-in (`BindingHint::Zoom` convention).
+    pub fn add_wheel_delta(&mut self, dy: f32) {
+        self.cart.world().input.add_wheel_delta(dy);
+    }
 }

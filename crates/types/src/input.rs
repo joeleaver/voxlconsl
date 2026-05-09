@@ -22,6 +22,9 @@ pub enum BindingHint {
     PrimaryMovement,
     /// 2D look/aim — accepts stick or pointer-delta (Axis2D).
     Aim,
+    /// Zoom in/out — accepts mouse wheel or stick axis (Axis1D).
+    /// Positive = zoom in (closer), negative = zoom out (farther).
+    Zoom,
     /// Main "do it" button (Button).
     PrimaryFire,
     /// Alt fire / aim-down-sights / right click.

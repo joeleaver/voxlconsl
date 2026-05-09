@@ -79,10 +79,19 @@ const WALK_FRAMES: &[PrefabId] = &[P_WALK_0, P_WALK_1, P_WALK_2, P_WALK_1];
 static mut WALK_FB: Flipbook = Flipbook::new(WALK_FRAMES, 140, true);
 static mut CURRENT_FRAME: PrefabId = P_IDLE;
 
-// Camera state — orbit around the dude.
+// Camera state — orbit around the dude. Defaults frame the dude
+// from a 3rd-person SW vantage so the gameplay HUD reads
+// immediately on entry.
 static mut CAM_YAW: f32 = 0.7;
 static mut CAM_PITCH: f32 = 0.45;
 static mut CAM_DISTANCE: f32 = 28.0;
+
+const CAM_PITCH_MIN: f32 = -0.20;     // ~-11° (just above looking up)
+const CAM_PITCH_MAX: f32 = 1.20;      // ~+69° (close to top-down)
+const CAM_DISTANCE_MIN: f32 = 6.0;
+const CAM_DISTANCE_MAX: f32 = 64.0;
+// Fraction of current distance applied per wheel-notch.
+const ZOOM_PER_NOTCH: f32 = 0.12;
 
 // Targeting reticle — last-painted voxel position, so we can clear it
 // before painting the next frame's hit point. None on first frame.
@@ -91,6 +100,7 @@ static mut RETICLE_POS: Option<UVec3> = None;
 // Action handles.
 static mut MOVE_ACTION: ActionHandle = ActionHandle(0);
 static mut AIM_ACTION:  ActionHandle = ActionHandle(0);
+static mut ZOOM_ACTION: ActionHandle = ActionHandle(0);
 static mut FIRE_ACTION: ActionHandle = ActionHandle(0);
 
 #[unsafe(no_mangle)]
@@ -275,6 +285,7 @@ pub extern "C" fn init() {
     unsafe {
         MOVE_ACTION = input_declare_action(ActionKind::Axis2D, BindingHint::PrimaryMovement, "move");
         AIM_ACTION  = input_declare_action(ActionKind::Axis2D, BindingHint::Aim, "aim");
+        ZOOM_ACTION = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom, "zoom");
         FIRE_ACTION = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "fire");
     }
 
@@ -302,24 +313,37 @@ pub extern "C" fn update(dt_ms: u32) {
     let dt = (dt_ms as f32) / 1000.0;
     let (mx, my) = input_action_axis2d(unsafe { MOVE_ACTION });
     let (ax, ay) = input_action_axis2d(unsafe { AIM_ACTION });
+    let zoom_delta = input_action_axis1d(unsafe { ZOOM_ACTION });
 
+    // ── Camera updates ────────────────────────────────────────
+    //
+    // Mouse delta drives yaw (left/right) and pitch (up/down) when the
+    // browser host has pointer lock — otherwise the host suppresses the
+    // delta so the camera stays put while the user reads the page.
+    //
+    // Wheel scroll drives zoom. Positive `zoom_delta` = scroll-up = zoom
+    // in. Step is fraction-of-current-distance per notch so far-away
+    // adjustments feel symmetric to close-up ones.
+    //
+    // Pitch is clamped well short of straight-down (1.20 rad ≈ 69°) and
+    // never tilts up past horizontal-plus-a-touch (-0.20 rad ≈ -11°),
+    // both to keep the third-person camera readable.
     unsafe {
-        CAM_YAW += ax * 0.005;
-        // Non-inverted Y (FPS feel): mouse down → look down. In orbit
-        // terms, look-down means the eye sits above the target →
-        // pitch positive → pitch *increases* with positive ay.
-        CAM_PITCH = (CAM_PITCH + ay * 0.005).clamp(-1.2, 1.2);
-        // Hold FIRE to dolly the camera in/out.
-        if input_action_button(FIRE_ACTION) {
-            CAM_DISTANCE = (CAM_DISTANCE + my * 30.0 * dt).clamp(8.0, 80.0);
+        CAM_YAW += ax * 0.004;
+        // FPS feel: mouse down → look down. Orbit cam sits the eye
+        // above the target on positive pitch, so positive `ay` (mouse
+        // moved down) maps to increasing pitch.
+        CAM_PITCH = (CAM_PITCH + ay * 0.004).clamp(CAM_PITCH_MIN, CAM_PITCH_MAX);
+        if zoom_delta != 0.0 {
+            CAM_DISTANCE = (CAM_DISTANCE * (1.0 - zoom_delta * ZOOM_PER_NOTCH))
+                .clamp(CAM_DISTANCE_MIN, CAM_DISTANCE_MAX);
         }
     }
 
     let cam_yaw = unsafe { CAM_YAW };
-    // forward = the direction the camera is *looking*, not the direction
-    // the camera *sits in* relative to target. Orbit-cam puts the eye at
-    // (sin*d, _, cos*d) from target, so the look direction is the
-    // negation of that — and that's what W should move you along.
+    // forward = where the camera is *looking* (toward target), in the
+    // ground plane only — vertical look doesn't affect movement so the
+    // dude moves predictably even when the camera is angled steeply.
     let forward = Vec3::new(-sine(cam_yaw), 0.0, -cosine(cam_yaw));
     let right   = Vec3::new(cosine(cam_yaw), 0.0, -sine(cam_yaw));
     let movement = Vec3::new(
@@ -329,16 +353,13 @@ pub extern "C" fn update(dt_ms: u32) {
     );
     let speed = 12.0_f32;
     let speed_sq = movement.x * movement.x + movement.z * movement.z;
-    let move_active = !unsafe { input_action_button(FIRE_ACTION) };  // FIRE held = camera dolly, not movement
 
     if let Some(player) = unsafe { PLAYER } {
         unsafe {
-            let moving = move_active && speed_sq > 0.0025;
+            let moving = speed_sq > 0.0025;
 
-            if move_active {
-                PLAYER_POS.x = (PLAYER_POS.x + movement.x * speed * dt).clamp(2.0, (WORLD - 7) as f32);
-                PLAYER_POS.z = (PLAYER_POS.z + movement.z * speed * dt).clamp(2.0, (WORLD - 5) as f32);
-            }
+            PLAYER_POS.x = (PLAYER_POS.x + movement.x * speed * dt).clamp(2.0, (WORLD - 7) as f32);
+            PLAYER_POS.z = (PLAYER_POS.z + movement.z * speed * dt).clamp(2.0, (WORLD - 5) as f32);
             // Sample the heightmap each frame so the dude tracks the terrain.
             let h = terrain_height(PLAYER_POS.x as u32, PLAYER_POS.z as u32);
             PLAYER_POS.y = h as f32;

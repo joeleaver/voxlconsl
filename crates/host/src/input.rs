@@ -70,6 +70,9 @@ pub enum Binding {
     Button { key: Key },
     /// Mouse delta accumulated since last frame.
     MouseDelta,
+    /// Mouse wheel delta accumulated since last frame. Positive = zoom in
+    /// (browser wheel scrolls up = positive value), negative = zoom out.
+    MouseWheel,
     /// Unbound — no physical input maps to this action on this port.
     None,
 }
@@ -92,6 +95,9 @@ pub struct InputState {
     /// Mouse delta accumulated since the last frame boundary.
     mouse_dx: f32,
     mouse_dy: f32,
+    /// Wheel delta accumulated since the last frame boundary. Positive
+    /// = zoom in (wheel scrolled up), negative = zoom out.
+    wheel_dy: f32,
 }
 
 impl InputState {
@@ -104,6 +110,7 @@ impl InputState {
             keys_held_ms: std::collections::HashMap::new(),
             mouse_dx: 0.0,
             mouse_dy: 0.0,
+            wheel_dy: 0.0,
         }
     }
 
@@ -164,6 +171,7 @@ impl InputState {
             Some(Binding::Axis1DKey { pos }) => {
                 if self.keys_held.contains(pos) { 1.0 } else { 0.0 }
             }
+            Some(Binding::MouseWheel) => self.wheel_dy,
             _ => 0.0,
         }
     }
@@ -206,6 +214,13 @@ impl InputState {
         self.mouse_dy += dy;
     }
 
+    /// Accumulate wheel motion since the last frame boundary. Browser
+    /// hosts pass `-event.deltaY / 100` so one wheel notch ≈ ±1.0,
+    /// positive = zoom in.
+    pub fn add_wheel_delta(&mut self, dy: f32) {
+        self.wheel_dy += dy;
+    }
+
     /// Called by the runtime once per frame after `cart.update` finishes,
     /// to clear edge-triggered events and roll forward held-time counters.
     pub fn end_of_frame(&mut self, dt_ms: u32) {
@@ -214,9 +229,10 @@ impl InputState {
         for ms in self.keys_held_ms.values_mut() {
             *ms = ms.saturating_add(dt_ms);
         }
-        // Mouse delta is consumed each frame.
+        // Mouse + wheel deltas are consumed each frame.
         self.mouse_dx = 0.0;
         self.mouse_dy = 0.0;
+        self.wheel_dy = 0.0;
     }
 }
 
@@ -245,6 +261,7 @@ fn browser_default_binding(kind: ActionKind, hint: BindingHint) -> Binding {
         (ActionKind::Button, Pause) => Binding::Button { key: Key::Tab },
         (ActionKind::Button, Menu) => Binding::Button { key: Key::F1 },
         (ActionKind::Button, _) => Binding::Button { key: Key::Space },
+        (ActionKind::Axis1D, Zoom) => Binding::MouseWheel,
         (ActionKind::Axis1D, _) => Binding::Axis1DKey { pos: Key::Space },
         (ActionKind::Pointer, _) => Binding::None,
     }

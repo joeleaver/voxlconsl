@@ -34,6 +34,14 @@ main {
     image-rendering: pixelated;
     image-rendering: crisp-edges;
     display: block;
+    cursor: pointer;
+}
+
+/* Hide the cursor while pointer is locked — Chrome already does this
+   on its own, but Firefox sometimes leaves a flicker; explicit
+   `cursor: none` makes the behavior consistent across ports. */
+#screen.locked {
+    cursor: none;
 }
 
 #status {
