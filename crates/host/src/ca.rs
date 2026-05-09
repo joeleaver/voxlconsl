@@ -220,28 +220,37 @@ fn liquid_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
         }
     }
 
-    // Lateral spread — try each cardinal neighbor at the same y. Only
-    // moves if the neighbor cell is air. This is the step that makes
-    // water spread out flat across an obstacle instead of piling up.
-    // Anti-oscillation: only spread when at least one neighbor has a
-    // *lower* exposed surface, so two equal-level cells don't ping-pong.
-    for &(dx, dz) in &DIRS {
-        let nx = x as i32 + dx;
-        let nz = z as i32 + dz;
-        if nx < 0 || nx >= WORLD_SIDE as i32 { continue; }
-        if nz < 0 || nz >= WORLD_SIDE as i32 { continue; }
-        let nx = nx as u32;
-        let nz = nz as u32;
-        if world.read_material(nx, y, nz) != 0 { continue; }
-        // Don't spread laterally over solid floor unless that floor
-        // extends — i.e., only spread to neighbors whose floor is at
-        // the same height. This keeps water sitting flat on top of a
-        // staircase rather than flowing back and forth across the
-        // step.
-        if world.read_material(nx, y - 1, nz) != 0 {
-            world.set_voxel(x, y, z, 0);
-            world.set_voxel(nx, y, nz, m);
-            return;
+    // Lateral spread — only when this voxel is *pressured from above*
+    // by another liquid voxel. A lone settled voxel sitting on solid
+    // ground has no reason to move, so it stays put. A continuous
+    // stream from above feeds the bottom row, which spreads outward
+    // forming a flat puddle that grows while the source flows and
+    // freezes once it stops.
+    //
+    // (Without this gate a single voxel oscillates between cardinal
+    // neighbors forever: each move opens up the cell it just left,
+    // and the rule sees that cell as a valid lateral spread target
+    // next tick.)
+    let above = if y + 1 < WORLD_SIDE { world.read_material(x, y + 1, z) } else { 0 };
+    let pressured = above != 0
+        && world.materials[above as usize].flags.contains(MaterialFlags::LIQUID);
+    if pressured {
+        for &(dx, dz) in &DIRS {
+            let nx = x as i32 + dx;
+            let nz = z as i32 + dz;
+            if nx < 0 || nx >= WORLD_SIDE as i32 { continue; }
+            if nz < 0 || nz >= WORLD_SIDE as i32 { continue; }
+            let nx = nx as u32;
+            let nz = nz as u32;
+            if world.read_material(nx, y, nz) != 0 { continue; }
+            // Don't spread laterally onto open air — only over solid
+            // floor — so water sitting on a staircase doesn't pour
+            // off both sides every frame.
+            if world.read_material(nx, y - 1, nz) != 0 {
+                world.set_voxel(x, y, z, 0);
+                world.set_voxel(nx, y, nz, m);
+                return;
+            }
         }
     }
 
@@ -349,31 +358,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn liquid_spreads_laterally_over_solid_floor() {
-        // Drop a single water voxel on a flat stone floor; after
-        // ticking enough times it should end up adjacent to the drop
-        // column rather than stacked vertically.
+    fn flat_stone_5x5() -> WorldState {
         let mut world = WorldState::new();
         world.materials[1] = Material {
             flags: MaterialFlags::empty().with(MaterialFlags::LIQUID),
             ..Material::default()
         };
         world.materials[2] = Material::default();
-        // 5×5 stone floor at y=0 centered on (10, 10).
-        for &(dx, dz) in &[
-            (-2i32, -2), (-1, -2), (0, -2), (1, -2), (2, -2),
-            (-2,    -1), (-1, -1), (0, -1), (1, -1), (2, -1),
-            (-2,     0), (-1,  0), (0,  0), (1,  0), (2,  0),
-            (-2,     1), (-1,  1), (0,  1), (1,  1), (2,  1),
-            (-2,     2), (-1,  2), (0,  2), (1,  2), (2,  2),
-        ] {
-            let nx = (10i32 + dx) as u32;
-            let nz = (10i32 + dz) as u32;
-            world.set_voxel(nx, 0, nz, 2);
+        for dz in -2i32..=2 {
+            for dx in -2..=2 {
+                let nx = (10i32 + dx) as u32;
+                let nz = (10i32 + dz) as u32;
+                world.set_voxel(nx, 0, nz, 2);
+            }
         }
+        world
+    }
+
+    #[test]
+    fn liquid_spreads_laterally_when_pressured_from_above() {
+        // Stack two water voxels on the floor; the bottom one sees
+        // liquid above and should spread sideways.
+        let mut world = flat_stone_5x5();
         world.set_voxel(10, 1, 10, 1);
-        // Tick a handful of times; water should spread to a neighbor.
+        world.set_voxel(10, 2, 10, 1);  // pressure
         for _ in 0..8 { tick(&mut world); }
         let mut neighbor_water = 0;
         for &(dx, dz) in &[(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
@@ -383,13 +391,39 @@ mod tests {
                 neighbor_water += 1;
             }
         }
-        // Either the original cell still holds water and a neighbor
-        // does too (spread), or the original is empty and a neighbor
-        // holds water (lateral hop). Either is "spread" behaviour.
-        let origin_water = world.read_material(10, 1, 10) == 1;
-        assert!(neighbor_water > 0 || !origin_water,
-            "water didn't spread (origin holds water = {}, neighbors with water = {})",
-            origin_water, neighbor_water);
+        assert!(neighbor_water > 0,
+            "pressured water didn't spread to any neighbor");
+    }
+
+    #[test]
+    fn liquid_lone_voxel_does_not_flicker() {
+        // Single isolated water voxel on solid ground with nothing
+        // above — must NOT bounce between neighbors. This test is
+        // the regression for the "fallen voxels flicker in and out"
+        // bug.
+        let mut world = flat_stone_5x5();
+        world.set_voxel(10, 1, 10, 1);
+        let mut history = std::collections::HashSet::new();
+        for _ in 0..16 {
+            tick(&mut world);
+            // Where is the (single) water voxel after this tick?
+            let mut count = 0;
+            let mut pos = (0u32, 0u32, 0u32);
+            for &(dx, dz) in &[(-1i32, 0), (1, 0), (0, -1), (0, 1), (0, 0)] {
+                let nx = (10i32 + dx) as u32;
+                let nz = (10i32 + dz) as u32;
+                if world.read_material(nx, 1, nz) == 1 {
+                    count += 1;
+                    pos = (nx, 1, nz);
+                }
+            }
+            assert_eq!(count, 1, "lone voxel duplicated/disappeared");
+            history.insert(pos);
+        }
+        // The voxel should have settled, not visited multiple cells.
+        assert_eq!(history.len(), 1,
+            "lone water voxel oscillated through {} cells: {:?}",
+            history.len(), history);
     }
 
     #[test]
