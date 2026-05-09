@@ -19,6 +19,7 @@
 #![no_main]
 
 use voxlconsl_sdk::*;
+use voxlconsl_sdk::animation::Flipbook;
 
 const WORLD: u32 = 512;
 
@@ -35,12 +36,26 @@ const DUDE_W: usize = 5;
 const DUDE_H: usize = 7;
 const DUDE_D: usize = 3;
 const DUDE_VOL: usize = DUDE_W * DUDE_H * DUDE_D;
-static mut DENSE_DUDE: [u8; DUDE_VOL] = [0; DUDE_VOL];
-const P_DUDE: PrefabId = PrefabId(1);
+
+// Four prefab frames: idle + three walk poses (0/1/2 swing the legs
+// and arms in counterphase). Same scheme as hello-cube.
+const P_IDLE:   PrefabId = PrefabId(1);
+const P_WALK_0: PrefabId = PrefabId(2);
+const P_WALK_1: PrefabId = PrefabId(3);
+const P_WALK_2: PrefabId = PrefabId(4);
+
+static mut DENSE_IDLE:   [u8; DUDE_VOL] = [0; DUDE_VOL];
+static mut DENSE_WALK_0: [u8; DUDE_VOL] = [0; DUDE_VOL];
+static mut DENSE_WALK_1: [u8; DUDE_VOL] = [0; DUDE_VOL];
+static mut DENSE_WALK_2: [u8; DUDE_VOL] = [0; DUDE_VOL];
 
 static mut PLAYER: Option<ActorId> = None;
 static mut PLAYER_POS: Vec3 = Vec3 { x: 256.0, y: 32.0, z: 256.0 };
 static mut PLAYER_FACING: f32 = 0.0;
+
+const WALK_FRAMES: &[PrefabId] = &[P_WALK_0, P_WALK_1, P_WALK_2, P_WALK_1];
+static mut WALK_FB: Flipbook = Flipbook::new(WALK_FRAMES, 140, true);
+static mut CURRENT_FRAME: PrefabId = P_IDLE;
 
 // Camera state — orbit around the dude.
 static mut CAM_YAW: f32 = 0.7;
@@ -105,34 +120,42 @@ pub extern "C" fn init() {
     let mut planted = 0u32;
     while planted < 500 {
         prng = prng.wrapping_mul(0x9E37_79B9).wrapping_add(0x1234_5678);
-        let tx = ((prng >> 8) % (WORLD - 8)) + 4;
+        // Canopy spans cx±3, cz±3 → keep a 4-voxel border from world edges.
+        let tx = ((prng >> 8) % (WORLD - 10)) + 5;
         prng = prng.wrapping_mul(0x9E37_79B9).wrapping_add(0x1234_5678);
-        let tz = ((prng >> 8) % (WORLD - 8)) + 4;
+        let tz = ((prng >> 8) % (WORLD - 10)) + 5;
         let h = terrain_height(tx, tz);
         // Skip trees in low / underwater spots — keeps them out of
         // ditches and on the visibly-grass tiles.
         if h >= 8 {
-            plant_tree(tx, tz, h);
+            plant_tree(tx, tz, h, prng);
             planted += 1;
         }
     }
 
     // ── Player prefab + actor ─────────────────────────────────
     unsafe {
-        build_dude(&mut *(&raw mut DENSE_DUDE));
-        prefab_define(
-            P_DUDE,
-            &*(&raw const DENSE_DUDE),
-            U8Vec3::new(DUDE_W as u8, DUDE_H as u8, DUDE_D as u8),
-        );
+        // IDLE: legs straight (z=1), arms at sides (z=1).
+        // WALK frames: feet/arms swing in counterphase so the cycle reads.
+        build_dude(&mut *(&raw mut DENSE_IDLE),   1, 1, 1, 1);
+        build_dude(&mut *(&raw mut DENSE_WALK_0), 0, 2, 2, 0);
+        build_dude(&mut *(&raw mut DENSE_WALK_1), 1, 1, 1, 1);
+        build_dude(&mut *(&raw mut DENSE_WALK_2), 2, 0, 0, 2);
+
+        let size = U8Vec3::new(DUDE_W as u8, DUDE_H as u8, DUDE_D as u8);
+        prefab_define(P_IDLE,   &*(&raw const DENSE_IDLE),   size);
+        prefab_define(P_WALK_0, &*(&raw const DENSE_WALK_0), size);
+        prefab_define(P_WALK_1, &*(&raw const DENSE_WALK_1), size);
+        prefab_define(P_WALK_2, &*(&raw const DENSE_WALK_2), size);
     }
-    let id = actor_spawn_from(P_DUDE, Orientation::Up).expect("player");
+    let id = actor_spawn_from(P_IDLE, Orientation::Up).expect("player");
     unsafe {
         // Drop the player on the surface at the centre.
         let h = terrain_height(256, 256);
         PLAYER_POS = Vec3::new(254.0, h as f32, 254.0);
         PLAYER = Some(id);
         actor_set_position(id, PLAYER_POS);
+        CURRENT_FRAME = P_IDLE;
     }
 
     // ── Input ─────────────────────────────────────────────────
@@ -179,6 +202,8 @@ pub extern "C" fn update(dt_ms: u32) {
 
     if let Some(player) = unsafe { PLAYER } {
         unsafe {
+            let moving = move_active && speed_sq > 0.0025;
+
             if move_active {
                 PLAYER_POS.x = (PLAYER_POS.x + movement.x * speed * dt).clamp(2.0, (WORLD - 7) as f32);
                 PLAYER_POS.z = (PLAYER_POS.z + movement.z * speed * dt).clamp(2.0, (WORLD - 5) as f32);
@@ -187,9 +212,25 @@ pub extern "C" fn update(dt_ms: u32) {
             let h = terrain_height(PLAYER_POS.x as u32, PLAYER_POS.z as u32);
             PLAYER_POS.y = h as f32;
             actor_set_position(player, PLAYER_POS);
-            if speed_sq > 0.0025 && move_active {
+            if moving {
                 PLAYER_FACING = -atan2(movement.x, movement.z);
                 actor_set_yaw(player, PLAYER_FACING);
+            }
+
+            // Animate while moving, snap back to idle when stopped.
+            // Only call set_prefab on transitions — the swap is cheap
+            // but spamming it is wasteful.
+            let walk_fb = &mut *(&raw mut WALK_FB);
+            let want = if moving {
+                walk_fb.tick(dt_ms);
+                walk_fb.current()
+            } else {
+                walk_fb.reset();
+                P_IDLE
+            };
+            if want != CURRENT_FRAME {
+                actor_set_prefab(player, want);
+                CURRENT_FRAME = want;
             }
         }
     }
@@ -269,30 +310,33 @@ fn terrain_height(x: u32, z: u32) -> u32 {
 
 // ── Trees + player prefab ───────────────────────────────────────────────
 
-/// Plant a 5-tall trunk + 2-layer leaf canopy at `(cx, cz)` whose
-/// surface sits at world y=`base`.
-fn plant_tree(cx: u32, cz: u32, base: u32) {
-    let trunk_top = base + 4;
-    let mut y = base;
-    while y < trunk_top {
-        set_voxel(UVec3::new(cx, y, cz), M_WOOD);
-        y += 1;
-    }
-    // Two-layer canopy: 3×3 below, 1 cap on top.
-    let cy = trunk_top;
-    let mut dx: i32 = -1;
-    while dx <= 1 {
-        let mut dz: i32 = -1;
-        while dz <= 1 {
-            set_voxel(
-                UVec3::new((cx as i32 + dx) as u32, cy, (cz as i32 + dz) as u32),
-                M_LEAF,
-            );
-            dz += 1;
-        }
-        dx += 1;
-    }
-    set_voxel(UVec3::new(cx, cy + 1, cz), M_LEAF);
+/// Plant a tree at `(cx, cz)` with its base at world y=`base`. `variant`
+/// (any u32) drives a small height variation so the forest doesn't look
+/// like a stamp pattern. Total tree height ≈ 8–10 voxels (taller than
+/// the 7-tall dude); 4-layer canopy shrinking from a 7×7 mid-ring to a
+/// 3×3 cap.
+fn plant_tree(cx: u32, cz: u32, base: u32, variant: u32) {
+    let trunk_h = 4 + (variant % 3);  // 4, 5, or 6
+    let trunk_top = base + trunk_h;
+    // Trunk: single wood column.
+    fill_box(
+        UVec3::new(cx, base, cz),
+        UVec3::new(cx, trunk_top - 1, cz),
+        M_WOOD,
+    );
+    // 4-layer canopy starting at the trunk top.
+    let l0 = trunk_top;
+    let l1 = trunk_top + 1;
+    let l2 = trunk_top + 2;
+    let l3 = trunk_top + 3;
+    // 5×5 base
+    fill_box(UVec3::new(cx - 2, l0, cz - 2), UVec3::new(cx + 2, l0, cz + 2), M_LEAF);
+    // 7×7 mid ring — the visually dominant layer
+    fill_box(UVec3::new(cx - 3, l1, cz - 3), UVec3::new(cx + 3, l1, cz + 3), M_LEAF);
+    // 5×5 upper
+    fill_box(UVec3::new(cx - 2, l2, cz - 2), UVec3::new(cx + 2, l2, cz + 2), M_LEAF);
+    // 3×3 cap
+    fill_box(UVec3::new(cx - 1, l3, cz - 1), UVec3::new(cx + 1, l3, cz + 1), M_LEAF);
 }
 
 fn idx(x: usize, y: usize, z: usize) -> usize {
@@ -305,16 +349,25 @@ fn put(buf: &mut [u8; DUDE_VOL], x: usize, y: usize, z: usize, m: u8) {
     }
 }
 
-fn build_dude(buf: &mut [u8; DUDE_VOL]) {
+/// Build one frame of the little dude into `buf`.
+///
+/// `left_leg_z` / `right_leg_z` / `arm_l_z` / `arm_r_z` are 0..=2
+/// (front/middle/back). Idle uses z=1 for everything; walk frames
+/// swing legs and arms in counterphase.
+fn build_dude(
+    buf: &mut [u8; DUDE_VOL],
+    left_leg_z: usize, right_leg_z: usize,
+    arm_l_z: usize, arm_r_z: usize,
+) {
     *buf = [0; DUDE_VOL];
-    // Legs
-    put(buf, 1, 0, 1, M_WOOD); put(buf, 1, 1, 1, M_WOOD);
-    put(buf, 3, 0, 1, M_WOOD); put(buf, 3, 1, 1, M_WOOD);
+    // Legs (y=0..=1)
+    put(buf, 1, 0, left_leg_z,  M_WOOD); put(buf, 1, 1, left_leg_z,  M_WOOD);
+    put(buf, 3, 0, right_leg_z, M_WOOD); put(buf, 3, 1, right_leg_z, M_WOOD);
     // Torso 3×3 (x=1..3, y=2..4, z=1)
     let mut x = 1; while x <= 3 { let mut y = 2; while y <= 4 { put(buf, x, y, 1, M_SHIRT); y += 1; } x += 1; }
-    // Arms
-    put(buf, 0, 2, 1, M_SHIRT); put(buf, 0, 3, 1, M_SHIRT);
-    put(buf, 4, 2, 1, M_SHIRT); put(buf, 4, 3, 1, M_SHIRT);
+    // Arms (x=0/4, y=2..3) at the swing offset
+    put(buf, 0, 2, arm_l_z, M_SHIRT); put(buf, 0, 3, arm_l_z, M_SHIRT);
+    put(buf, 4, 2, arm_r_z, M_SHIRT); put(buf, 4, 3, arm_r_z, M_SHIRT);
     // Head 3×2×3 (x=1..3, y=5..6, full z)
     let mut x = 1; while x <= 3 {
         let mut y = 5; while y <= 6 {
