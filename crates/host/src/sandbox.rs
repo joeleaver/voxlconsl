@@ -470,17 +470,26 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
                 3 => ActionKind::Pointer,
                 _ => return u32::MAX,
             };
+            // Must match the cart-side `BindingHint` discriminants in
+            // voxlconsl-types. Don't skip Zoom — its slot (3) used to
+            // be missing here, which silently shifted every subsequent
+            // hint down by one: cart-side PrimaryFire (=4) was being
+            // decoded as SecondaryFire (binding K), Zoom (=3) was
+            // being decoded as PrimaryFire (binding J), etc. The
+            // long-standing "J doesn't reach the cart, K does" symptom
+            // was actually this off-by-one masquerade.
             let hint = match hint {
                 0 => BindingHint::None,
                 1 => BindingHint::PrimaryMovement,
                 2 => BindingHint::Aim,
-                3 => BindingHint::PrimaryFire,
-                4 => BindingHint::SecondaryFire,
-                5 => BindingHint::Confirm,
-                6 => BindingHint::Cancel,
-                7 => BindingHint::Menu,
-                8 => BindingHint::Pause,
-                9 => BindingHint::PointerOnly,
+                3 => BindingHint::Zoom,
+                4 => BindingHint::PrimaryFire,
+                5 => BindingHint::SecondaryFire,
+                6 => BindingHint::Confirm,
+                7 => BindingHint::Cancel,
+                8 => BindingHint::Menu,
+                9 => BindingHint::Pause,
+                10 => BindingHint::PointerOnly,
                 _ => BindingHint::None,
             };
             caller.data_mut().input.declare(name, kind, hint).0
@@ -979,6 +988,46 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "voice_release",
         |mut caller: Caller<WorldState>, voice: u32| {
             caller.data_mut().audio.voice_release(crate::audio::VoiceId(voice));
+        },
+    )?;
+
+    // Stage 3 — MIDI event surface (§5.2).
+    linker.func_wrap(
+        "env", "note_on",
+        |mut caller: Caller<WorldState>, channel: u32, note: u32, velocity: u32| -> u32 {
+            caller.data_mut().audio.note_on(
+                channel as u8, note as u8, velocity as u8,
+            ).0
+        },
+    )?;
+    linker.func_wrap(
+        "env", "note_off",
+        |mut caller: Caller<WorldState>, channel: u32, note: u32| {
+            caller.data_mut().audio.note_off(channel as u8, note as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "pitch_bend",
+        |mut caller: Caller<WorldState>, channel: u32, value: i32| {
+            caller.data_mut().audio.pitch_bend(channel as u8, value as i16);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "cc",
+        |mut caller: Caller<WorldState>, channel: u32, controller: u32, value: u32| {
+            caller.data_mut().audio.cc(channel as u8, controller as u8, value as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "program_change",
+        |mut caller: Caller<WorldState>, channel: u32, patch: u32| {
+            caller.data_mut().audio.program_change(channel as u8, patch as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "all_notes_off",
+        |mut caller: Caller<WorldState>, channel: u32| {
+            caller.data_mut().audio.all_notes_off(channel as u8);
         },
     )?;
 

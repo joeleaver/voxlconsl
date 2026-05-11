@@ -43,6 +43,35 @@ pub const SAMPLE_SLOTS: usize = 64;
 /// Maximum patches per cart (§5.1).
 pub const PATCH_SLOTS: usize = 16;
 
+/// MIDI channels (§5.2). 16 channels, identity-mapped to patches by
+/// default (channel N → patch N % PATCH_SLOTS). MIDI channel "10"
+/// follows General MIDI convention as the drum channel; in our
+/// 0-indexed API that's channel index 9.
+pub const MIDI_CHANNELS: usize = 16;
+
+/// 0-indexed MIDI channel that defaults to drum-kit playback.
+/// `program_change` on this channel switches it to a normal synth
+/// patch and disables the drum bypass.
+pub const DRUM_CHANNEL: u8 = 9;
+
+/// Number of slots in the host-private drum bank. Covers GM
+/// percussion notes 35..=81; the slot for a given note is
+/// `note - 35`. Not all slots are populated — only the recipes in
+/// `DRUM_RECIPES` fill in their corresponding slots.
+pub const DRUM_BANK_SIZE: usize = 47;
+
+/// Sentinel `channel` value for `SynthVoiceState` created via the
+/// `voice_trigger` primitive (not via `note_on`). These voices don't
+/// match any MIDI channel for `note_off` / `all_notes_off` lookups.
+const NO_CHANNEL: u8 = 0xFF;
+
+// MIDI CC numbers we recognize (§5.2). Other CCs are silently ignored.
+pub const CC_MOD_WHEEL: u8 = 1;
+pub const CC_VOLUME: u8 = 7;
+pub const CC_PAN: u8 = 10;
+pub const CC_EXPRESSION: u8 = 11;
+pub const CC_SUSTAIN: u8 = 64;
+
 /// Each voice mixes its contribution as f32 in roughly ±1 range into
 /// a per-block accumulator. The master stage soft-clips the sum
 /// through `tanh` (which smoothly compresses anything above ±1 toward
@@ -296,9 +325,19 @@ struct SvfState {
     ic2eq: f32,
 }
 
+/// Which sample bank an SFX voice draws from. Cart samples (the
+/// 64-slot bank populated by `sample_register`) and host drum samples
+/// (the 47-slot bank synthesized at boot for channel-10 percussion)
+/// share the same SFX mix path — they only differ in lookup table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SampleSource {
+    Cart(u8),
+    Drum(u8),
+}
+
 #[derive(Copy, Clone, Debug)]
 struct SfxVoiceState {
-    sample_slot: u8,
+    source: SampleSource,
     /// Fractional position in sample data. f64 keeps drift negligible
     /// over multi-second samples.
     position: f64,
@@ -310,9 +349,12 @@ struct SfxVoiceState {
 #[derive(Copy, Clone, Debug)]
 struct SynthVoiceState {
     patch: u8,
-    /// MIDI note number. Stored but not yet read directly; Stage 3
-    /// will reference it for `note_off` / `all_notes_off` matching.
-    #[allow(dead_code)]
+    /// 0..=15 MIDI channel that triggered the voice. Used by
+    /// `note_off` / `all_notes_off` / sustain to look up which
+    /// voice(s) to release.
+    channel: u8,
+    /// MIDI note number — `note_off` matches voices by `(channel,
+    /// note)`.
     note: u8,
     velocity: u8,
     /// Per-oscillator phase, [0, 1).
@@ -385,13 +427,364 @@ fn bump_generation(g: u8) -> u8 {
 }
 
 // ===========================================================================
+// MIDI channel state (Stage 3)
+// ===========================================================================
+
+/// Per-channel state for the §5.2 MIDI surface. Values are typed
+/// as MIDI-native ranges; conversion to mixer-native happens at use.
+#[derive(Copy, Clone, Debug)]
+struct Channel {
+    /// Which patch this channel currently plays. `program_change`
+    /// updates this and also flips `is_drum` to false.
+    patch_idx: u8,
+    /// True for channel 9 (MIDI 10) by default — `note_on` then
+    /// bypasses the patch system and triggers a drum sample from the
+    /// host-private drum bank. Cleared on `program_change`.
+    is_drum: bool,
+    /// CC 7. 0..=127.
+    volume: u8,
+    /// CC 10. 0..=127; 0 = full L, 64 = center, 127 = full R.
+    pan: u8,
+    /// CC 11. 0..=127. Multiplies with volume per §5.2.
+    expression: u8,
+    /// CC 1. 0..=127. Adds to the patch's LFO depth.
+    mod_wheel: u8,
+    /// Pitch bend wheel. -8192..=8191; ±2 semitones at full scale by
+    /// default. Per-channel range customization is reserved.
+    pitch_bend: i16,
+    /// CC 64. While true, note_off adds the note number to
+    /// `sustained_notes` instead of releasing the voice. When sustain
+    /// transitions false, every sustained note gets released.
+    sustain_held: bool,
+    /// Bitmap of MIDI note numbers held by the sustain pedal.
+    sustained_lo: u64,
+    sustained_hi: u64,
+}
+
+impl Channel {
+    fn new(idx: usize) -> Self {
+        Self {
+            // Identity default mapping per §5.2: channel N → patch
+            // N % 16. Cart can `program_change` immediately to remap.
+            patch_idx: (idx % PATCH_SLOTS) as u8,
+            is_drum: idx == DRUM_CHANNEL as usize,
+            volume: 100,
+            pan: 64,
+            expression: 127,
+            mod_wheel: 0,
+            pitch_bend: 0,
+            sustain_held: false,
+            sustained_lo: 0,
+            sustained_hi: 0,
+        }
+    }
+
+    fn mark_sustained(&mut self, note: u8) {
+        if note < 64 {
+            self.sustained_lo |= 1u64 << note;
+        } else if note < 128 {
+            self.sustained_hi |= 1u64 << (note - 64);
+        }
+    }
+
+    fn clear_sustained(&mut self) {
+        self.sustained_lo = 0;
+        self.sustained_hi = 0;
+    }
+}
+
+// ===========================================================================
+// Drum kit — synthesized at host boot from §5.1's synth engine.
+// ===========================================================================
+//
+// The §5.2 default for channel 10 is a "drum-kit patch" that maps
+// note numbers to percussion samples. Rather than ship those samples
+// as PCM blobs in the host firmware, we describe each drum as a
+// recipe (patch + note + velocity + duration) and render it once at
+// `AudioState::new()`. The rendered audio lives in a host-private
+// 47-slot bank — separate from the cart's 64-slot sample bank, so
+// carts retain their full bank.
+//
+// The recipes are deliberately minimal (~10 GM drums). Without the
+// FM oscillator / pitch envelope shipping in later stages, the kick
+// and toms can't do the classic 808 pitch sweep — so they speak
+// their fundamental directly. That gives a cleaner "fantasy console"
+// drum aesthetic than chasing exact-replica realism.
+
+struct DrumRecipe {
+    /// GM percussion note number this drum responds to. The render
+    /// is stored at `drum_bank[gm_note - 35]`.
+    gm_note: u8,
+    /// Patch describing the synthesis chain for this drum.
+    patch: Patch,
+    /// MIDI note number used to trigger the synth voice. For pitched
+    /// drums (kick, tom) this sets the fundamental; for noise-based
+    /// drums it's irrelevant.
+    synth_note: u8,
+    /// Rendered sample length, ms. Rounded up to the next mixer
+    /// block (BLOCK_FRAMES = 64 frames @ 22.05 kHz ≈ 2.9 ms).
+    duration_ms: u16,
+}
+
+const DRUM_RECIPES: &[DrumRecipe] = &[
+    // Acoustic Bass Drum + Bass Drum 1 — same render, two GM notes.
+    DrumRecipe {
+        gm_note: 35,
+        patch: drum_patch_kick(),
+        synth_note: 36, // C2 = 65 Hz
+        duration_ms: 220,
+    },
+    DrumRecipe {
+        gm_note: 36,
+        patch: drum_patch_kick(),
+        synth_note: 36,
+        duration_ms: 220,
+    },
+    // Acoustic + Electric Snare
+    DrumRecipe {
+        gm_note: 38,
+        patch: drum_patch_snare(),
+        synth_note: 48,
+        duration_ms: 160,
+    },
+    DrumRecipe {
+        gm_note: 40,
+        patch: drum_patch_snare(),
+        synth_note: 48,
+        duration_ms: 160,
+    },
+    // Hand Clap
+    DrumRecipe {
+        gm_note: 39,
+        patch: drum_patch_clap(),
+        synth_note: 60,
+        duration_ms: 120,
+    },
+    // Closed Hat / Pedal Hat / Open Hat — same patch, different decay.
+    DrumRecipe {
+        gm_note: 42,
+        patch: drum_patch_hat_closed(),
+        synth_note: 84,
+        duration_ms: 80,
+    },
+    DrumRecipe {
+        gm_note: 44,
+        patch: drum_patch_hat_closed(),
+        synth_note: 84,
+        duration_ms: 100,
+    },
+    DrumRecipe {
+        gm_note: 46,
+        patch: drum_patch_hat_open(),
+        synth_note: 84,
+        duration_ms: 350,
+    },
+    // Low / Mid / High Tom
+    DrumRecipe {
+        gm_note: 41,
+        patch: drum_patch_tom(),
+        synth_note: 42, // F#2 = 92.5 Hz
+        duration_ms: 320,
+    },
+    DrumRecipe {
+        gm_note: 47,
+        patch: drum_patch_tom(),
+        synth_note: 50, // D3 = 146.8 Hz
+        duration_ms: 280,
+    },
+    DrumRecipe {
+        gm_note: 50,
+        patch: drum_patch_tom(),
+        synth_note: 57, // A3 = 220 Hz
+        duration_ms: 240,
+    },
+    // Crash + Ride — broad HP noise with different decays.
+    DrumRecipe {
+        gm_note: 49,
+        patch: drum_patch_crash(),
+        synth_note: 84,
+        duration_ms: 900,
+    },
+    DrumRecipe {
+        gm_note: 51,
+        patch: drum_patch_ride(),
+        synth_note: 84,
+        duration_ms: 1200,
+    },
+];
+
+// All drum patches use a 1 ms amp-env attack rather than 0. With an
+// instantaneous attack, the very first rendered PCM sample is silence
+// (env value 0) and the next is at peak amplitude — a hard step that
+// reads as a click/pop at sample-1 in the baked PCM. 1 ms ramp keeps
+// the perceived "punch" while smoothing the discontinuity.
+
+const fn drum_patch_kick() -> Patch {
+    Patch {
+        osc: [
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 127 },
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 15 },
+        ],
+        filter: FilterParams { mode: FilterMode::LowPass, cutoff_hz: 200, resonance: 0 },
+        amp_env: EnvParams { attack_ms: 1, decay_ms: 200, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 1, decay_ms: 30, sustain: 0, release_ms: 0 },
+        filter_env_depth: 100,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+const fn drum_patch_snare() -> Patch {
+    Patch {
+        osc: [
+            // Body: sine at ~130 Hz.
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 70 },
+            // Snare buzz: noise dominant.
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 127 },
+        ],
+        filter: FilterParams { mode: FilterMode::HighPass, cutoff_hz: 800, resonance: 0 },
+        amp_env: EnvParams { attack_ms: 1, decay_ms: 140, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 1, decay_ms: 60, sustain: 0, release_ms: 0 },
+        filter_env_depth: 60,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+const fn drum_patch_clap() -> Patch {
+    Patch {
+        osc: [
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 127 },
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 0 },
+        ],
+        // Bandpass around ~1.5 kHz gives clap's tonal character.
+        filter: FilterParams { mode: FilterMode::BandPass, cutoff_hz: 1500, resonance: 40 },
+        amp_env: EnvParams { attack_ms: 1, decay_ms: 100, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 1, decay_ms: 40, sustain: 0, release_ms: 0 },
+        filter_env_depth: 30,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+const fn drum_patch_hat_closed() -> Patch {
+    Patch {
+        osc: [
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 127 },
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 0 },
+        ],
+        filter: FilterParams { mode: FilterMode::HighPass, cutoff_hz: 6000, resonance: 20 },
+        amp_env: EnvParams { attack_ms: 1, decay_ms: 60, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 1, decay_ms: 30, sustain: 0, release_ms: 0 },
+        filter_env_depth: 0,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+const fn drum_patch_hat_open() -> Patch {
+    Patch {
+        osc: [
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 127 },
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 0 },
+        ],
+        filter: FilterParams { mode: FilterMode::HighPass, cutoff_hz: 6000, resonance: 20 },
+        amp_env: EnvParams { attack_ms: 1, decay_ms: 300, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 1, decay_ms: 100, sustain: 0, release_ms: 0 },
+        filter_env_depth: 0,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+const fn drum_patch_tom() -> Patch {
+    Patch {
+        osc: [
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 127 },
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 10 },
+        ],
+        filter: FilterParams { mode: FilterMode::LowPass, cutoff_hz: 800, resonance: 0 },
+        amp_env: EnvParams { attack_ms: 1, decay_ms: 260, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 1, decay_ms: 80, sustain: 0, release_ms: 0 },
+        filter_env_depth: 40,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+const fn drum_patch_crash() -> Patch {
+    Patch {
+        osc: [
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 127 },
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 0 },
+        ],
+        filter: FilterParams { mode: FilterMode::HighPass, cutoff_hz: 4000, resonance: 0 },
+        amp_env: EnvParams { attack_ms: 2, decay_ms: 800, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 0, decay_ms: 400, sustain: 0, release_ms: 0 },
+        filter_env_depth: 0,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+const fn drum_patch_ride() -> Patch {
+    Patch {
+        osc: [
+            OscParams { mode: OscMode::Noise, detune_cents: 0, octave: 0, level: 127 },
+            OscParams { mode: OscMode::Sine,  detune_cents: 0, octave: 0, level: 0 },
+        ],
+        filter: FilterParams { mode: FilterMode::HighPass, cutoff_hz: 5000, resonance: 30 },
+        amp_env: EnvParams { attack_ms: 1, decay_ms: 1100, sustain: 0, release_ms: 0 },
+        filter_env: EnvParams { attack_ms: 0, decay_ms: 500, sustain: 0, release_ms: 0 },
+        filter_env_depth: 0,
+        lfo: LfoParams { rate_centihz: 0, shape: LfoShape::Sine, target: LfoTarget::Pitch, depth: 0 },
+        glide_ms: 0,
+    }
+}
+
+/// Render one drum recipe through a throwaway mixer instance. Output
+/// is mono 8-bit unsigned PCM at 22.05 kHz — the canonical sample
+/// format defined in §5.4 — so the drum samples are indistinguishable
+/// from cart-authored ones once they land in the bank.
+fn synthesize_drum_sample(recipe: &DrumRecipe) -> Vec<u8> {
+    let mut tmp = AudioState::new_silent();
+    tmp.patches[0] = recipe.patch;
+    tmp.voice_trigger(0, recipe.synth_note, 127);
+
+    let num_frames =
+        (recipe.duration_ms as usize) * (SAMPLE_RATE as usize) / 1000;
+    let num_blocks = num_frames.div_ceil(BLOCK_FRAMES);
+    let mut output = Vec::with_capacity(num_blocks * BLOCK_FRAMES);
+    let mut block = vec![0i16; BLOCK_SAMPLES];
+
+    for _ in 0..num_blocks {
+        tmp.render_block(&mut block);
+        for i in 0..BLOCK_FRAMES {
+            let l = block[i * 2] as i32;
+            let r = block[i * 2 + 1] as i32;
+            let mono = (l + r) / 2;
+            let byte = (((mono + 32768) / 256).clamp(0, 255)) as u8;
+            output.push(byte);
+        }
+    }
+
+    output.truncate(num_frames);
+    output
+}
+
+// ===========================================================================
 // AudioState — public mixer API.
 // ===========================================================================
 
 pub struct AudioState {
     samples: Vec<Option<Sample>>,
+    /// Host-private drum samples synthesized at boot. Indexed by
+    /// `gm_note - 35`; covers GM percussion notes 35..=81 with
+    /// unfilled slots (None) for drums we don't synthesize.
+    drum_bank: Vec<Option<Sample>>,
     patches: Vec<Patch>,
     voices: Vec<Voice>,
+    channels: Vec<Channel>,
     frame_counter: u64,
     /// Telemetry: incremented when `sfx_play` / `voice_trigger` had to
     /// steal a voice.
@@ -399,13 +792,53 @@ pub struct AudioState {
 }
 
 impl AudioState {
+    /// Full constructor — initializes the host drum kit at boot.
+    /// Adds ~150 ms of synthesis work at construction time (release
+    /// build); tests that don't need percussion can use `new_silent`
+    /// to skip it.
     pub fn new() -> Self {
+        let mut state = Self::new_silent();
+        state.init_drum_kit();
+        state
+    }
+
+    /// Bare constructor — no drum kit synthesized. Use this from
+    /// tests where percussion isn't under test, and from the drum-
+    /// kit renderer itself (to avoid recursion).
+    pub fn new_silent() -> Self {
         let mut samples = Vec::with_capacity(SAMPLE_SLOTS);
         samples.resize_with(SAMPLE_SLOTS, || None);
+        let mut drum_bank = Vec::with_capacity(DRUM_BANK_SIZE);
+        drum_bank.resize_with(DRUM_BANK_SIZE, || None);
         let mut patches = Vec::with_capacity(PATCH_SLOTS);
         patches.resize(PATCH_SLOTS, Patch::default_synth());
         let voices = (0..VOICE_POOL_SIZE).map(|_| Voice::idle()).collect();
-        Self { samples, patches, voices, frame_counter: 0, voices_stolen: 0 }
+        let channels = (0..MIDI_CHANNELS).map(Channel::new).collect();
+        Self {
+            samples,
+            drum_bank,
+            patches,
+            voices,
+            channels,
+            frame_counter: 0,
+            voices_stolen: 0,
+        }
+    }
+
+    fn init_drum_kit(&mut self) {
+        for recipe in DRUM_RECIPES {
+            let pcm = synthesize_drum_sample(recipe);
+            if (recipe.gm_note as usize) >= 35
+                && (recipe.gm_note as usize - 35) < DRUM_BANK_SIZE
+            {
+                let slot = recipe.gm_note as usize - 35;
+                self.drum_bank[slot] = Some(Sample {
+                    data: pcm,
+                    rate: SampleRate::Khz22_05,
+                    loop_points: None,
+                });
+            }
+        }
     }
 
     // ── Sample bank (Stage 1) ──────────────────────────────────────
@@ -444,7 +877,7 @@ impl AudioState {
         v.pan = pan.clamp(-64, 63);
         v.start_frame = frame;
         v.kind = VoiceKind::Sfx(SfxVoiceState {
-            sample_slot: slot,
+            source: SampleSource::Cart(slot),
             position: 0.0,
             pitch_ratio,
             loop_,
@@ -470,10 +903,19 @@ impl AudioState {
             None => return,
         };
         if let VoiceKind::Sfx(state) = &mut self.voices[idx].kind {
-            let slot = state.sample_slot;
-            let src_hz = match self.samples.get(slot as usize).and_then(|s| s.as_ref()) {
-                Some(s) => s.rate.hz() as f64,
-                None => return,
+            let src_hz = match state.source {
+                SampleSource::Cart(slot) => {
+                    match self.samples.get(slot as usize).and_then(|s| s.as_ref()) {
+                        Some(s) => s.rate.hz() as f64,
+                        None => return,
+                    }
+                }
+                SampleSource::Drum(slot) => {
+                    match self.drum_bank.get(slot as usize).and_then(|s| s.as_ref()) {
+                        Some(s) => s.rate.hz() as f64,
+                        None => return,
+                    }
+                }
             };
             state.pitch_ratio = compute_pitch_ratio(src_hz, pitch_cents);
         }
@@ -603,6 +1045,11 @@ impl AudioState {
         v.start_frame = frame;
         v.kind = VoiceKind::Synth(SynthVoiceState {
             patch: patch_slot,
+            // `voice_trigger` is the under-MIDI primitive — voices
+            // created this way aren't bound to a MIDI channel and
+            // won't match `note_off` lookups. Use the MIDI surface
+            // (`note_on` / `note_off`) for channel-aware notes.
+            channel: NO_CHANNEL,
             note,
             velocity: velocity.min(127),
             osc_phase: [0.0, 0.0],
@@ -635,6 +1082,188 @@ impl AudioState {
         }
     }
 
+    // ── MIDI surface (Stage 3) ─────────────────────────────────────
+
+    /// Start a note on a MIDI channel. Channel 9 (MIDI 10) by default
+    /// bypasses the patch system and triggers a sample from the
+    /// host-private drum bank (slot = `note - 35`); other channels
+    /// route to the channel's current patch via `voice_trigger`.
+    ///
+    /// `velocity == 0` is a common MIDI convention for "note off" —
+    /// in §5.2 we route it through `note_off(channel, note)` for that
+    /// reason. Returns `VoiceId::NONE` on out-of-range channel /
+    /// note, missing drum sample, or missing patch.
+    pub fn note_on(&mut self, channel: u8, note: u8, velocity: u8) -> VoiceId {
+        if (channel as usize) >= MIDI_CHANNELS || note >= 128 {
+            return VoiceId::NONE;
+        }
+        if velocity == 0 {
+            self.note_off(channel, note);
+            return VoiceId::NONE;
+        }
+        let ch = &self.channels[channel as usize];
+        if ch.is_drum {
+            return self.trigger_drum_voice(note, velocity, ch.pan);
+        }
+        let patch = ch.patch_idx;
+        let (vol, pan) = (ch.volume, ch.pan);
+        let id = self.voice_trigger(patch, note, velocity);
+        if id != VoiceId::NONE {
+            if let Some(idx) = self.lookup_voice(id) {
+                self.voices[idx].volume = midi_volume_combined(vol, self.channels[channel as usize].expression);
+                self.voices[idx].pan = midi_pan_to_signed(pan);
+                if let VoiceKind::Synth(state) = &mut self.voices[idx].kind {
+                    state.channel = channel;
+                }
+            }
+        }
+        id
+    }
+
+    /// Release voices that match `(channel, note)`. If sustain is
+    /// held on the channel, the note number is recorded and the
+    /// release is deferred until sustain transitions off.
+    pub fn note_off(&mut self, channel: u8, note: u8) {
+        if (channel as usize) >= MIDI_CHANNELS || note >= 128 {
+            return;
+        }
+        if self.channels[channel as usize].sustain_held {
+            self.channels[channel as usize].mark_sustained(note);
+            return;
+        }
+        self.release_matching_voices(channel, Some(note));
+    }
+
+    /// Set the pitch bend for a channel. Currently a no-op — the
+    /// per-sample frequency in `mix_synth_voice` doesn't read this
+    /// yet. Stage 4 will wire it in alongside SMF playback.
+    pub fn pitch_bend(&mut self, channel: u8, value: i16) {
+        if (channel as usize) >= MIDI_CHANNELS {
+            return;
+        }
+        self.channels[channel as usize].pitch_bend = value.clamp(-8192, 8191);
+    }
+
+    /// Handle a recognized control change. Other CCs are silently
+    /// ignored per §5.2's fixed table.
+    pub fn cc(&mut self, channel: u8, controller: u8, value: u8) {
+        if (channel as usize) >= MIDI_CHANNELS {
+            return;
+        }
+        let value = value.min(127);
+        let ch = &mut self.channels[channel as usize];
+        match controller {
+            CC_MOD_WHEEL => ch.mod_wheel = value,
+            CC_VOLUME => ch.volume = value,
+            CC_PAN => ch.pan = value,
+            CC_EXPRESSION => ch.expression = value,
+            CC_SUSTAIN => {
+                let was_held = ch.sustain_held;
+                let now_held = value >= 64; // MIDI convention: ≥64 = on
+                ch.sustain_held = now_held;
+                if was_held && !now_held {
+                    let lo = ch.sustained_lo;
+                    let hi = ch.sustained_hi;
+                    ch.clear_sustained();
+                    // Release each note that was held by sustain.
+                    for n in 0..64u8 {
+                        if lo & (1u64 << n) != 0 {
+                            self.release_matching_voices(channel, Some(n));
+                        }
+                    }
+                    for n in 0..64u8 {
+                        if hi & (1u64 << n) != 0 {
+                            self.release_matching_voices(channel, Some(n + 64));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Bind a channel to a different patch. Always clears the
+    /// drum-bypass flag — even programming channel 10 to a synth
+    /// patch (per §5.2 the cart's option to reclaim it for melodic
+    /// content).
+    pub fn program_change(&mut self, channel: u8, patch: u8) {
+        if (channel as usize) >= MIDI_CHANNELS || (patch as usize) >= PATCH_SLOTS {
+            return;
+        }
+        let ch = &mut self.channels[channel as usize];
+        ch.patch_idx = patch;
+        ch.is_drum = false;
+    }
+
+    /// Release every voice on this channel, regardless of note.
+    /// Standard panic / scene-cleanup primitive.
+    pub fn all_notes_off(&mut self, channel: u8) {
+        if (channel as usize) >= MIDI_CHANNELS {
+            return;
+        }
+        self.channels[channel as usize].clear_sustained();
+        self.release_matching_voices(channel, None);
+    }
+
+    /// Read the patch a channel is currently bound to.
+    pub fn channel_patch(&self, channel: u8) -> Option<u8> {
+        self.channels
+            .get(channel as usize)
+            .map(|c| c.patch_idx)
+    }
+
+    /// Trigger an SFX-style voice from the host-private drum bank
+    /// without going through `sfx_play` (which targets the cart's
+    /// sample bank). Drum samples are mono 8-bit PCM at 22.05 kHz,
+    /// indexed by `gm_note - 35`.
+    fn trigger_drum_voice(&mut self, note: u8, velocity: u8, channel_pan: u8) -> VoiceId {
+        if note < 35 {
+            return VoiceId::NONE;
+        }
+        let slot = (note - 35) as usize;
+        if slot >= DRUM_BANK_SIZE || self.drum_bank[slot].is_none() {
+            return VoiceId::NONE;
+        }
+        let src_hz = self.drum_bank[slot]
+            .as_ref()
+            .map(|s| s.rate.hz() as f64)
+            .unwrap_or(22_050.0);
+        let pitch_ratio = compute_pitch_ratio(src_hz, 0);
+        let frame = self.frame_counter;
+        let idx = self.allocate_voice();
+        let v = &mut self.voices[idx];
+        v.volume = velocity.min(127);
+        v.pan = midi_pan_to_signed(channel_pan);
+        v.start_frame = frame;
+        v.kind = VoiceKind::Sfx(SfxVoiceState {
+            source: SampleSource::Drum(slot as u8),
+            position: 0.0,
+            pitch_ratio,
+            loop_: false,
+        });
+        VoiceId::pack(idx, v.generation)
+    }
+
+    /// Walk the voice pool and release every synth voice that was
+    /// triggered by `note_on(channel, note)`. If `note` is `None`,
+    /// release every voice on the channel regardless of note.
+    fn release_matching_voices(&mut self, channel: u8, note: Option<u8>) {
+        for i in 0..self.voices.len() {
+            if let VoiceKind::Synth(state) = &self.voices[i].kind {
+                let matches = state.channel == channel
+                    && note.map_or(true, |n| state.note == n)
+                    && !state.released;
+                if matches {
+                    if let VoiceKind::Synth(state) = &mut self.voices[i].kind {
+                        state.released = true;
+                        state.amp_env.stage = EnvStage::Release;
+                        state.filter_env.stage = EnvStage::Release;
+                    }
+                }
+            }
+        }
+    }
+
     // ── Render ─────────────────────────────────────────────────────
 
     /// Render one block of stereo interleaved samples. `out` must have
@@ -652,13 +1281,14 @@ impl AudioState {
         let mut acc = [0.0_f32; BLOCK_SAMPLES];
 
         // Split borrow so each voice can read the (immutable) sample
-        // bank + patch table while we mutate the voice itself.
+        // banks + patch table while we mutate the voice itself.
         let samples = &self.samples;
+        let drum_bank = &self.drum_bank;
         let patches = &self.patches;
         for voice in self.voices.iter_mut() {
             match &mut voice.kind {
                 VoiceKind::Idle => {}
-                VoiceKind::Sfx(_) => mix_sfx_voice(voice, samples, &mut acc),
+                VoiceKind::Sfx(_) => mix_sfx_voice(voice, samples, drum_bank, &mut acc),
                 VoiceKind::Synth(_) => mix_synth_voice(voice, patches, &mut acc),
             }
         }
@@ -747,16 +1377,40 @@ pub fn note_to_freq(note: u8) -> f32 {
     440.0 * (2.0_f32).powf(n / 12.0)
 }
 
+/// Combine CC 7 (channel volume) and CC 11 (expression) into the
+/// single 0..=127 volume the voice mixer accepts. Per §5.2 these
+/// multiply: `(volume × expression) / 127`.
+#[inline]
+fn midi_volume_combined(volume: u8, expression: u8) -> u8 {
+    let v = volume as u16 * expression as u16 / 127;
+    v.min(127) as u8
+}
+
+/// MIDI pan (0..=127, 64 = center) → mixer pan (-64..=63, 0 = center).
+#[inline]
+fn midi_pan_to_signed(pan: u8) -> i8 {
+    (pan as i16 - 64).clamp(-64, 63) as i8
+}
+
 // ===========================================================================
 // SFX mix path (Stage 1) — unchanged behavior.
 // ===========================================================================
 
-fn mix_sfx_voice(voice: &mut Voice, samples: &[Option<Sample>], out: &mut [f32]) {
+fn mix_sfx_voice(
+    voice: &mut Voice,
+    samples: &[Option<Sample>],
+    drum_bank: &[Option<Sample>],
+    out: &mut [f32],
+) {
     let state = match &mut voice.kind {
         VoiceKind::Sfx(s) => s,
         _ => return,
     };
-    let sample = match samples.get(state.sample_slot as usize).and_then(|s| s.as_ref()) {
+    let sample = match state.source {
+        SampleSource::Cart(slot) => samples.get(slot as usize).and_then(|s| s.as_ref()),
+        SampleSource::Drum(slot) => drum_bank.get(slot as usize).and_then(|s| s.as_ref()),
+    };
+    let sample = match sample {
         Some(s) => s,
         None => {
             voice.deactivate();
@@ -1520,4 +2174,174 @@ mod tests {
         }
     }
 
+    // ── Stage 3 MIDI surface ───────────────────────────────────────
+
+    #[test]
+    fn note_on_off_round_trip() {
+        let mut a = AudioState::new_silent();
+        let id = a.note_on(0, 60, 100);
+        assert_ne!(id, VoiceId::NONE);
+        assert_eq!(a.active_voice_count(), 1);
+        a.note_off(0, 60);
+        // Voice is in Release stage; let it run out.
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        for _ in 0..200 {
+            a.render_block(&mut buf);
+        }
+        assert_eq!(a.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn note_off_only_matches_same_channel_and_note() {
+        let mut a = AudioState::new_silent();
+        a.note_on(0, 60, 100);
+        a.note_on(1, 60, 100);
+        a.note_on(0, 64, 100);
+        assert_eq!(a.active_voice_count(), 3);
+        // Releasing channel-0 note-60 only affects one voice — the
+        // channel-1 voice on the same note and the channel-0 voice
+        // on a different note both stay live.
+        a.note_off(0, 60);
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        // Run the release envelope to completion.
+        for _ in 0..200 {
+            a.render_block(&mut buf);
+        }
+        assert_eq!(a.active_voice_count(), 2);
+    }
+
+    #[test]
+    fn all_notes_off_releases_only_the_channel() {
+        let mut a = AudioState::new_silent();
+        a.note_on(0, 60, 100);
+        a.note_on(0, 64, 100);
+        a.note_on(2, 60, 100);
+        assert_eq!(a.active_voice_count(), 3);
+        a.all_notes_off(0);
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        for _ in 0..200 {
+            a.render_block(&mut buf);
+        }
+        assert_eq!(a.active_voice_count(), 1);
+    }
+
+    #[test]
+    fn note_on_velocity_zero_acts_as_note_off() {
+        let mut a = AudioState::new_silent();
+        a.note_on(0, 60, 100);
+        assert_eq!(a.active_voice_count(), 1);
+        // Per §5.2 / MIDI convention: velocity 0 on note_on = release.
+        a.note_on(0, 60, 0);
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        for _ in 0..200 {
+            a.render_block(&mut buf);
+        }
+        assert_eq!(a.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn sustain_pedal_delays_release_until_off() {
+        let mut a = AudioState::new_silent();
+        // Short release so the test doesn't wait on the default
+        // 80 ms exponential tail.
+        a.patch_set_amp_env(0, 1, 1, 100, 5);
+        a.note_on(0, 60, 100);
+        a.cc(0, CC_SUSTAIN, 127);
+        a.note_off(0, 60);
+        // Voice should still be alive — sustain is holding it.
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        for _ in 0..20 {
+            a.render_block(&mut buf);
+        }
+        assert_eq!(a.active_voice_count(), 1);
+        // Release sustain — voice should now drop.
+        a.cc(0, CC_SUSTAIN, 0);
+        for _ in 0..40 {
+            a.render_block(&mut buf);
+        }
+        assert_eq!(a.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn program_change_rebinds_channel_and_clears_drum_flag() {
+        let mut a = AudioState::new_silent();
+        assert_eq!(a.channel_patch(DRUM_CHANNEL), Some(DRUM_CHANNEL % PATCH_SLOTS as u8));
+        // Channel 10 is drum-mode by default.
+        a.program_change(DRUM_CHANNEL, 3);
+        assert_eq!(a.channel_patch(DRUM_CHANNEL), Some(3));
+        // Now `note_on` on channel 10 should route through patch 3,
+        // not the drum bank. Triggering note 36 (would be a kick in
+        // drum mode) creates a synth voice instead.
+        let id = a.note_on(DRUM_CHANNEL, 36, 100);
+        assert_ne!(id, VoiceId::NONE);
+        // Inspect that the voice is a SynthVoiceState (not Sfx/drum).
+        let slot = id.0 as usize & 0xFF;
+        assert!(matches!(a.voices[slot].kind, VoiceKind::Synth(_)));
+    }
+
+    #[test]
+    fn channel_10_default_routes_to_drum_bank() {
+        // Need the real drum kit init for this one — drum_bank is empty
+        // under `new_silent`.
+        let mut a = AudioState::new();
+        let id = a.note_on(DRUM_CHANNEL, 36, 100); // kick
+        assert_ne!(id, VoiceId::NONE);
+        let slot = id.0 as usize & 0xFF;
+        // The voice should be an SFX voice sourced from the drum bank.
+        match &a.voices[slot].kind {
+            VoiceKind::Sfx(state) => {
+                assert!(matches!(state.source, SampleSource::Drum(_)));
+            }
+            _ => panic!("expected drum-bank SFX voice"),
+        }
+    }
+
+    #[test]
+    fn note_off_with_no_match_is_silent_noop() {
+        let mut a = AudioState::new_silent();
+        // No voice on channel 0 note 60 — release should not panic
+        // and should not affect any other state.
+        a.note_off(0, 60);
+        a.all_notes_off(5);
+        assert_eq!(a.active_voice_count(), 0);
+    }
+
+    #[test]
+    fn cc_volume_clamps_at_127() {
+        let mut a = AudioState::new_silent();
+        a.cc(0, CC_VOLUME, 250);
+        assert_eq!(a.channels[0].volume, 127);
+    }
+
+    #[test]
+    fn drum_kit_synthesizes_audible_samples() {
+        // Full constructor — drum kit fills the bank.
+        let a = AudioState::new();
+        let kick_slot = 36 - 35;
+        let drum = a.drum_bank[kick_slot].as_ref().expect("kick sample missing");
+        // Sample is mono 8-bit PCM at 22.05 kHz; should have a clear
+        // non-silent peak (the kick's body) and a non-empty buffer.
+        assert!(!drum.data.is_empty());
+        let max_excursion = drum.data
+            .iter()
+            .map(|&b| (b as i32 - 128).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(max_excursion > 40, "kick sample too quiet: peak {max_excursion}");
+    }
+
+    #[test]
+    fn midi_pan_to_signed_centers_correctly() {
+        assert_eq!(midi_pan_to_signed(64), 0);
+        assert_eq!(midi_pan_to_signed(0), -64);
+        assert_eq!(midi_pan_to_signed(127), 63);
+    }
+
+    #[test]
+    fn midi_volume_combined_multiplies() {
+        assert_eq!(midi_volume_combined(127, 127), 127);
+        assert_eq!(midi_volume_combined(127, 64), 64);
+        assert_eq!(midi_volume_combined(64, 64), 32);
+        assert_eq!(midi_volume_combined(0, 127), 0);
+    }
 }

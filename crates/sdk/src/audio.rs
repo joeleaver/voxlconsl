@@ -286,3 +286,69 @@ pub fn voice_trigger(patch: u8, note: u8, velocity: u8) -> VoiceId {
 pub fn voice_release(voice: VoiceId) {
     unsafe { host::voice_release(voice.0) }
 }
+
+// ============================================================================
+// MIDI (§5.2, §5.6) — Stage 3. The first-class way to play synth + drum
+// notes. `voice_trigger / voice_release` remain as the under-MIDI
+// primitive for advanced cart-side voice control.
+// ============================================================================
+
+/// 0-indexed MIDI channel that defaults to drum-kit routing. Sending
+/// `note_on(DRUM_CHANNEL, n, v)` triggers a sample from the host's
+/// built-in drum kit (slot = `n - 35`) unless the cart has called
+/// `program_change(DRUM_CHANNEL, _)` to rebind the channel.
+pub const DRUM_CHANNEL: u8 = 9;
+
+/// MIDI CC numbers recognized by the host (§5.2). All other CCs are
+/// silently ignored.
+pub const CC_MOD_WHEEL: u8 = 1;
+pub const CC_VOLUME: u8 = 7;
+pub const CC_PAN: u8 = 10;
+pub const CC_EXPRESSION: u8 = 11;
+pub const CC_SUSTAIN: u8 = 64;
+
+/// Start a note on a MIDI channel. Returns [`VoiceId::NONE`] on
+/// out-of-range channel/note, on a missing drum sample (channel
+/// `DRUM_CHANNEL` only), or on an empty patch slot.
+///
+/// Velocity 0 is interpreted as `note_off(channel, note)` per the
+/// standard MIDI convention.
+pub fn note_on(channel: u8, note: u8, velocity: u8) -> VoiceId {
+    let raw = unsafe {
+        host::note_on(channel as u32, note as u32, velocity as u32)
+    };
+    VoiceId(raw)
+}
+
+/// Release every voice on `(channel, note)`. If the channel's sustain
+/// pedal is held (CC 64 ≥ 64), the release is deferred until sustain
+/// transitions off.
+pub fn note_off(channel: u8, note: u8) {
+    unsafe { host::note_off(channel as u32, note as u32) }
+}
+
+/// Set the pitch bend wheel for a channel. Range -8192..=8191; ±2
+/// semitones at full scale by default.
+pub fn pitch_bend(channel: u8, value: i16) {
+    unsafe { host::pitch_bend(channel as u32, value as i32) }
+}
+
+/// Send a control change to a channel. Only the recognized CCs in
+/// the [CC_*] constants take effect; other controllers are silently
+/// ignored.
+pub fn cc(channel: u8, controller: u8, value: u8) {
+    unsafe { host::cc(channel as u32, controller as u32, value as u32) }
+}
+
+/// Bind a channel to a different patch. Always clears the
+/// drum-bypass flag — call this on `DRUM_CHANNEL` to reclaim it for
+/// melodic content per §5.2.
+pub fn program_change(channel: u8, patch: u8) {
+    unsafe { host::program_change(channel as u32, patch as u32) }
+}
+
+/// Release every voice currently active on a channel, regardless of
+/// note. Standard "panic" / scene-cleanup primitive.
+pub fn all_notes_off(channel: u8) {
+    unsafe { host::all_notes_off(channel as u32) }
+}

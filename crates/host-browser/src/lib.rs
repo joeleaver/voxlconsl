@@ -14,11 +14,15 @@ use voxlconsl_host::sandbox::Cart;
 
 const FB_BYTES: usize = (WIDTH as usize) * (HEIGHT as usize) * 4;
 
-/// Audio blocks rendered per JS-driven chunk pull. 4 blocks × 64
-/// frames @ 22.05 kHz ≈ 11.6 ms per chunk. JS keeps ~3 chunks
-/// scheduled ahead so output latency lands around 35 ms — fine for
-/// SFX, well below the noticeable threshold for game audio.
-const AUDIO_CHUNK_BLOCKS: usize = 4;
+/// Audio blocks rendered per JS-driven chunk pull. 8 blocks × 64
+/// frames @ 22.05 kHz ≈ 23 ms per chunk. Bigger chunks = fewer
+/// `AudioBufferSourceNode` allocations per second (~43 instead of
+/// 86) and proportionally less per-call wasm-bindgen overhead. JS
+/// keeps `AUDIO_LEAD_CHUNKS` (= 8) chunks scheduled ahead, putting
+/// total output latency around 185 ms — fine for cart audio, and
+/// generous enough that a single slow renderer frame on big-world
+/// can't underrun the audio pump.
+const AUDIO_CHUNK_BLOCKS: usize = 8;
 const AUDIO_CHUNK_FRAMES: usize = AUDIO_CHUNK_BLOCKS * BLOCK_FRAMES;
 
 /// Embedded cart `.voxl`, produced by `scripts/build-web.sh` (which runs

@@ -169,6 +169,14 @@ mod host {
         pub fn patch_copy(src: u32, dst: u32);
         pub fn voice_trigger(patch: u32, note: u32, velocity: u32) -> u32;
         pub fn voice_release(voice: u32);
+
+        // Audio (§5) — Stage 3: MIDI event surface.
+        pub fn note_on(channel: u32, note: u32, velocity: u32) -> u32;
+        pub fn note_off(channel: u32, note: u32);
+        pub fn pitch_bend(channel: u32, value: i32);
+        pub fn cc(channel: u32, controller: u32, value: u32);
+        pub fn program_change(channel: u32, patch: u32);
+        pub fn all_notes_off(channel: u32);
     }
 }
 

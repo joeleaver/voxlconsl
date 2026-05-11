@@ -21,7 +21,7 @@
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
 use voxlconsl_sdk::audio::{
-    self, EnvParams as AudioEnv, FilterMode, LfoShape, LfoTarget, OscMode, VoiceId,
+    self, EnvParams as AudioEnv, FilterMode, LfoShape, LfoTarget, OscMode, DRUM_CHANNEL,
 };
 use voxlconsl_sdk::bodies;
 use voxlconsl_sdk::physics;
@@ -116,15 +116,19 @@ static mut AIM_ACTION:  ActionHandle = ActionHandle(0);
 static mut ZOOM_ACTION: ActionHandle = ActionHandle(0);
 static mut FIRE_ACTION: ActionHandle = ActionHandle(0);
 static mut NOTE_ACTION: ActionHandle = ActionHandle(0);
+static mut KICK_ACTION: ActionHandle = ActionHandle(0);
 
-// ── Audio (§5) — Stage 2 synth demo ───────────────────────────────
+// ── Audio (§5) — Stage 3 MIDI demo ────────────────────────────────
 // Patch 0: dual-saw lead with a slight detune for chorus thickness,
 // LP filter at 2.5 kHz that opens with the filter envelope, gentle
-// pitch vibrato. SPACE press → `voice_trigger` (hold to sustain);
-// SPACE release → `voice_release` (decays to silence + auto-frees).
+// pitch vibrato. Channel 0 plays this patch by default (identity
+// channel→patch map). Channel 9 (`DRUM_CHANNEL`, MIDI 10) defaults
+// to the host's built-in drum kit synthesized at boot.
+//
+//   SPACE  → `note_on(0, A3, 110)`         (saw lead, hold to sustain)
+//   K      → `note_on(DRUM_CHANNEL, 36, …)` (acoustic-bass-drum kick)
 const SYNTH_PATCH: u8 = 0;
 const SYNTH_NOTE:  u8 = 57; // A3 — comfortable lead-line pitch
-static mut SYNTH_VOICE: VoiceId = VoiceId(0);
 
 // ── Embers ────────────────────────────────────────────────────────────────
 // The §10.3 CA only spreads fire cell-by-cell to cardinal neighbors.
@@ -426,6 +430,8 @@ pub extern "C" fn init() {
         FIRE_ACTION = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "fire");
         // `BindingHint::None` → Space on the browser port.
         NOTE_ACTION = input_declare_action(ActionKind::Button, BindingHint::None, "note");
+        // SecondaryFire → K on the browser port.
+        KICK_ACTION = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "kick");
     }
 
     // ── Audio: configure patch 0 as a dual-saw lead ──
@@ -818,28 +824,22 @@ pub extern "C" fn update(dt_ms: u32) {
     let (ax, ay) = input_action_axis2d(unsafe { AIM_ACTION });
     let zoom_delta = input_action_axis1d(unsafe { ZOOM_ACTION });
 
-    // SPACE → sustained synth note on patch 0. Stage 2 proof-of-life
-    // for the §5 voice graph (2 osc + filter + ADSR + LFO + glide).
-    // Hold to sustain at the patch's sustain level; release to fade
-    // out through the release stage and auto-free.
+    // SPACE → sustained synth note on channel 0. Hold to sustain at
+    // the patch's sustain level; release for a fade-out + auto-free.
+    // We go through the MIDI surface so `note_off` finds the right
+    // voice by (channel, note) — no need to track VoiceIds.
     if input_action_pressed(unsafe { NOTE_ACTION }) {
-        // Release any prior voice before triggering a fresh one — old
-        // VoiceIds become stale on `voice_release` so it's safe to
-        // clobber the slot. Mono-synth feel: each press steals.
-        unsafe {
-            if SYNTH_VOICE != VoiceId::NONE {
-                audio::voice_release(SYNTH_VOICE);
-            }
-            SYNTH_VOICE = audio::voice_trigger(SYNTH_PATCH, SYNTH_NOTE, /*velocity*/110);
-        }
+        let _ = audio::note_on(/*channel*/0, SYNTH_NOTE, /*velocity*/110);
     }
     if input_action_released(unsafe { NOTE_ACTION }) {
-        unsafe {
-            if SYNTH_VOICE != VoiceId::NONE {
-                audio::voice_release(SYNTH_VOICE);
-                SYNTH_VOICE = VoiceId::NONE;
-            }
-        }
+        audio::note_off(/*channel*/0, SYNTH_NOTE);
+    }
+
+    // K → kick drum on channel 10 (DRUM_CHANNEL). GM note 36 =
+    // Bass Drum 1 in the boot-synthesized drum kit. Each press is a
+    // one-shot — drum voices auto-free at sample end.
+    if input_action_pressed(unsafe { KICK_ACTION }) {
+        let _ = audio::note_on(DRUM_CHANNEL, /*GM kick*/36, /*velocity*/110);
     }
 
     // ── Camera updates ────────────────────────────────────────
