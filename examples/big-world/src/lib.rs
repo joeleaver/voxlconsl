@@ -176,6 +176,12 @@ static mut EMBER_RNG:  u32 = 0xC0FF_EEBA;
 // is just "spawn it and forget" — no per-frame update logic needed.
 const CRATE_STACK_LEN: usize = 3;
 const CRATE_SIDE_VOX:  u8    = 3;
+// One side of the leaf-ball actor volume. The radius of the simulated
+// sphere is `BALL_SIDE_VOX as f32 / 2.0`. We mask-paint only voxels
+// inside the sphere so the actor reads as a chunky ball rather than a
+// cube — the §10.2 CCD treats it as a true sphere regardless.
+const BALL_SIDE_VOX:   u8    = 5;
+const BALL_COUNT:      usize = 2;
 static mut CRATES_SPAWNED: bool = false;
 
 #[unsafe(no_mangle)]
@@ -694,6 +700,57 @@ fn spawn_crate_stack() {
         // Restitution low so they don't bounce off forever; friction
         // moderate so they don't slide across the dirt indefinitely.
         bodies::body_set_material(body, /*restitution*/0.15, /*friction*/0.5);
+    }
+
+    // ── Spheres (§10.2 CCD demo) ──────────────────────────────────
+    //
+    // Drop a couple of leaf-coloured balls slightly downhill from the
+    // crate stack. Each actor paints only the voxels inside the
+    // inscribed sphere (so the rendered shape reads as a ball, not a
+    // cube), while the host integrator uses the spherical body with
+    // proper sphere-vs-voxel CCD — see §10.2 in SPEC.md.
+    let radius = (BALL_SIDE_VOX as f32) * 0.5;
+    let ball_base_x = (p.x - 5.0).clamp(2.0, (WORLD - 6) as f32);
+    let ball_base_z = (p.z + 1.0).clamp(2.0, (WORLD - 6) as f32);
+    for i in 0..BALL_COUNT {
+        let Some(actor) = actor_spawn() else { break };
+        // Sphere-mask paint into a BALL_SIDE_VOX cube actor. The center
+        // of the painted sphere is at the actor's local geometric
+        // center; any voxel whose center-to-center distance to that
+        // center is ≤ radius - 0.05 gets painted M_LEAF. The small
+        // shrinkage keeps the visible silhouette inside the body's
+        // bounding sphere so the renderer never has voxels poking out
+        // past the simulated contact surface.
+        let r_paint = radius - 0.05;
+        let r2 = r_paint * r_paint;
+        let center = (BALL_SIDE_VOX as f32 - 1.0) * 0.5;
+        for vz in 0..BALL_SIDE_VOX {
+            for vy in 0..BALL_SIDE_VOX {
+                for vx in 0..BALL_SIDE_VOX {
+                    let dx = vx as f32 - center;
+                    let dy = vy as f32 - center;
+                    let dz = vz as f32 - center;
+                    if dx*dx + dy*dy + dz*dz <= r2 {
+                        actor_set_voxel(actor, U8Vec3::new(vx, vy, vz), M_LEAF);
+                    }
+                }
+            }
+        }
+        let Some(body) = bodies::body_spawn(
+            Some(actor),
+            BodyKind::Dynamic,
+            Shape::Sphere { radius },
+            /*mass*/ 0.5,
+        ) else { actor_despawn(actor); break };
+        let pos = Vec3::new(
+            ball_base_x + radius,
+            drop_height + (i as f32) * (radius * 2.0 + 0.2),
+            ball_base_z + radius,
+        );
+        bodies::body_set_position(body, pos);
+        // Springier than crates — balls bounce a bit on impact and
+        // roll a touch before friction takes them.
+        bodies::body_set_material(body, /*restitution*/0.45, /*friction*/0.25);
     }
 }
 

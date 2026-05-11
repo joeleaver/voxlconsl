@@ -243,8 +243,12 @@ fn substep(world: &mut WorldState, dt: f32) {
     resolve_pairs(world);
 }
 
-/// Integrate one Dynamic body: apply gravity, then move along
-/// velocity, axis-separated, clipping against the voxel grid.
+/// Integrate one Dynamic body: apply gravity, then sweep against the
+/// voxel grid. AABBs use axis-separated motion (cheap and exact
+/// against grid-aligned voxels); spheres use a discrete-CCD sweep
+/// (substep size ≤ radius so the sphere can never tunnel) that tests
+/// each candidate solid voxel with a sphere-vs-AABB closest-point
+/// query.
 fn integrate_dynamic(world: &mut WorldState, id: BodyId, dt: f32) {
     let (gravity, mut body) = {
         let g = world.bodies.gravity;
@@ -256,10 +260,21 @@ fn integrate_dynamic(world: &mut WorldState, id: BodyId, dt: f32) {
     };
     body.velocity = body.velocity + gravity * dt;
 
+    match body.shape {
+        Shape::Aabb { .. } => integrate_aabb_world(world, id, &mut body, dt),
+        Shape::Sphere { radius } => integrate_sphere_world(world, id, &mut body, dt, radius),
+    }
+
+    world.bodies.slots[id.0 as usize] = Some(body);
+}
+
+/// AABB integration — three axis-separated sweeps (X, Y, Z). For each
+/// axis the motion budget is `velocity * dt`; on impact we clip the
+/// body to the contact point, push out by `SKIN`, reflect the
+/// along-axis velocity with restitution, and drop tangential speed by
+/// the friction factor.
+fn integrate_aabb_world(world: &mut WorldState, id: BodyId, body: &mut Body, dt: f32) {
     let he = body.shape.half_extents();
-    // Three axis-separated sweeps: X then Y then Z. The motion budget
-    // for each axis is `velocity * dt`; on impact we clip the position
-    // to the contact point, then apply restitution / friction.
     for axis in 0..3 {
         let v = component(body.velocity, axis);
         let motion = v * dt;
@@ -268,16 +283,12 @@ fn integrate_dynamic(world: &mut WorldState, id: BodyId, dt: f32) {
         let advanced = motion * t;
         body.position = add_axis(body.position, axis, advanced);
         if t < 1.0 {
-            // Push the body just outside contact, then resolve.
             let recoil = -advanced.signum() * SKIN;
             body.position = add_axis(body.position, axis, recoil);
-            // Reflect velocity along contact axis with restitution.
             let v_along = component(body.velocity, axis);
             let v_new = -v_along * body.restitution;
             let v_new = if v_new.abs() < REST_VELOCITY_EPS { 0.0 } else { v_new };
             body.velocity = set_axis(body.velocity, axis, v_new);
-
-            // Friction on the tangential components.
             apply_friction(&mut body.velocity, axis, body.friction);
 
             let impulse = (v_along - v_new).abs() * body.mass.max(0.0);
@@ -292,8 +303,153 @@ fn integrate_dynamic(world: &mut WorldState, id: BodyId, dt: f32) {
             });
         }
     }
+}
 
-    world.bodies.slots[id.0 as usize] = Some(body);
+/// Sphere integration — CCD against the voxel grid. We move in
+/// substeps of size ≤ `radius` so the sphere can't tunnel past a thin
+/// wall; for each candidate position we test every solid voxel within
+/// `(radius + 1)` cells of the sphere center via the
+/// closest-point-on-AABB shortcut. On contact we advance to the last
+/// clear substep, reflect velocity along the contact normal with
+/// restitution, scrub the tangent by `friction`, and emit a
+/// body-vs-world event.
+fn integrate_sphere_world(
+    world: &mut WorldState,
+    id: BodyId,
+    body: &mut Body,
+    dt: f32,
+    radius: f32,
+) {
+    let motion = body.velocity * dt;
+    let speed = motion.length();
+    if speed <= 0.0 { return; }
+
+    // Substep size: never more than the sphere's radius (so a clear-at-
+    // step-N → overlap-at-step-N+1 transition is always caught while
+    // the sphere is still mostly outside the new voxel). Bounded below
+    // so we don't infinite-loop on a microscopic ball.
+    let step_len = radius.min(0.5).max(0.05);
+    let mut substeps = (speed / step_len).ceil() as i32;
+    if substeps < 1 { substeps = 1; }
+    // Cap so a pathologically fast body can't burn the frame budget.
+    let substeps = substeps.min(64);
+
+    let inv = 1.0 / substeps as f32;
+    let step = motion * inv;
+
+    let mut last_clear = body.position;
+    let mut last_clear_t = 0.0_f32;
+    for i in 1..=substeps {
+        let candidate = body.position + step * i as f32;
+        if let Some(contact) = sphere_grid_contact(world, candidate, radius) {
+            // Roll back to the previous clear position; resolve the
+            // collision in velocity-space at that point.
+            body.position = last_clear;
+            // Push a hair along the contact normal so subsequent
+            // overlap probes don't immediately re-trigger.
+            body.position = body.position + contact.normal * SKIN;
+
+            let v_along = body.velocity.dot(contact.normal);
+            if v_along < 0.0 {
+                let v_normal = contact.normal * v_along;
+                let v_tangent = body.velocity - v_normal;
+                let mut v_normal_new = -v_along * body.restitution;
+                if v_normal_new.abs() < REST_VELOCITY_EPS {
+                    v_normal_new = 0.0;
+                }
+                let v_tangent_new = v_tangent * (1.0 - body.friction.clamp(0.0, 1.0));
+                let v_new = contact.normal * v_normal_new + v_tangent_new;
+                // Clamp microscopic post-bounce drift so a resting
+                // ball doesn't creep across the floor.
+                let v_new = if v_new.length_squared()
+                    < REST_VELOCITY_EPS * REST_VELOCITY_EPS
+                {
+                    Vec3::ZERO
+                } else {
+                    v_new
+                };
+                let impulse = (v_along - v_normal_new).abs() * body.mass.max(0.0);
+                body.velocity = v_new;
+                world.bodies.push_event(CollisionEvent {
+                    a: id.0,
+                    b: CollisionEvent::WORLD,
+                    point: contact.point,
+                    normal: contact.normal,
+                    impulse,
+                });
+            }
+            let _ = last_clear_t;
+            return;
+        }
+        last_clear = candidate;
+        last_clear_t = i as f32 * inv;
+    }
+    body.position = last_clear;
+}
+
+#[derive(Copy, Clone)]
+struct SphereContact {
+    /// Unit normal from the contacted voxel toward the sphere center.
+    normal: Vec3,
+    /// Closest-point-on-voxel-AABB world coord.
+    point: Vec3,
+}
+
+/// True iff a sphere of `radius` at `center` overlaps any solid voxel
+/// in the active scene. Returns the contact (normal + closest point)
+/// for the deepest-penetration voxel found.
+fn sphere_grid_contact(world: &WorldState, center: Vec3, radius: f32) -> Option<SphereContact> {
+    let world_max = WORLD_SIDE as f32;
+    if center.x + radius < 0.0 || center.x - radius >= world_max
+        || center.y + radius < 0.0 || center.y - radius >= world_max
+        || center.z + radius < 0.0 || center.z - radius >= world_max
+    {
+        return None;
+    }
+    let max_cell = (WORLD_SIDE as i32) - 1;
+    let lo_x = ((center.x - radius).floor() as i32).max(0);
+    let hi_x = ((center.x + radius).floor() as i32).min(max_cell);
+    let lo_y = ((center.y - radius).floor() as i32).max(0);
+    let hi_y = ((center.y + radius).floor() as i32).min(max_cell);
+    let lo_z = ((center.z - radius).floor() as i32).max(0);
+    let hi_z = ((center.z + radius).floor() as i32).min(max_cell);
+
+    let r2 = radius * radius;
+    let mut best: Option<(f32, SphereContact)> = None;
+    for zi in lo_z..=hi_z {
+        for yi in lo_y..=hi_y {
+            for xi in lo_x..=hi_x {
+                if world.read_material(xi as u32, yi as u32, zi as u32) == 0 {
+                    continue;
+                }
+                let cx = center.x.clamp(xi as f32, (xi + 1) as f32);
+                let cy = center.y.clamp(yi as f32, (yi + 1) as f32);
+                let cz = center.z.clamp(zi as f32, (zi + 1) as f32);
+                let d = center - Vec3::new(cx, cy, cz);
+                let d2 = d.dot(d);
+                if d2 >= r2 { continue; }
+                let dist = f32::sqrt(d2.max(0.0));
+                let normal = if dist > 1e-6 {
+                    d * (1.0 / dist)
+                } else {
+                    // Sphere center is on / inside the voxel — push
+                    // straight up. (Shouldn't happen often given our
+                    // ≤ radius substep, but be robust.)
+                    Vec3::Y
+                };
+                let penetration = radius - dist;
+                let contact = SphereContact {
+                    normal,
+                    point: Vec3::new(cx, cy, cz),
+                };
+                match best {
+                    Some((deepest, _)) if penetration <= deepest => {}
+                    _ => best = Some((penetration, contact)),
+                }
+            }
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 /// AABB-vs-voxel-grid swept collision along a single axis. `motion`
@@ -814,6 +970,90 @@ mod tests {
         let b = w.bodies.get(id).unwrap();
         assert!(b.velocity.y < 0.0, "v.y should be negative, got {:?}", b.velocity);
         assert!(b.position.y < 50.0, "should have fallen, got {:?}", b.position);
+    }
+
+    fn dynamic_sphere(pos: Vec3, radius: f32) -> Body {
+        Body {
+            kind: BodyKind::Dynamic,
+            shape: Shape::Sphere { radius },
+            position: pos,
+            velocity: Vec3::ZERO,
+            mass: 1.0,
+            restitution: 0.0,
+            friction: 0.0,
+            layer: 0,
+            mask: 0xFF,
+            sensor: false,
+            actor: None,
+        }
+    }
+
+    #[test]
+    fn sphere_settles_on_solid_floor() {
+        let mut w = WorldState::new();
+        for x in 8..14u32 {
+            for z in 8..14u32 {
+                w.set_voxel(x, 10, z, 4);
+            }
+        }
+        w.flush();
+        w.bodies.gravity = Vec3::new(0.0, -20.0, 0.0);
+        let id = w.bodies.spawn(dynamic_sphere(
+            Vec3::new(11.0, 14.0, 11.0),
+            0.5,
+        )).expect("spawn");
+        for _ in 0..120 { step(&mut w, 1.0 / 60.0); }
+        let b = w.bodies.get(id).unwrap();
+        // Floor voxel cell y=10 occupies y in [10, 11]; top face at y=11.
+        // Sphere radius 0.5, so resting center sits at y=11.5.
+        assert!(b.position.y > 11.4 && b.position.y < 11.6,
+            "sphere should rest just above the platform, got y={}", b.position.y);
+        assert!(b.velocity.length() < 0.1, "should be stopped, got {:?}", b.velocity);
+    }
+
+    #[test]
+    fn sphere_bounces_with_full_restitution() {
+        let mut w = WorldState::new();
+        for x in 8..14u32 {
+            for z in 8..14u32 {
+                w.set_voxel(x, 10, z, 4);
+            }
+        }
+        w.flush();
+        w.bodies.gravity = Vec3::ZERO;
+        let id = w.bodies.spawn(Body {
+            velocity: Vec3::new(0.0, -10.0, 0.0),
+            restitution: 1.0,
+            ..dynamic_sphere(Vec3::new(11.0, 14.0, 11.0), 0.5)
+        }).unwrap();
+        // Run enough substeps for the sphere to reach the floor + bounce.
+        for _ in 0..30 { step(&mut w, 1.0 / 60.0); }
+        let b = w.bodies.get(id).unwrap();
+        assert!(b.velocity.y > 0.0,
+            "sphere should have rebounded upward, got vy={}", b.velocity.y);
+    }
+
+    #[test]
+    fn sphere_doesnt_tunnel_through_thin_floor() {
+        // A single thin slab of voxels — sphere falling fast must not
+        // skip past it in one substep.
+        let mut w = WorldState::new();
+        for x in 8..14u32 {
+            for z in 8..14u32 {
+                w.set_voxel(x, 20, z, 4);
+            }
+        }
+        w.flush();
+        w.bodies.gravity = Vec3::new(0.0, -50.0, 0.0);
+        let id = w.bodies.spawn(Body {
+            velocity: Vec3::new(0.0, -40.0, 0.0),  // very fast downward
+            ..dynamic_sphere(Vec3::new(11.0, 30.0, 11.0), 0.5)
+        }).unwrap();
+        for _ in 0..240 { step(&mut w, 1.0 / 60.0); }
+        let b = w.bodies.get(id).unwrap();
+        // Should be sitting on the slab top (y=21), not below it.
+        assert!(b.position.y > 21.0 - 0.1,
+            "sphere tunneled through the slab, ended at y={}", b.position.y);
     }
 
     #[test]
