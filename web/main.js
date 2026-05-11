@@ -51,6 +51,67 @@ async function start() {
     const h = host.height();
     const imageData = ctx.createImageData(w, h);
 
+    // ── Audio (§5) ─────────────────────────────────────────────────────
+    //
+    // The mixer runs on the main thread alongside the cart; this shim
+    // pulls a chunk of f32 samples and schedules it on an
+    // AudioBufferSourceNode. We keep ~AUDIO_LEAD_CHUNKS scheduled
+    // ahead of currentTime so a stuttering rAF doesn't underrun.
+    //
+    // AudioContext must be created from a user gesture (browser
+    // autoplay policy); we lazily build it inside the canvas-click
+    // handler that also engages pointer lock.
+    const AUDIO_LEAD_CHUNKS = 3;
+    const audioSampleRate = host.audio_sample_rate();
+    const audioChunkFrames = host.audio_chunk_frames();
+    const audioChunkSeconds = audioChunkFrames / audioSampleRate;
+    let audioCtx = null;
+    let audioNextStart = 0;
+
+    function pumpAudio() {
+        if (!audioCtx) return;
+        const horizon = audioCtx.currentTime + AUDIO_LEAD_CHUNKS * audioChunkSeconds;
+        // Catch up if rAF stalled — drop missed chunks (silence in the gap).
+        if (audioNextStart < audioCtx.currentTime) {
+            audioNextStart = audioCtx.currentTime;
+        }
+        while (audioNextStart < horizon) {
+            host.render_audio_chunk();
+            // Re-read pointers each chunk: wasm memory can grow and
+            // detach earlier views without warning.
+            const lPtr = host.audio_l_ptr();
+            const rPtr = host.audio_r_ptr();
+            const lView = new Float32Array(wasm.memory.buffer, lPtr, audioChunkFrames);
+            const rView = new Float32Array(wasm.memory.buffer, rPtr, audioChunkFrames);
+
+            const buf = audioCtx.createBuffer(2, audioChunkFrames, audioSampleRate);
+            // `set` copies, so it's safe to reuse the wasm-backed views
+            // immediately on the next iteration.
+            buf.getChannelData(0).set(lView);
+            buf.getChannelData(1).set(rView);
+
+            const src = audioCtx.createBufferSource();
+            src.buffer = buf;
+            src.connect(audioCtx.destination);
+            src.start(audioNextStart);
+            audioNextStart += audioChunkSeconds;
+        }
+    }
+
+    function ensureAudioStarted() {
+        if (audioCtx) return;
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) {
+            console.warn("Web Audio not available — running silently");
+            return;
+        }
+        audioCtx = new Ctx({ latencyHint: "interactive" });
+        audioNextStart = audioCtx.currentTime;
+        // resume() is a no-op on a fresh context but covers the case
+        // where the browser created it in "suspended" state.
+        audioCtx.resume().catch((err) => console.warn("audio resume failed:", err));
+    }
+
     // ── Pointer-lock state ──────────────────────────────────────────────
     //
     // The cart treats mouse motion as `Aim` input. To get clean FPS-style
@@ -60,6 +121,7 @@ async function start() {
     // the camera doesn't drift while the user is just hovering.
     let pointerLocked = false;
     canvas.addEventListener("click", () => {
+        ensureAudioStarted();
         if (!pointerLocked) {
             // Modern browsers return a Promise; older ones don't. Either
             // way, the `pointerlockchange` listener below handles success.
@@ -114,6 +176,12 @@ async function start() {
 
     status.textContent = `running ${w}×${h}`;
 
+    // Debug exposures for headless E2E testing. Pure conveniences for
+    // tests/devtools — the runtime itself never reads them, so they're
+    // safe to leave in place even in release builds.
+    window.__host = host;
+    window.__wasm = wasm;
+
     let lastTime = performance.now();
 
     function frame(now) {
@@ -127,6 +195,8 @@ async function start() {
         const memory = new Uint8ClampedArray(wasm.memory.buffer, ptr, len);
         imageData.data.set(memory);
         ctx.putImageData(imageData, 0, 0);
+
+        pumpAudio();
 
         if (frameCursor === 0) {
             const avg = FRAME_TIMES.reduce((a, b) => a + b, 0) / FRAME_TIMES.length;

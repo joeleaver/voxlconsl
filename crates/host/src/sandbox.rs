@@ -816,6 +816,69 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
+    // Audio (§5) — Stage 1: sample bank + one-shot SFX. Synth, MIDI,
+    // SMF, FX, runtime patch editing land in Stages 2-6.
+    linker.func_wrap(
+        "env", "sample_load",
+        |mut caller: Caller<WorldState>,
+         slot: u32, ptr: u32, len: u32,
+         rate_code: u32, flags: u32,
+         loop_start: u32, loop_end: u32| -> u32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            let mut buf = vec![0u8; len as usize];
+            if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+                return 0;
+            }
+            let rate = crate::audio::SampleRate::from_code(rate_code as u8);
+            let loop_points = if flags & 0x1 != 0 { Some((loop_start, loop_end)) } else { None };
+            caller.data_mut().audio.register_sample(
+                slot as u8,
+                crate::audio::Sample { data: buf, rate, loop_points },
+            );
+            1
+        },
+    )?;
+    linker.func_wrap(
+        "env", "sfx_play",
+        |mut caller: Caller<WorldState>,
+         slot: u32, volume: u32, pan: i32, pitch_cents: i32, loop_: u32| -> u32 {
+            caller.data_mut().audio.sfx_play(
+                slot as u8,
+                volume as u8,
+                pan as i8,
+                pitch_cents as i16,
+                loop_ != 0,
+            ).0
+        },
+    )?;
+    linker.func_wrap(
+        "env", "sfx_stop",
+        |mut caller: Caller<WorldState>, voice: u32| {
+            caller.data_mut().audio.sfx_stop(crate::audio::VoiceId(voice));
+        },
+    )?;
+    linker.func_wrap(
+        "env", "sfx_set_volume",
+        |mut caller: Caller<WorldState>, voice: u32, volume: u32| {
+            caller.data_mut().audio.sfx_set_volume(
+                crate::audio::VoiceId(voice),
+                volume as u8,
+            );
+        },
+    )?;
+    linker.func_wrap(
+        "env", "sfx_set_pitch",
+        |mut caller: Caller<WorldState>, voice: u32, pitch_cents: i32| {
+            caller.data_mut().audio.sfx_set_pitch(
+                crate::audio::VoiceId(voice),
+                pitch_cents as i16,
+            );
+        },
+    )?;
+
     // Misc (§8.3)
     linker.func_wrap(
         "env", "log",

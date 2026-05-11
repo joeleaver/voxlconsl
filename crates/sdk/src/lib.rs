@@ -139,6 +139,19 @@ mod host {
         pub fn ca_mark_active(x: u32, y: u32, z: u32);
         pub fn ca_active_count() -> u32;
         pub fn ca_set_global_param(param: u32, value: f32);
+
+        // Audio (§5) — Stage 1: sample bank + one-shot SFX.
+        pub fn sample_load(
+            slot: u32, ptr: *const u8, len: u32,
+            rate_code: u32, flags: u32,
+            loop_start: u32, loop_end: u32,
+        ) -> u32;
+        pub fn sfx_play(
+            slot: u32, volume: u32, pan: i32, pitch_cents: i32, loop_: u32,
+        ) -> u32;
+        pub fn sfx_stop(voice: u32);
+        pub fn sfx_set_volume(voice: u32, volume: u32);
+        pub fn sfx_set_pitch(voice: u32, pitch_cents: i32);
     }
 }
 
@@ -398,6 +411,7 @@ pub fn actor_get_orientation(actor: ActorId) -> Orientation {
 }
 
 pub mod animation;
+pub mod audio;
 pub mod bodies;
 pub mod ca;
 pub mod physics;

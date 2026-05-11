@@ -20,6 +20,7 @@
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
+use voxlconsl_sdk::audio::{self, SampleRate};
 use voxlconsl_sdk::bodies;
 use voxlconsl_sdk::physics;
 use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
@@ -112,6 +113,17 @@ static mut MOVE_ACTION: ActionHandle = ActionHandle(0);
 static mut AIM_ACTION:  ActionHandle = ActionHandle(0);
 static mut ZOOM_ACTION: ActionHandle = ActionHandle(0);
 static mut FIRE_ACTION: ActionHandle = ActionHandle(0);
+static mut BEEP_ACTION: ActionHandle = ActionHandle(0);
+
+// ── Audio (§5) — Stage 1 proof-of-life ───────────────────────────────
+// 200 ms 440 Hz sine, 5 ms linear attack/release to mask click noise.
+// Synthesized at init time and registered to sample slot 0; pressing
+// SPACE during gameplay triggers it via `audio::sfx_play`.
+const BEEP_SR_HZ:   usize = 22_050;
+const BEEP_FRAMES:  usize = BEEP_SR_HZ / 5; // 200 ms
+const BEEP_FREQ_HZ: f32   = 440.0;
+const BEEP_FADE:    usize = 110;            // ≈ 5 ms attack/release
+static mut BEEP_PCM: [u8; BEEP_FRAMES] = [128; BEEP_FRAMES];
 
 // ── Embers ────────────────────────────────────────────────────────────────
 // The §10.3 CA only spreads fire cell-by-cell to cardinal neighbors.
@@ -411,6 +423,32 @@ pub extern "C" fn init() {
         AIM_ACTION  = input_declare_action(ActionKind::Axis2D, BindingHint::Aim, "aim");
         ZOOM_ACTION = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom, "zoom");
         FIRE_ACTION = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "fire");
+        // `BindingHint::None` → Space on the browser port.
+        BEEP_ACTION = input_declare_action(ActionKind::Button, BindingHint::None, "beep");
+    }
+
+    // ── Audio: synthesize + register the proof-of-life beep ──
+    unsafe {
+        let two_pi = core::f32::consts::TAU;
+        for i in 0..BEEP_FRAMES {
+            let phase = two_pi * BEEP_FREQ_HZ * (i as f32) / (BEEP_SR_HZ as f32);
+            let env = if i < BEEP_FADE {
+                i as f32 / BEEP_FADE as f32
+            } else if i + BEEP_FADE >= BEEP_FRAMES {
+                (BEEP_FRAMES - i) as f32 / BEEP_FADE as f32
+            } else {
+                1.0
+            };
+            let val = sine(phase) * 0.4 * env;
+            BEEP_PCM[i] = (128.0 + val * 127.0) as u8;
+        }
+        // Pointer-based slice keeps the strict `static_mut_refs` lint happy
+        // — we've finished mutating the buffer above and only read it now.
+        let pcm: &[u8] = core::slice::from_raw_parts(
+            (&raw const BEEP_PCM) as *const u8,
+            BEEP_FRAMES,
+        );
+        audio::sample_register(0, pcm, SampleRate::Khz22_05, None);
     }
 
     // Boot into the title screen. The world is now fully built; the
@@ -783,6 +821,12 @@ pub extern "C" fn update(dt_ms: u32) {
     let (mx, my) = input_action_axis2d(unsafe { MOVE_ACTION });
     let (ax, ay) = input_action_axis2d(unsafe { AIM_ACTION });
     let zoom_delta = input_action_axis1d(unsafe { ZOOM_ACTION });
+
+    // SPACE → 200 ms 440 Hz beep. Stage 1 proof-of-life for the §5
+    // audio pipeline; non-looping voices auto-free at end of sample.
+    if input_action_pressed(unsafe { BEEP_ACTION }) {
+        let _ = audio::sfx_play(0, /*volume*/100, /*pan*/0, /*pitch_cents*/0, /*loop_*/false);
+    }
 
     // ── Camera updates ────────────────────────────────────────
     //
