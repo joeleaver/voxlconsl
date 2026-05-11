@@ -178,13 +178,13 @@ pub extern "C" fn init() {
         Material::pack_color( 0, 0), 0,
         MaterialFlags::empty().with(MaterialFlags::FLAMMABLE),
     );
-    material_set_ca(M_WOOD, /*threshold*/30, 0, 0, /*ignites_to*/M_FIRE);
+    material_set_ca(M_WOOD, /*threshold*/90, 0, 0, /*ignites_to*/M_FIRE);
     material_define(
         M_LEAF,
         Material::pack_color( 2, 2), 0,
         MaterialFlags::empty().with(MaterialFlags::FLAMMABLE),
     );
-    material_set_ca(M_LEAF, /*threshold*/15, 0, 0, /*ignites_to*/M_FIRE);
+    material_set_ca(M_LEAF, /*threshold*/60, 0, 0, /*ignites_to*/M_FIRE);
     material_define(M_SKIN,  Material::pack_color( 1, 3), 0, MaterialFlags::empty());
     material_define(M_SHIRT, Material::pack_color( 7, 2), 0, MaterialFlags::empty());
     // Sign body = warm dark wood; face = bright emissive accent so the
@@ -220,7 +220,7 @@ pub extern "C" fn init() {
         14,
         MaterialFlags::empty().with(MaterialFlags::FIRE),
     );
-    material_set_ca(M_FIRE, 0, /*lifetime*/12, 0, 0);
+    material_set_ca(M_FIRE, 0, /*lifetime*/15, 0, 0);
     // Ember: bright yellow + max emission, no CA flags. The cart
     // moves these voxels manually each tick (write at new pos, clear
     // at last pos), so they read as little glowing dots arcing
@@ -482,11 +482,70 @@ fn clear_ember_voxel(p: UVec3) {
     }
 }
 
+/// Walk each tracked burn site's 6 cardinal neighbours and add any
+/// cell that's now `M_FIRE` (via §10.3 propagation) but not yet
+/// tracked. Without this the cart-side sites would die as soon as
+/// the original ignition burned out, even though the fire has
+/// actually walked into adjacent cells.
+fn discover_propagated_fire() {
+    const NEIGHBOURS: [(i32, i32, i32); 6] = [
+        (-1, 0, 0), (1, 0, 0),
+        (0, -1, 0), (0, 1, 0),
+        (0, 0, -1), (0, 0, 1),
+    ];
+    let sites = unsafe { &mut *(&raw mut BURN_SITES) };
+    // Snapshot the currently-known positions so we don't pick up our
+    // own additions in this pass.
+    let mut known: [UVec3; BURN_SITES_CAP] =
+        [UVec3 { x: 0, y: 0, z: 0 }; BURN_SITES_CAP];
+    let mut known_count = 0usize;
+    for slot in sites.iter() {
+        if let Some((p, _)) = slot {
+            known[known_count] = *p;
+            known_count += 1;
+        }
+    }
+    for i in 0..known_count {
+        let pos = known[i];
+        for &(dx, dy, dz) in &NEIGHBOURS {
+            let nx = (pos.x as i32 + dx).clamp(0, WORLD as i32 - 1) as u32;
+            let ny = (pos.y as i32 + dy).clamp(0, WORLD as i32 - 1) as u32;
+            let nz = (pos.z as i32 + dz).clamp(0, WORLD as i32 - 1) as u32;
+            if physics::material_at(nx, ny, nz) != M_FIRE { continue; }
+            // Dedup against the snapshot.
+            let mut already = false;
+            for k in 0..known_count {
+                if known[k].x == nx && known[k].y == ny && known[k].z == nz {
+                    already = true; break;
+                }
+            }
+            if !already {
+                add_burn_site(UVec3::new(nx, ny, nz));
+            }
+        }
+    }
+}
+
 fn tick_embers() {
+    discover_propagated_fire();
+
     // ── Phase 1: roll each burn site for a new ember launch. ──
+    //
+    // A site is only allowed to launch when the cell it points at
+    // is *still* M_FIRE. The §10.3 fire rule consumes each cell in
+    // ~12 ticks, but the burn site can stay tracked for much
+    // longer; we don't want a long tail of embers spawning from a
+    // patch of grass that *used to* be on fire.
     let sites = unsafe { &mut *(&raw mut BURN_SITES) };
     for slot in sites.iter_mut() {
         if let Some((pos, ttl)) = *slot {
+            // Drop the site the moment the cell stops being fire —
+            // the visible flame is gone, so embers shouldn't come
+            // from here either.
+            if physics::material_at(pos.x, pos.y, pos.z) != M_FIRE {
+                *slot = None;
+                continue;
+            }
             if ttl == 0 { *slot = None; continue; }
             *slot = Some((pos, ttl - 1));
             if ember_rand() % SITE_LAUNCH_MOD != 0 { continue; }
