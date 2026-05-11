@@ -61,7 +61,7 @@ async function start() {
     // AudioContext must be created from a user gesture (browser
     // autoplay policy); we lazily build it inside the canvas-click
     // handler that also engages pointer lock.
-    const AUDIO_LEAD_CHUNKS = 3;
+    const AUDIO_LEAD_CHUNKS = 6;
     const audioSampleRate = host.audio_sample_rate();
     const audioChunkFrames = host.audio_chunk_frames();
     const audioChunkSeconds = audioChunkFrames / audioSampleRate;

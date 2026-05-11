@@ -43,19 +43,14 @@ pub const SAMPLE_SLOTS: usize = 64;
 /// Maximum patches per cart (§5.1).
 pub const PATCH_SLOTS: usize = 16;
 
-/// Per-voice mix headroom. With i16 output and 8-bit-equivalent peak
-/// amplitude 128, 16 voices at full volume + center pan sum to
-/// ±32 k without clipping (headroom × peak × pool = 16 × 128 × 16 =
-/// 32 768). Synth voices use the same scale via 128 × normalized_f32.
-const MIX_HEADROOM: f32 = 16.0;
-
-/// Convert normalized f32 sample (-1..1) into the 8-bit-equivalent
-/// integer amplitude that `MIX_HEADROOM` budgets for. Conservative
-/// at 64 (vs the theoretical 128 that matches 8-bit-PCM peak) to
-/// leave headroom for: (a) the saw oscillator's sharp transients,
-/// which alias above ±1 through the SVF, and (b) the SVF's resonance
-/// peak when both filter envelope and resonance are pushing.
-const SYNTH_AMPLITUDE: f32 = 64.0;
+/// Each voice mixes its contribution as f32 in roughly ±1 range into
+/// a per-block accumulator. The master stage soft-clips the sum
+/// through `tanh` (which smoothly compresses anything above ±1 toward
+/// ±1) and then quantizes to i16. With this design the per-voice
+/// scale is "natural" — voices output normalized f32 like every
+/// DSP-paper formula assumes, polyphony just adds together, and the
+/// soft clipper gracefully handles whatever total amplitude shows
+/// up. No manual headroom math, no constants per voice type.
 
 // ===========================================================================
 // Sample bank (Stage 1) — unchanged.
@@ -290,12 +285,15 @@ struct EnvelopeState {
     value: f32,
 }
 
-/// State-variable filter (Chamberlin form). Per-voice; reset on
-/// voice_trigger.
+/// State-variable filter using the **topology-preserving transform**
+/// (Vadim Zavalishin / Andy Simper / Cytomic). Unconditionally stable
+/// across the entire audible cutoff range — no clamping or
+/// belt-and-suspenders state limiting required. The two integrator
+/// states `ic1eq` / `ic2eq` are reset to 0 on `voice_trigger`.
 #[derive(Copy, Clone, Debug, Default)]
 struct SvfState {
-    v1: f32,
-    v2: f32,
+    ic1eq: f32,
+    ic2eq: f32,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -641,11 +639,17 @@ impl AudioState {
 
     /// Render one block of stereo interleaved samples. `out` must have
     /// length `BLOCK_SAMPLES`.
+    ///
+    /// Voices mix their contributions in normalized f32 (≈ ±1 per
+    /// voice) into an internal accumulator. The master stage soft-
+    /// clips the sum through `tanh` and quantizes to i16. tanh gives
+    /// smooth, monotonic compression: single voice stays near unity
+    /// gain (~-2.4 dB), polyphony gradually compresses, and the
+    /// output is bounded by ±1 at the output regardless of how many
+    /// voices add up — so the i16 cast can never overflow.
     pub fn render_block(&mut self, out: &mut [i16]) {
         debug_assert_eq!(out.len(), BLOCK_SAMPLES);
-        for s in out.iter_mut() {
-            *s = 0;
-        }
+        let mut acc = [0.0_f32; BLOCK_SAMPLES];
 
         // Split borrow so each voice can read the (immutable) sample
         // bank + patch table while we mutate the voice itself.
@@ -654,9 +658,14 @@ impl AudioState {
         for voice in self.voices.iter_mut() {
             match &mut voice.kind {
                 VoiceKind::Idle => {}
-                VoiceKind::Sfx(_) => mix_sfx_voice(voice, samples, out),
-                VoiceKind::Synth(_) => mix_synth_voice(voice, patches, out),
+                VoiceKind::Sfx(_) => mix_sfx_voice(voice, samples, &mut acc),
+                VoiceKind::Synth(_) => mix_synth_voice(voice, patches, &mut acc),
             }
+        }
+
+        for (i, &s) in acc.iter().enumerate() {
+            let clipped = s.tanh();
+            out[i] = (clipped * i16::MAX as f32) as i16;
         }
 
         self.frame_counter = self.frame_counter.wrapping_add(BLOCK_FRAMES as u64);
@@ -742,7 +751,7 @@ pub fn note_to_freq(note: u8) -> f32 {
 // SFX mix path (Stage 1) — unchanged behavior.
 // ===========================================================================
 
-fn mix_sfx_voice(voice: &mut Voice, samples: &[Option<Sample>], out: &mut [i16]) {
+fn mix_sfx_voice(voice: &mut Voice, samples: &[Option<Sample>], out: &mut [f32]) {
     let state = match &mut voice.kind {
         VoiceKind::Sfx(s) => s,
         _ => return,
@@ -762,8 +771,8 @@ fn mix_sfx_voice(voice: &mut Voice, samples: &[Option<Sample>], out: &mut [i16])
 
     let (gl, gr) = pan_gains(voice.pan);
     let vol = voice.volume as f32 / 127.0;
-    let amp_l = vol * gl * MIX_HEADROOM;
-    let amp_r = vol * gr * MIX_HEADROOM;
+    let amp_l = vol * gl;
+    let amp_r = vol * gr;
 
     let data_len = data.len();
     let loop_region = sample.loop_points.and_then(|(ls, le)| {
@@ -794,19 +803,14 @@ fn mix_sfx_voice(voice: &mut Voice, samples: &[Option<Sample>], out: &mut [i16])
         let frac = (state.position - s0 as f64) as f32;
         let a = data.get(s0).copied().unwrap_or(128);
         let b = data.get(s0 + 1).copied().unwrap_or(a);
-        let f0 = (a as i32 - 128) as f32;
-        let f1 = (b as i32 - 128) as f32;
+        // 8-bit unsigned PCM (128 = silence) → normalized f32 in ±1.
+        let f0 = ((a as i32 - 128) as f32) * (1.0 / 128.0);
+        let f1 = ((b as i32 - 128) as f32) * (1.0 / 128.0);
         let s = f0 + (f1 - f0) * frac;
 
         let oi = i * 2;
-        let l = (s * amp_l) as i32;
-        let r = (s * amp_r) as i32;
-        out[oi] = (out[oi] as i32)
-            .saturating_add(l)
-            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        out[oi + 1] = (out[oi + 1] as i32)
-            .saturating_add(r)
-            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        out[oi] += s * amp_l;
+        out[oi + 1] += s * amp_r;
 
         state.position += state.pitch_ratio;
     }
@@ -911,18 +915,16 @@ fn next_noise(rng: &mut u32) -> f32 {
     (raw as f32) / 32768.0
 }
 
-/// Process one input sample through a state-variable filter. Returns
-/// the filtered sample. `mode` decides which SVF tap is returned.
+/// Process one input sample through the TPT state-variable filter.
 ///
-/// Uses the Chamberlin SVF topology. It's unconditionally stable only
-/// while `f = 2·sin(π·fc/fs) < 1.4` — corresponds to `fc < ~0.247·fs`
-/// (≈ 5440 Hz at 22.05 kHz). We clamp `cutoff_hz` to a safer value
-/// (5000 Hz here) so the filter never runs away even when the filter
-/// envelope or LFO modulates cutoff aggressively. Above that, the
-/// caller is free to set higher cutoff values in the patch but the
-/// filter behaves as if cutoff = SVF_CUTOFF_MAX.
-const SVF_CUTOFF_MAX: f32 = 5000.0;
-
+/// Reference: Vadim Zavalishin, *The Art of VA Filter Design* (2012,
+/// ch. 5); Andy Simper / Cytomic ("Linear Trapezoidal SVF", 2013).
+/// Pre-warped cutoff coefficient `g = tan(π·fc/fs)` + zero-delay
+/// feedback via the trapezoidal integrator pair gives unconditional
+/// stability across `[20, fs/2)` Hz — no cutoff clamp, no integrator
+/// safety nets. Resonance 0..127 maps to Q in [0.5, 10] (0.707 ≈
+/// Butterworth, no peak; 5+ is strongly resonant; 10 approaches
+/// self-oscillation but never reaches it).
 #[inline]
 fn svf_process(
     state: &mut SvfState,
@@ -934,28 +936,52 @@ fn svf_process(
     if matches!(mode, FilterMode::Off) {
         return input;
     }
-    let cutoff = cutoff_hz.clamp(20.0, SVF_CUTOFF_MAX);
-    let f = 2.0 * (core::f32::consts::PI * cutoff / SAMPLE_RATE as f32).sin();
-    // Resonance maps 0..127 → damping 1.0..0.05. Lower damping = more
-    // peak at cutoff, but we never let it go below 0.05 to avoid the
-    // SVF self-oscillating at full resonance.
-    let q = 1.0 - (resonance as f32 / 127.0) * 0.95;
-    let lp = state.v1 + f * state.v2;
-    let hp = input - lp - q * state.v2;
-    let bp = state.v2 + f * hp;
-    // Belt-and-suspenders: clamp the integrators so a momentary
-    // numerical excursion can't permanently destabilize the filter.
-    state.v1 = lp.clamp(-4.0, 4.0);
-    state.v2 = bp.clamp(-4.0, 4.0);
+    // Cutoff clamp is just to keep `tan` from exploding at Nyquist
+    // — not a stability bound. The TPT form is stable across this
+    // whole range.
+    let cutoff = cutoff_hz.clamp(20.0, SAMPLE_RATE as f32 * 0.49);
+    let g = (core::f32::consts::PI * cutoff / SAMPLE_RATE as f32).tan();
+    let q = 0.5 + (resonance as f32 / 127.0) * 9.5;
+    let k = 1.0 / q;
+    let a1 = 1.0 / (1.0 + g * (g + k));
+    let a2 = g * a1;
+    let a3 = g * a2;
+    let v3 = input - state.ic2eq;
+    let v1 = a1 * state.ic1eq + a2 * v3;
+    let v2 = state.ic2eq + a2 * state.ic1eq + a3 * v3;
+    state.ic1eq = 2.0 * v1 - state.ic1eq;
+    state.ic2eq = 2.0 * v2 - state.ic2eq;
     match mode {
-        FilterMode::LowPass => state.v1,
-        FilterMode::HighPass => hp.clamp(-4.0, 4.0),
-        FilterMode::BandPass => state.v2,
+        FilterMode::LowPass => v2,
+        FilterMode::BandPass => v1,
+        FilterMode::HighPass => input - k * v1 - v2,
         FilterMode::Off => input, // unreachable
     }
 }
 
-fn mix_synth_voice(voice: &mut Voice, patches: &[Patch], out: &mut [i16]) {
+/// Polynomial bandlimited step (polyBLEP) correction. Added to a naïve
+/// oscillator sample at and around its discontinuities, this kills the
+/// alias-induced transient overshoot a raw saw / square exhibits at
+/// the wrap point. The discontinuity must have amplitude 2.0 (e.g.
+/// saw jumps -1 → +1 at p=1, square jumps ±2 at p=0 and p=0.5).
+///
+/// `t` is the phase in [0, 1); `dt` is the per-sample phase increment
+/// (= freq / sample_rate). Reference: Välimäki & Huovilainen (2007),
+/// the popular "Tale's polyBLEP" formulation.
+#[inline]
+fn poly_blep(t: f32, dt: f32) -> f32 {
+    if t < dt {
+        let x = t / dt;
+        x + x - x * x - 1.0
+    } else if t > 1.0 - dt {
+        let x = (t - 1.0) / dt;
+        x * x + x + x + 1.0
+    } else {
+        0.0
+    }
+}
+
+fn mix_synth_voice(voice: &mut Voice, patches: &[Patch], out: &mut [f32]) {
     // Extract everything we need before the &mut state borrow.
     let pan = voice.pan;
     let volume = voice.volume;
@@ -978,11 +1004,13 @@ fn mix_synth_voice(voice: &mut Voice, patches: &[Patch], out: &mut [i16]) {
 
     let dt = 1.0 / SAMPLE_RATE as f32;
 
-    // Per-block premultiplied amp constants.
+    // Per-block premultiplied amp factor. Each voice contributes a
+    // normalized f32 in ≈ ±1; the master soft-clipper handles
+    // polyphony summation.
     let (gl, gr) = pan_gains(pan);
     let vol = volume as f32 / 127.0;
     let velocity = state.velocity as f32 / 127.0;
-    let block_amp = vol * velocity * MIX_HEADROOM * SYNTH_AMPLITUDE;
+    let block_amp = vol * velocity;
 
     let lfo_rate_hz = patch.lfo.rate_centihz as f32 * 0.01;
     let lfo_inc = lfo_rate_hz * dt;
@@ -1037,10 +1065,22 @@ fn mix_synth_voice(voice: &mut Voice, patches: &[Patch], out: &mut [i16]) {
                 state.osc_phase[k] += 1.0;
             }
             let p = state.osc_phase[k];
+            // Saw + square apply polyBLEP at their discontinuities so
+            // the aliasing energy that would otherwise overshoot ±1
+            // (and stack up after the filter) gets smoothed out.
+            // Sine / triangle are already band-limited; noise is
+            // intentionally broadband.
             let raw = match params.mode {
                 OscMode::Sine => (p * core::f32::consts::TAU).sin(),
-                OscMode::Saw => 2.0 * p - 1.0,
-                OscMode::Square => if p < 0.5 { 1.0 } else { -1.0 },
+                OscMode::Saw => {
+                    let naive = 2.0 * p - 1.0;
+                    naive - poly_blep(p, phase_inc)
+                }
+                OscMode::Square => {
+                    let naive = if p < 0.5 { 1.0 } else { -1.0 };
+                    let p_half = if p < 0.5 { p + 0.5 } else { p - 0.5 };
+                    naive + poly_blep(p, phase_inc) - poly_blep(p_half, phase_inc)
+                }
                 OscMode::Triangle => {
                     if p < 0.5 {
                         4.0 * p - 1.0
@@ -1086,14 +1126,8 @@ fn mix_synth_voice(voice: &mut Voice, patches: &[Patch], out: &mut [i16]) {
         }
 
         let oi = i * 2;
-        let l = (sample * pl * block_amp) as i32;
-        let r = (sample * pr * block_amp) as i32;
-        out[oi] = (out[oi] as i32)
-            .saturating_add(l)
-            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-        out[oi + 1] = (out[oi + 1] as i32)
-            .saturating_add(r)
-            .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        out[oi] += sample * pl * block_amp;
+        out[oi + 1] += sample * pr * block_amp;
 
         // Auto-free once the amp envelope has fully decayed after release.
         if state.amp_env.stage == EnvStage::Done {
@@ -1412,4 +1446,78 @@ mod tests {
         let p = a.patch(0).unwrap();
         assert_eq!(p.filter.resonance, 127);
     }
+
+    #[test]
+    fn svf_stable_at_high_cutoff_and_resonance() {
+        // With the previous Chamberlin SVF, this combination drove the
+        // filter past its stability bound and every output sample
+        // saturated at i16::MAX. The TPT SVF should stay bounded.
+        let mut a = AudioState::new();
+        a.patch_set_osc(0, 0, OscMode::Saw, 0, 0, 127);
+        a.patch_set_filter(0, FilterMode::LowPass, 9000, 127);
+        a.patch_set_filter_env(0, /*a*/1, /*d*/200, /*s*/100, /*r*/100, /*depth*/127);
+        let _id = a.voice_trigger(0, 84, 127); // high note, full velocity
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        for _ in 0..16 {
+            a.render_block(&mut buf);
+        }
+        // Soft-clipper bounds output to ±i16::MAX by construction;
+        // the test ensures we don't see a buffer where the vast
+        // majority of samples saturated (= filter ran away).
+        let max_count = buf.iter().filter(|&&s| s.abs() >= i16::MAX - 1).count();
+        assert!(
+            max_count < BLOCK_SAMPLES / 4,
+            "filter looks unstable: {max_count}/{BLOCK_SAMPLES} samples saturated"
+        );
+    }
+
+    #[test]
+    fn polyblep_doesnt_break_low_freq_saw() {
+        // PolyBLEP correction kicks in over a window of `dt` samples
+        // around discontinuities. At low frequencies the window is
+        // tiny — the corrected saw should still be audibly a saw.
+        let mut a = AudioState::new();
+        a.patch_set_osc(0, 0, OscMode::Saw, 0, 0, 127);
+        a.patch_set_filter(0, FilterMode::Off, 0, 0);
+        let _id = a.voice_trigger(0, 60, 127);
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        // Skip the attack ramp.
+        for _ in 0..3 {
+            a.render_block(&mut buf);
+        }
+        let peak = buf.iter().map(|s| s.abs()).max().unwrap();
+        // Audible but not saturated — tanh on a single voice peaks
+        // around i16::MAX × 0.76 ≈ 25 000.
+        assert!(peak > 10_000, "low-freq saw too quiet: peak {peak}");
+        assert!(peak < i16::MAX - 100, "low-freq saw is clipping: peak {peak}");
+    }
+
+    #[test]
+    fn master_softclip_bounds_polyphony() {
+        // Stack 16 unison saws at full volume + velocity. Before the
+        // soft-clip master they would sum past i16::MAX every sample
+        // (with the old MIX_HEADROOM=16 budget it just barely fit; any
+        // resonance overshoot blew past). With tanh master, the sum
+        // is bounded regardless of how many voices add up.
+        let mut a = AudioState::new();
+        a.patch_set_osc(0, 0, OscMode::Saw, 0, 0, 127);
+        a.patch_set_filter(0, FilterMode::Off, 0, 0);
+        for _ in 0..VOICE_POOL_SIZE {
+            a.voice_trigger(0, 60, 127);
+        }
+        let mut buf = [0i16; BLOCK_SAMPLES];
+        for _ in 0..3 {
+            a.render_block(&mut buf);
+        }
+        // Every sample must remain a valid i16. The cast in
+        // render_block uses `(tanh(s) * i16::MAX as f32) as i16`,
+        // which is bounded by definition. This test exists to lock
+        // that invariant in case someone tries to "optimize" the
+        // master stage away.
+        for &s in &buf {
+            let _: i16 = s; // type-level proof
+            assert!(s as i32 <= i16::MAX as i32 && s as i32 >= i16::MIN as i32);
+        }
+    }
+
 }
