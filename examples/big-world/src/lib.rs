@@ -20,7 +20,9 @@
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
-use voxlconsl_sdk::audio::{self, SampleRate};
+use voxlconsl_sdk::audio::{
+    self, EnvParams as AudioEnv, FilterMode, LfoShape, LfoTarget, OscMode, VoiceId,
+};
 use voxlconsl_sdk::bodies;
 use voxlconsl_sdk::physics;
 use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
@@ -113,17 +115,16 @@ static mut MOVE_ACTION: ActionHandle = ActionHandle(0);
 static mut AIM_ACTION:  ActionHandle = ActionHandle(0);
 static mut ZOOM_ACTION: ActionHandle = ActionHandle(0);
 static mut FIRE_ACTION: ActionHandle = ActionHandle(0);
-static mut BEEP_ACTION: ActionHandle = ActionHandle(0);
+static mut NOTE_ACTION: ActionHandle = ActionHandle(0);
 
-// ── Audio (§5) — Stage 1 proof-of-life ───────────────────────────────
-// 200 ms 440 Hz sine, 5 ms linear attack/release to mask click noise.
-// Synthesized at init time and registered to sample slot 0; pressing
-// SPACE during gameplay triggers it via `audio::sfx_play`.
-const BEEP_SR_HZ:   usize = 22_050;
-const BEEP_FRAMES:  usize = BEEP_SR_HZ / 5; // 200 ms
-const BEEP_FREQ_HZ: f32   = 440.0;
-const BEEP_FADE:    usize = 110;            // ≈ 5 ms attack/release
-static mut BEEP_PCM: [u8; BEEP_FRAMES] = [128; BEEP_FRAMES];
+// ── Audio (§5) — Stage 2 synth demo ───────────────────────────────
+// Patch 0: dual-saw lead with a slight detune for chorus thickness,
+// LP filter at 2.5 kHz that opens with the filter envelope, gentle
+// pitch vibrato. SPACE press → `voice_trigger` (hold to sustain);
+// SPACE release → `voice_release` (decays to silence + auto-frees).
+const SYNTH_PATCH: u8 = 0;
+const SYNTH_NOTE:  u8 = 57; // A3 — comfortable lead-line pitch
+static mut SYNTH_VOICE: VoiceId = VoiceId(0);
 
 // ── Embers ────────────────────────────────────────────────────────────────
 // The §10.3 CA only spreads fire cell-by-cell to cardinal neighbors.
@@ -424,32 +425,27 @@ pub extern "C" fn init() {
         ZOOM_ACTION = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom, "zoom");
         FIRE_ACTION = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "fire");
         // `BindingHint::None` → Space on the browser port.
-        BEEP_ACTION = input_declare_action(ActionKind::Button, BindingHint::None, "beep");
+        NOTE_ACTION = input_declare_action(ActionKind::Button, BindingHint::None, "note");
     }
 
-    // ── Audio: synthesize + register the proof-of-life beep ──
-    unsafe {
-        let two_pi = core::f32::consts::TAU;
-        for i in 0..BEEP_FRAMES {
-            let phase = two_pi * BEEP_FREQ_HZ * (i as f32) / (BEEP_SR_HZ as f32);
-            let env = if i < BEEP_FADE {
-                i as f32 / BEEP_FADE as f32
-            } else if i + BEEP_FADE >= BEEP_FRAMES {
-                (BEEP_FRAMES - i) as f32 / BEEP_FADE as f32
-            } else {
-                1.0
-            };
-            let val = sine(phase) * 0.4 * env;
-            BEEP_PCM[i] = (128.0 + val * 127.0) as u8;
-        }
-        // Pointer-based slice keeps the strict `static_mut_refs` lint happy
-        // — we've finished mutating the buffer above and only read it now.
-        let pcm: &[u8] = core::slice::from_raw_parts(
-            (&raw const BEEP_PCM) as *const u8,
-            BEEP_FRAMES,
-        );
-        audio::sample_register(0, pcm, SampleRate::Khz22_05, None);
-    }
+    // ── Audio: configure patch 0 as a dual-saw lead ──
+    // Osc A: clean saw at root pitch. Osc B: saw detuned +7 cents
+    // for a fat unison-detune feel. LP filter at ~2.5 kHz that opens
+    // when the filter envelope rises. Snappy amp env so the note
+    // speaks immediately; release a touch long so taps don't click
+    // off. Gentle 6 Hz pitch vibrato keeps held notes alive.
+    audio::patch_set_osc(SYNTH_PATCH, 0, OscMode::Saw, /*detune*/0,   /*octave*/0, /*level*/110);
+    audio::patch_set_osc(SYNTH_PATCH, 1, OscMode::Saw, /*detune*/7,   /*octave*/0, /*level*/80);
+    audio::patch_set_filter(SYNTH_PATCH, FilterMode::LowPass, /*cutoff_hz*/2500, /*resonance*/30);
+    audio::patch_set_amp_env(SYNTH_PATCH, AudioEnv {
+        attack_ms: 5, decay_ms: 120, sustain: 90, release_ms: 220,
+    });
+    audio::patch_set_filter_env(SYNTH_PATCH, AudioEnv {
+        attack_ms: 3, decay_ms: 240, sustain: 30, release_ms: 200,
+    }, /*depth*/64);
+    audio::patch_set_lfo(SYNTH_PATCH,
+        /*rate_centihz*/600, LfoShape::Sine, LfoTarget::Pitch, /*depth*/4);
+    audio::patch_set_glide(SYNTH_PATCH, 0);
 
     // Boot into the title screen. The world is now fully built; the
     // first fire gets dropped *after* the player presses FIRE and the
@@ -822,10 +818,28 @@ pub extern "C" fn update(dt_ms: u32) {
     let (ax, ay) = input_action_axis2d(unsafe { AIM_ACTION });
     let zoom_delta = input_action_axis1d(unsafe { ZOOM_ACTION });
 
-    // SPACE → 200 ms 440 Hz beep. Stage 1 proof-of-life for the §5
-    // audio pipeline; non-looping voices auto-free at end of sample.
-    if input_action_pressed(unsafe { BEEP_ACTION }) {
-        let _ = audio::sfx_play(0, /*volume*/100, /*pan*/0, /*pitch_cents*/0, /*loop_*/false);
+    // SPACE → sustained synth note on patch 0. Stage 2 proof-of-life
+    // for the §5 voice graph (2 osc + filter + ADSR + LFO + glide).
+    // Hold to sustain at the patch's sustain level; release to fade
+    // out through the release stage and auto-free.
+    if input_action_pressed(unsafe { NOTE_ACTION }) {
+        // Release any prior voice before triggering a fresh one — old
+        // VoiceIds become stale on `voice_release` so it's safe to
+        // clobber the slot. Mono-synth feel: each press steals.
+        unsafe {
+            if SYNTH_VOICE != VoiceId::NONE {
+                audio::voice_release(SYNTH_VOICE);
+            }
+            SYNTH_VOICE = audio::voice_trigger(SYNTH_PATCH, SYNTH_NOTE, /*velocity*/110);
+        }
+    }
+    if input_action_released(unsafe { NOTE_ACTION }) {
+        unsafe {
+            if SYNTH_VOICE != VoiceId::NONE {
+                audio::voice_release(SYNTH_VOICE);
+                SYNTH_VOICE = VoiceId::NONE;
+            }
+        }
     }
 
     // ── Camera updates ────────────────────────────────────────

@@ -152,6 +152,23 @@ mod host {
         pub fn sfx_stop(voice: u32);
         pub fn sfx_set_volume(voice: u32, volume: u32);
         pub fn sfx_set_pitch(voice: u32, pitch_cents: i32);
+
+        // Audio (§5) — Stage 2: synth patches + voice trigger.
+        pub fn patch_set_osc(
+            slot: u32, osc_idx: u32,
+            mode: u32, detune_cents: i32, octave: i32, level: u32,
+        );
+        pub fn patch_set_filter(slot: u32, mode: u32, cutoff_hz: u32, resonance: u32);
+        pub fn patch_set_amp_env(slot: u32, attack_ms: u32, decay_ms: u32, sustain: u32, release_ms: u32);
+        pub fn patch_set_filter_env(
+            slot: u32, attack_ms: u32, decay_ms: u32, sustain: u32, release_ms: u32, depth: i32,
+        );
+        pub fn patch_set_lfo(slot: u32, rate_centihz: u32, shape: u32, target: u32, depth: i32);
+        pub fn patch_set_glide(slot: u32, ms: u32);
+        pub fn patch_reset(slot: u32);
+        pub fn patch_copy(src: u32, dst: u32);
+        pub fn voice_trigger(patch: u32, note: u32, velocity: u32) -> u32;
+        pub fn voice_release(voice: u32);
     }
 }
 

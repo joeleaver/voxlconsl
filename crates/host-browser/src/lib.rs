@@ -85,6 +85,14 @@ impl BrowserHost {
         self.cart.world().audio.active_voice_count() as u32
     }
 
+    /// Debug-only: directly call `voice_trigger` on the cart's mixer,
+    /// bypassing the cart's input handling. Lets E2E tests verify the
+    /// audio path without depending on cart-side input wiring.
+    /// Returns the raw VoiceId (0 = NONE).
+    pub fn audio_debug_voice_trigger(&mut self, patch: u32, note: u32, velocity: u32) -> u32 {
+        self.cart.world().audio.voice_trigger(patch as u8, note as u8, velocity as u8).0
+    }
+
     /// Pull `AUDIO_CHUNK_BLOCKS` blocks from the mixer, deinterleave
     /// + convert i16 → f32 into `audio_l` / `audio_r`. JS then copies
     /// these into an `AudioBuffer` and schedules it on an

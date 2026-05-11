@@ -879,6 +879,109 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
+    // Stage 2 — synth patches + voice trigger / release.
+    linker.func_wrap(
+        "env", "patch_set_osc",
+        |mut caller: Caller<WorldState>,
+         slot: u32, osc_idx: u32,
+         mode: u32, detune_cents: i32, octave: i32, level: u32| {
+            caller.data_mut().audio.patch_set_osc(
+                slot as u8,
+                osc_idx as u8,
+                crate::audio::OscMode::from_code(mode as u8),
+                detune_cents as i16,
+                octave as i8,
+                level as u8,
+            );
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_filter",
+        |mut caller: Caller<WorldState>,
+         slot: u32, mode: u32, cutoff_hz: u32, resonance: u32| {
+            caller.data_mut().audio.patch_set_filter(
+                slot as u8,
+                crate::audio::FilterMode::from_code(mode as u8),
+                cutoff_hz as u16,
+                resonance as u8,
+            );
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_amp_env",
+        |mut caller: Caller<WorldState>,
+         slot: u32, attack_ms: u32, decay_ms: u32, sustain: u32, release_ms: u32| {
+            caller.data_mut().audio.patch_set_amp_env(
+                slot as u8,
+                attack_ms as u16,
+                decay_ms as u16,
+                sustain as u8,
+                release_ms as u16,
+            );
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_filter_env",
+        |mut caller: Caller<WorldState>,
+         slot: u32, attack_ms: u32, decay_ms: u32, sustain: u32, release_ms: u32, depth: i32| {
+            caller.data_mut().audio.patch_set_filter_env(
+                slot as u8,
+                attack_ms as u16,
+                decay_ms as u16,
+                sustain as u8,
+                release_ms as u16,
+                depth as i8,
+            );
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_lfo",
+        |mut caller: Caller<WorldState>,
+         slot: u32, rate_centihz: u32, shape: u32, target: u32, depth: i32| {
+            caller.data_mut().audio.patch_set_lfo(
+                slot as u8,
+                rate_centihz as u16,
+                crate::audio::LfoShape::from_code(shape as u8),
+                crate::audio::LfoTarget::from_code(target as u8),
+                depth as i8,
+            );
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_glide",
+        |mut caller: Caller<WorldState>, slot: u32, ms: u32| {
+            caller.data_mut().audio.patch_set_glide(slot as u8, ms as u16);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_reset",
+        |mut caller: Caller<WorldState>, slot: u32| {
+            caller.data_mut().audio.patch_reset(slot as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_copy",
+        |mut caller: Caller<WorldState>, src: u32, dst: u32| {
+            caller.data_mut().audio.patch_copy(src as u8, dst as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "voice_trigger",
+        |mut caller: Caller<WorldState>, patch: u32, note: u32, velocity: u32| -> u32 {
+            caller.data_mut().audio.voice_trigger(
+                patch as u8,
+                note as u8,
+                velocity as u8,
+            ).0
+        },
+    )?;
+    linker.func_wrap(
+        "env", "voice_release",
+        |mut caller: Caller<WorldState>, voice: u32| {
+            caller.data_mut().audio.voice_release(crate::audio::VoiceId(voice));
+        },
+    )?;
+
     // Misc (§8.3)
     linker.func_wrap(
         "env", "log",

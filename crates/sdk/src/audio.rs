@@ -118,3 +118,171 @@ pub fn sfx_set_volume(voice: VoiceId, volume: u8) {
 pub fn sfx_set_pitch(voice: VoiceId, pitch_cents: i16) {
     unsafe { host::sfx_set_pitch(voice.0, pitch_cents as i32) }
 }
+
+// ============================================================================
+// Synth (§5.1, §5.7) — Stage 2.
+//
+// Patches are cart-owned instrument definitions; carts mutate them
+// freely via `patch_set_*` and trigger notes via `voice_trigger`. The
+// `voice_trigger / voice_release` pair is a Stage 2 stand-in for the
+// MIDI surface — Stage 3 will replace it with `note_on / note_off` on
+// 16-channel routing, and these calls remain available as the under-
+// MIDI primitive.
+// ============================================================================
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OscMode {
+    Sine = 0,
+    Saw = 1,
+    Square = 2,
+    Triangle = 3,
+    Noise = 4,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FilterMode {
+    Off = 0,
+    LowPass = 1,
+    HighPass = 2,
+    BandPass = 3,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LfoShape {
+    Sine = 0,
+    Triangle = 1,
+    Square = 2,
+    SampleAndHold = 3,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LfoTarget {
+    Pitch = 0,
+    Filter = 1,
+    Amp = 2,
+    Pan = 3,
+}
+
+/// ADSR envelope settings (used for both amp and filter envelopes).
+/// All times in milliseconds; `sustain` is 0..=127 (fraction of peak).
+#[derive(Copy, Clone, Debug)]
+pub struct EnvParams {
+    pub attack_ms: u16,
+    pub decay_ms: u16,
+    pub sustain: u8,
+    pub release_ms: u16,
+}
+
+/// Configure one of a patch's two oscillators (§5.1).
+pub fn patch_set_osc(
+    patch: u8,
+    osc: u8,
+    mode: OscMode,
+    detune_cents: i16,
+    octave: i8,
+    level: u8,
+) {
+    unsafe {
+        host::patch_set_osc(
+            patch as u32,
+            osc as u32,
+            mode as u32,
+            detune_cents as i32,
+            octave as i32,
+            level as u32,
+        )
+    }
+}
+
+/// Configure the filter block of a patch (§5.1).
+pub fn patch_set_filter(patch: u8, mode: FilterMode, cutoff_hz: u16, resonance: u8) {
+    unsafe {
+        host::patch_set_filter(patch as u32, mode as u32, cutoff_hz as u32, resonance as u32)
+    }
+}
+
+/// Configure the amp envelope of a patch.
+pub fn patch_set_amp_env(patch: u8, env: EnvParams) {
+    unsafe {
+        host::patch_set_amp_env(
+            patch as u32,
+            env.attack_ms as u32,
+            env.decay_ms as u32,
+            env.sustain as u32,
+            env.release_ms as u32,
+        )
+    }
+}
+
+/// Configure the filter envelope + cutoff modulation depth.
+/// `depth` is signed -127..=127; positive opens the filter as the
+/// envelope rises, negative closes it.
+pub fn patch_set_filter_env(patch: u8, env: EnvParams, depth: i8) {
+    unsafe {
+        host::patch_set_filter_env(
+            patch as u32,
+            env.attack_ms as u32,
+            env.decay_ms as u32,
+            env.sustain as u32,
+            env.release_ms as u32,
+            depth as i32,
+        )
+    }
+}
+
+/// Configure the LFO. `rate_centihz` is hundredths of a Hz (100 = 1 Hz,
+/// 1000 = 10 Hz). `depth` is -127..=127; sign affects routing polarity.
+pub fn patch_set_lfo(
+    patch: u8,
+    rate_centihz: u16,
+    shape: LfoShape,
+    target: LfoTarget,
+    depth: i8,
+) {
+    unsafe {
+        host::patch_set_lfo(
+            patch as u32,
+            rate_centihz as u32,
+            shape as u32,
+            target as u32,
+            depth as i32,
+        )
+    }
+}
+
+/// Set the patch's portamento time. 0 = no glide (notes start at their
+/// target frequency immediately).
+pub fn patch_set_glide(patch: u8, ms: u16) {
+    unsafe { host::patch_set_glide(patch as u32, ms as u32) }
+}
+
+/// Reset a patch to the default sine + snappy ADSR.
+pub fn patch_reset(patch: u8) {
+    unsafe { host::patch_reset(patch as u32) }
+}
+
+/// Copy every parameter of `src` into `dst`.
+pub fn patch_copy(src: u8, dst: u8) {
+    unsafe { host::patch_copy(src as u32, dst as u32) }
+}
+
+/// Trigger a synth note on the given patch. `note` is MIDI note
+/// number (60 = middle C, 69 = A4 / 440 Hz). `velocity` 0..=127 scales
+/// output amplitude. Returns [`VoiceId::NONE`] if the patch slot is
+/// out of range.
+///
+/// The voice plays through its amp envelope's Attack → Decay → Sustain
+/// stages and holds there until either [`voice_release`] is called
+/// (transitioning into Release) or the voice gets stolen for a newer
+/// trigger.
+pub fn voice_trigger(patch: u8, note: u8, velocity: u8) -> VoiceId {
+    let raw = unsafe { host::voice_trigger(patch as u32, note as u32, velocity as u32) };
+    VoiceId(raw)
+}
+
+/// Move a synth voice into the Release stage of its envelope. The
+/// voice keeps playing until release completes, then auto-frees.
+/// No-op for SFX voices and stale ids.
+pub fn voice_release(voice: VoiceId) {
+    unsafe { host::voice_release(voice.0) }
+}
