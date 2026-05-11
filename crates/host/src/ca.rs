@@ -9,11 +9,11 @@
 //! morton_position)`. `tick_counter` advances once per
 //! [`CaState::tick`] call and is the per-frame insertion stamp.
 //!
-//! v0.1.x scope: framework + granular (sand/gravel) rule. Liquid /
-//! gas / flammable / fire are reserved in [`MaterialFlags`] and the
-//! framework dispatches them, but the rules are no-ops for now —
-//! the active-set machinery is the same regardless of which rule
-//! ultimately runs.
+//! v0.1.5 scope: granular + level-aware liquid. The liquid rule reads
+//! and writes `state_byte & 0x0F` as a fluid level 0..15 (§10.3 state
+//! byte for `liquid`: "bits 0–3: fluid level"). Gas / flammable / fire
+//! are reserved in [`MaterialFlags`] and the framework dispatches them,
+//! but the rules are no-ops for now.
 
 use std::collections::HashMap;
 
@@ -23,6 +23,9 @@ use crate::world::{WorldState, WORLD_SIDE};
 
 /// Per-port default budget, taken from §10.3's "browser, generous" cap.
 pub const DEFAULT_BUDGET: u32 = 32_768;
+
+/// Maximum liquid level stored in `state & 0x0F`.
+pub const LIQUID_LEVEL_MAX: u8 = 15;
 
 /// Active-set entry: when it was inserted (for FIFO drain order) plus
 /// the per-material 8-bit state byte.
@@ -54,26 +57,76 @@ impl CaState {
         self.active.len()
     }
 
-    /// Add `(x, y, z)` plus its 6-axis neighbors to the active set.
-    /// Coords outside the world are skipped. Existing entries keep
-    /// their original `insertion_tick` (FIFO).
-    pub fn mark_active(&mut self, x: u32, y: u32, z: u32) {
+    /// Insert/update an active-set entry for `(x, y, z)` and wake its
+    /// 6-axis neighbors. Used by world mutations (cart writes,
+    /// `fill_box`) where the caller has decided which CA state byte the
+    /// new voxel should have — granular voxels use 0; freshly-placed
+    /// liquids use 15 (full).
+    ///
+    /// Existing entries' state bytes are overwritten for the self
+    /// position. Neighbors are inserted only when missing, with state
+    /// 0 — the worker rule re-reads each neighbor's material from the
+    /// dense buffer next tick so the default state is only ever used
+    /// for "wake up and check" purposes.
+    pub fn wake_with_state(&mut self, x: u32, y: u32, z: u32, self_state: u8) {
         let tick = self.tick_counter;
-        self.add_one(x, y, z, tick);
-        if x > 0                 { self.add_one(x - 1, y, z, tick); }
-        if y > 0                 { self.add_one(x, y - 1, z, tick); }
-        if z > 0                 { self.add_one(x, y, z - 1, tick); }
-        if x + 1 < WORLD_SIDE    { self.add_one(x + 1, y, z, tick); }
-        if y + 1 < WORLD_SIDE    { self.add_one(x, y + 1, z, tick); }
-        if z + 1 < WORLD_SIDE    { self.add_one(x, y, z + 1, tick); }
+        self.put_one(x, y, z, tick, self_state, true);
+        if x > 0              { self.put_one(x - 1, y, z, tick, 0, false); }
+        if y > 0              { self.put_one(x, y - 1, z, tick, 0, false); }
+        if z > 0              { self.put_one(x, y, z - 1, tick, 0, false); }
+        if x + 1 < WORLD_SIDE { self.put_one(x + 1, y, z, tick, 0, false); }
+        if y + 1 < WORLD_SIDE { self.put_one(x, y + 1, z, tick, 0, false); }
+        if z + 1 < WORLD_SIDE { self.put_one(x, y, z + 1, tick, 0, false); }
     }
 
-    fn add_one(&mut self, x: u32, y: u32, z: u32, tick: u32) {
+    /// Insert `(x, y, z)` plus its 6-axis neighbors with state=0.
+    /// Wrapper for callers that don't care about level (granular,
+    /// fill_box corners). Kept as the old name for call-site clarity.
+    pub fn mark_active(&mut self, x: u32, y: u32, z: u32) {
+        self.wake_with_state(x, y, z, 0);
+    }
+
+    /// Insert/update only the self cell at `(x, y, z)`, without waking
+    /// neighbors. Used by the liquid rule when transferring level
+    /// between adjacent cells: we already woke the neighbor by writing
+    /// to it (or by direct mark), so a level-only update is enough.
+    /// Existing state is overwritten.
+    pub fn set_state(&mut self, x: u32, y: u32, z: u32, state: u8) {
+        if x >= WORLD_SIDE || y >= WORLD_SIDE || z >= WORLD_SIDE { return; }
+        let tick = self.tick_counter;
+        self.put_one(x, y, z, tick, state, true);
+    }
+
+    /// Read the state byte for `(x, y, z)`. Returns None if the voxel
+    /// is not in the active set.
+    pub fn get_state(&self, x: u32, y: u32, z: u32) -> Option<u8> {
+        self.active.get(&morton3(x, y, z)).map(|e| e.state)
+    }
+
+    /// Read fluid level for a liquid voxel. Returns `LIQUID_LEVEL_MAX`
+    /// when the voxel is not in the active set — the convention is
+    /// that a settled liquid is full (level 15) until something
+    /// re-activates it. The renderer uses this on the hot path.
+    pub fn liquid_level(&self, x: u32, y: u32, z: u32) -> u8 {
+        self.active
+            .get(&morton3(x, y, z))
+            .map(|e| e.state & 0x0F)
+            .unwrap_or(LIQUID_LEVEL_MAX)
+    }
+
+    fn put_one(&mut self, x: u32, y: u32, z: u32, tick: u32, state: u8, overwrite: bool) {
         if x >= WORLD_SIDE || y >= WORLD_SIDE || z >= WORLD_SIDE { return; }
         let key = morton3(x, y, z);
-        self.active
-            .entry(key)
-            .or_insert(ActiveEntry { insertion_tick: tick, state: 0 });
+        if overwrite {
+            self.active
+                .entry(key)
+                .and_modify(|e| e.state = state)
+                .or_insert(ActiveEntry { insertion_tick: tick, state });
+        } else {
+            self.active
+                .entry(key)
+                .or_insert(ActiveEntry { insertion_tick: tick, state });
+        }
     }
 
     fn evict(&mut self, x: u32, y: u32, z: u32) {
@@ -181,71 +234,171 @@ fn granular_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
     world.ca.evict(x, y, z);
 }
 
-/// Liquid rule (water-like): fall straight down or — when pressured
-/// from above by another liquid voxel — spread laterally across same-y
-/// air whose floor is solid. **No diagonal slides**: those are the
-/// granular-rule's job and they make falling drops settle into
-/// pyramidal piles.
+/// Liquid rule (water-like): level-aware mass-conserving flow.
 ///
-/// Limitation: this is mass-conservative single-voxel-per-cell flow,
-/// without a level state. A pile under a continuous source spreads
-/// outward but the *top* voxels of the pile see only air above and
-/// fail the pressure check, so they evict and freeze in place. The
-/// puddle ends up shaped like a flat-stepped pyramid that doesn't
-/// re-flatten after the source stops. Proper Minecraft-style flow
-/// (state byte bits 0–3 = level 0..15, donate-to-lower-neighbor
-/// equilibration) is parking-lotted to a follow-up CA pass; carts
-/// today should rate-limit the source so the spread can keep up.
+/// Each liquid voxel carries a fluid level 0..15 in `state & 0x0F`
+/// (§10.3 state byte for `liquid`). A freshly-placed source voxel
+/// starts at 15 (full); the rule equilibrates levels with neighbors
+/// until the body is at rest. Per tick:
 ///
-/// The `level` state byte (§10.3 bits 0–3) is reserved for that
-/// future renderer + flow upgrade; the rule itself treats every
-/// liquid voxel as a full unit.
+///   1. Gravity. Donate as much as possible downward. If below is air,
+///      the entire level falls straight down (the cell becomes air,
+///      level 15 lands one Y below). If below is the same liquid with
+///      partial fill, donate `min(self, 15 - below)` down.
+///   2. Lateral equilibration. For each cardinal neighbor in fixed
+///      order, if `self > neighbor + 1` (i.e., a slope of at least
+///      two), donate one unit. Self stops donating once it drops to
+///      level 1 (which is the smallest standing puddle).
+///
+/// A voxel that didn't transfer anything *and* has no pressure from
+/// above evicts itself; otherwise it stays active for the next tick.
+/// This produces flat-pond equilibria under a continuous source and
+/// avoids the v0.1.3 single-voxel-pyramid limitation.
 fn liquid_tick(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8) {
-    if y == 0 {
-        world.ca.evict(x, y, z);
-        return;
-    }
-    let below = world.read_material(x, y - 1, z);
-    if below == 0 {
-        world.set_voxel(x, y, z, 0);
-        world.set_voxel(x, y - 1, z, m);
-        return;
+    // Read our level. A liquid voxel that's already in the active set
+    // with state=0 is *uninitialized* (woke up via a neighbor's 6-axis
+    // wake which uses state=0 as a default) — not "empty". A real
+    // "empty → clear" transition is handled inline below by writing
+    // air + evicting, never by storing state=0 persistently.
+    let raw = world.ca.get_state(x, y, z).unwrap_or(LIQUID_LEVEL_MAX);
+    let mut level = raw & 0x0F;
+    if level == 0 { level = LIQUID_LEVEL_MAX; }
+
+    let mut transferred = false;
+
+    // Step 1: gravity.
+    if y > 0 {
+        let bm = world.read_material(x, y - 1, z);
+        if bm == 0 {
+            // Free fall: move the entire level one cell down.
+            world.set_voxel(x, y, z, 0);
+            world.ca.evict(x, y, z);
+            place_liquid(world, x, y - 1, z, m, level);
+            return;
+        }
+        if bm == m {
+            let bl = world.ca.liquid_level(x, y - 1, z);
+            if bl < LIQUID_LEVEL_MAX {
+                let space = LIQUID_LEVEL_MAX - bl;
+                let mut send = level.min(space);
+                // Don't drain to 0 unless we're being pressured by
+                // liquid above. A "top-of-column" partial cell that
+                // fully drained would just be re-created by a lateral
+                // neighbor next tick, only to drain again — that's
+                // the rim-flicker the user reports. Leaving 1 unit
+                // behind keeps the cell stable while mass keeps
+                // routing down via lateral donation cycles.
+                let pressured_above = y + 1 < WORLD_SIDE
+                    && world.read_material(x, y + 1, z) == m;
+                if !pressured_above && send >= level {
+                    send = level - 1;
+                }
+                if send > 0 {
+                    world.ca.set_state(x, y - 1, z, bl + send);
+                    level -= send;
+                    transferred = true;
+                    if level == 0 {
+                        world.set_voxel(x, y, z, 0);
+                        world.ca.evict(x, y, z);
+                        return;
+                    }
+                }
+            }
+        }
     }
 
-    // Lateral spread — only when this voxel is *pressured from above*
-    // by another liquid voxel. A lone settled voxel sitting on solid
-    // ground has no reason to move, so it stays put. A continuous
-    // stream from above feeds the bottom row, which spreads outward
-    // forming a flat puddle that grows while the source flows and
-    // freezes once it stops.
-    //
-    // (Without this gate a single voxel oscillates between cardinal
-    // neighbors forever: each move opens up the cell it just left,
-    // and the rule sees that cell as a valid spread target next tick.)
-    let above = if y + 1 < WORLD_SIDE { world.read_material(x, y + 1, z) } else { 0 };
-    let pressured = above != 0
-        && world.materials[above as usize].flags.contains(MaterialFlags::LIQUID);
-    if pressured {
+    // Step 2: lateral equilibration.
+    if level >= 2 {
         const DIRS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
         for &(dx, dz) in &DIRS {
+            if level < 2 { break; }
             let nx = x as i32 + dx;
             let nz = z as i32 + dz;
             if nx < 0 || nx >= WORLD_SIDE as i32 { continue; }
             if nz < 0 || nz >= WORLD_SIDE as i32 { continue; }
             let nx = nx as u32;
             let nz = nz as u32;
-            if world.read_material(nx, y, nz) != 0 { continue; }
-            // Spread only over solid floor so water sitting on a
-            // staircase doesn't pour off both sides every frame.
-            if world.read_material(nx, y - 1, nz) != 0 {
-                world.set_voxel(x, y, z, 0);
-                world.set_voxel(nx, y, nz, m);
-                return;
+            let nm = world.read_material(nx, y, nz);
+            // Only spread into air or our own liquid.
+            if nm != 0 && nm != m { continue; }
+
+            // Diagonal-flow shortcut: if the lateral target is air AND
+            // the cell below it is partial-fill same liquid, donate
+            // directly into the lower cell. Skipping the intermediate
+            // same-y cell prevents the "land at y, drain to y-1 next
+            // tick, repeat" pop cycle that shows as voxel flicker at
+            // the pond rim.
+            if nm == 0 && y > 0 {
+                let nm_below = world.read_material(nx, y - 1, nz);
+                if nm_below == m {
+                    let bl = world.ca.liquid_level(nx, y - 1, nz);
+                    if bl < LIQUID_LEVEL_MAX {
+                        world.ca.set_state(nx, y - 1, nz, bl + 1);
+                        level -= 1;
+                        transferred = true;
+                        continue;
+                    }
+                }
+            }
+
+            let nl = if nm == m {
+                world.ca.liquid_level(nx, y, nz)
+            } else {
+                0
+            };
+            // Only donate when there's a slope of at least two — this
+            // is what stops 1-unit voxels from flickering back and
+            // forth across cardinals.
+            if level > nl + 1 {
+                let new_nl = nl + 1;
+                if nm == 0 {
+                    place_liquid(world, nx, y, nz, m, new_nl);
+                } else {
+                    // Existing same-liquid neighbor: bump its level in
+                    // place. set_state already puts/updates its
+                    // active-set entry; we deliberately do NOT call
+                    // mark_active here, which would overwrite the
+                    // state with 0 via wake_with_state.
+                    world.ca.set_state(nx, y, nz, new_nl);
+                }
+                level -= 1;
+                transferred = true;
             }
         }
     }
 
-    world.ca.evict(x, y, z);
+    // Write our remaining level back.
+    if level == 0 {
+        world.set_voxel(x, y, z, 0);
+        world.ca.evict(x, y, z);
+        return;
+    }
+    world.ca.set_state(x, y, z, level);
+
+    // Stay active if we did anything this tick OR if we're still being
+    // pressured by liquid from above OR if we're holding a partial
+    // level (the level lives in the active-set state byte, so evicting
+    // a level-<15 cell would lose the data — the renderer would see it
+    // as full again next frame).
+    //
+    // A settled full cell (L=15 with no transfers and no pressure) is
+    // safe to evict: a future lookup defaults to LIQUID_LEVEL_MAX, so
+    // the renderer still sees it as full.
+    let pressured_above = y + 1 < WORLD_SIDE
+        && world.read_material(x, y + 1, z) == m;
+    if !transferred && !pressured_above && level == LIQUID_LEVEL_MAX {
+        world.ca.evict(x, y, z);
+    }
+}
+
+/// Place a liquid voxel at `(x, y, z)` and set its CA level. Used both
+/// for free-fall (move entire level into an air cell) and lateral
+/// spread (donate one unit into an air cell, creating a new level=1
+/// voxel). `set_voxel`'s default LIQUID-init runs first; we then
+/// override with the caller's level.
+fn place_liquid(world: &mut WorldState, x: u32, y: u32, z: u32, m: u8, level: u8) {
+    world.set_voxel(x, y, z, m);
+    world.ca.set_state(x, y, z, level);
 }
 
 // ============================================================================
@@ -322,18 +475,10 @@ mod tests {
         let mut world = world_with_sand_at(10, 1, 10);
         world.materials[2] = Material::default(); // stone, no CA flags
         world.set_voxel(10, 0, 10, 2); // stone below
-        // Sand at y=1, stone at y=0 — sand should try to fall, fail,
-        // then try diagonals (also blocked by stone? actually diagonals
-        // require nx,y,nz=air AND nx,y-1,nz=air. Side air; diag-below
-        // is air on most sides since only (10,0,10) has stone). So
-        // sand should slide diagonally on first tick.
         tick(&mut world);
-        // Either sand stayed put (settled) or moved diagonally —
-        // verify it left y=1 in either case.
         let still_there = world.read_material(10, 1, 10);
         if still_there == 1 {
-            // Settled in place — OK, but the diag path should have
-            // worked, so this is informational only.
+            // Settled in place — OK.
         } else {
             // Confirm sand landed in some adjacent column at y=0.
             let mut found = false;
@@ -366,14 +511,54 @@ mod tests {
         world
     }
 
+    /// Sum up `level` across every cell whose material is `liquid`. For
+    /// cells not in the active set, level is treated as 15 (matching
+    /// `liquid_level`'s default).
+    fn total_liquid_mass(world: &WorldState, liquid_mat: u8) -> u32 {
+        let mut sum = 0u32;
+        for z in 0..WORLD_SIDE {
+            for y in 0..WORLD_SIDE.min(8) {
+                for x in 0..WORLD_SIDE {
+                    if world.read_material(x, y, z) == liquid_mat {
+                        sum += world.ca.liquid_level(x, y, z) as u32;
+                    }
+                }
+            }
+        }
+        sum
+    }
+
     #[test]
-    fn liquid_spreads_laterally_when_pressured_from_above() {
-        // Stack two water voxels on the floor; the bottom one sees
-        // liquid above and should spread sideways.
+    fn liquid_source_initialized_to_full_level() {
+        // A freshly placed liquid voxel must enter the active set at
+        // level 15, not level 0 (which would mean "empty / clear me").
         let mut world = flat_stone_5x5();
         world.set_voxel(10, 1, 10, 1);
-        world.set_voxel(10, 2, 10, 1);  // pressure
-        for _ in 0..8 { tick(&mut world); }
+        assert_eq!(world.ca.liquid_level(10, 1, 10), 15);
+    }
+
+    #[test]
+    fn liquid_falls_into_air() {
+        // Liquid voxel suspended in air should fall straight down by
+        // one cell per tick.
+        let mut world = flat_stone_5x5();
+        // Floor at y=0, then air rows y=1..3, then a water voxel at y=3.
+        world.set_voxel(10, 3, 10, 1);
+        tick(&mut world);
+        assert_eq!(world.read_material(10, 3, 10), 0);
+        assert_eq!(world.read_material(10, 2, 10), 1);
+        assert_eq!(world.ca.liquid_level(10, 2, 10), 15);
+    }
+
+    #[test]
+    fn liquid_spreads_laterally_when_pressured_from_above() {
+        // Stack two water voxels on the floor; the bottom one is full
+        // (level 15) and pressured by another full voxel above. Spread
+        // outward over enough ticks for the level-1 ring to appear.
+        let mut world = flat_stone_5x5();
+        world.set_voxel(10, 1, 10, 1);
+        world.set_voxel(10, 2, 10, 1);
+        for _ in 0..16 { tick(&mut world); }
         let mut neighbor_water = 0;
         for &(dx, dz) in &[(-1i32, 0), (1, 0), (0, -1), (0, 1)] {
             let nx = (10i32 + dx) as u32;
@@ -389,22 +574,15 @@ mod tests {
     #[test]
     fn liquid_stream_lays_flat_not_pyramidal() {
         // A continuous source of falling water voxels should spread out
-        // along the ground rather than stacking into a sand-shaped pile.
-        // Drop one voxel per simulated frame from y=8 onto a flat stone
-        // floor; after a number of drops, more water voxels should be
-        // at y=1 (the ground row) than at y=2 (one above ground).
-        // Without this rule shape, the granular-style diagonal slide
-        // would settle each drop adjacent to the column and the
-        // bottom row never gets wider than 5–7 voxels, with the
-        // remainder building up vertically.
+        // along the ground rather than stacking. After enough time
+        // there should be more water voxels at y=1 (the ground row)
+        // than at y=2.
         let mut world = WorldState::new();
         world.materials[1] = Material {
             flags: MaterialFlags::empty().with(MaterialFlags::LIQUID),
             ..Material::default()
         };
         world.materials[2] = Material::default();
-        // 21×21 stone floor centered at (10, 10) so spreading isn't
-        // wall-bound.
         for dz in -10i32..=10 {
             for dx in -10..=10 {
                 let nx = (10i32 + dx) as u32;
@@ -412,18 +590,15 @@ mod tests {
                 world.set_voxel(nx, 0, nz, 2);
             }
         }
-        // Drop 60 water voxels into the same column with a tick after
-        // each — i.e., simulate a stream.
+        // Drop 60 water voxels into the same column.
         for _ in 0..60 {
-            // Only place if the spawn cell is air; otherwise the host
-            // hook would skip the write anyway.
             if world.read_material(10, 8, 10) == 0 {
                 world.set_voxel(10, 8, 10, 1);
             }
             tick(&mut world);
         }
-        // Let any in-flight grains land + settle.
-        for _ in 0..40 { tick(&mut world); }
+        // Let in-flight voxels land + equilibrate.
+        for _ in 0..200 { tick(&mut world); }
 
         let mut at_y1 = 0;
         let mut at_y2 = 0;
@@ -435,9 +610,6 @@ mod tests {
                 if world.read_material(nx, 2, nz) == 1 { at_y2 += 1; }
             }
         }
-        // Liquid should spread out along the floor, not pile vertically.
-        // We assert both that the bottom row has many voxels AND that
-        // it's wider than the second row.
         assert!(at_y1 >= 8,
             "expected a wide bottom row of water; only {} voxels at y=1", at_y1);
         assert!(at_y1 > at_y2,
@@ -445,36 +617,85 @@ mod tests {
             at_y1, at_y2);
     }
 
+    #[test]
+    fn liquid_mass_is_conserved_under_spread() {
+        // Place one full water voxel on a flat floor; tick to settle.
+        // The total fluid level summed across all liquid cells should
+        // equal 15 forever (mass conservation).
+        let mut world = flat_stone_5x5();
+        // Widen the floor so the puddle has room.
+        for dz in -10i32..=10 {
+            for dx in -10..=10 {
+                let nx = (10i32 + dx) as u32;
+                let nz = (10i32 + dz) as u32;
+                world.set_voxel(nx, 0, nz, 2);
+            }
+        }
+        world.set_voxel(10, 1, 10, 1);
+        let start_mass = total_liquid_mass(&world, 1);
+        assert_eq!(start_mass, 15);
+        for _ in 0..200 { tick(&mut world); }
+        let end_mass = total_liquid_mass(&world, 1);
+        assert_eq!(end_mass, 15, "mass not conserved under lateral spread");
+    }
+
+    #[test]
+    fn liquid_level_below_15_advances_top_surface_marker() {
+        // Smoke-test the renderer-visible level state: write a partial
+        // level directly and confirm `liquid_level` returns it.
+        let mut world = flat_stone_5x5();
+        world.set_voxel(10, 1, 10, 1);
+        world.ca.set_state(10, 1, 10, 7);
+        assert_eq!(world.ca.liquid_level(10, 1, 10), 7);
+    }
 
     #[test]
     fn liquid_lone_voxel_does_not_flicker() {
-        // Single isolated water voxel on solid ground with nothing
-        // above — must NOT bounce between neighbors. This test is
-        // the regression for the "fallen voxels flicker in and out"
-        // bug.
+        // A single voxel placed on solid ground spreads out as far as
+        // it can (per equilibration), then stops moving. Critically,
+        // it must not oscillate between cells.
         let mut world = flat_stone_5x5();
-        world.set_voxel(10, 1, 10, 1);
-        let mut history = std::collections::HashSet::new();
-        for _ in 0..16 {
-            tick(&mut world);
-            // Where is the (single) water voxel after this tick?
-            let mut count = 0;
-            let mut pos = (0u32, 0u32, 0u32);
-            for &(dx, dz) in &[(-1i32, 0), (1, 0), (0, -1), (0, 1), (0, 0)] {
+        // Widen so the equilibrium puddle has room.
+        for dz in -3i32..=3 {
+            for dx in -3..=3 {
                 let nx = (10i32 + dx) as u32;
                 let nz = (10i32 + dz) as u32;
-                if world.read_material(nx, 1, nz) == 1 {
-                    count += 1;
-                    pos = (nx, 1, nz);
+                world.set_voxel(nx, 0, nz, 2);
+            }
+        }
+        world.set_voxel(10, 1, 10, 1);
+        // Run long enough for the puddle to settle.
+        for _ in 0..200 { tick(&mut world); }
+        // Run another batch and snapshot positions — they must not
+        // change after settling.
+        let snapshot: Vec<(u32, u32, u32, u8)> = {
+            let mut v = Vec::new();
+            for dz in -3i32..=3 {
+                for dx in -3..=3 {
+                    let nx = (10i32 + dx) as u32;
+                    let nz = (10i32 + dz) as u32;
+                    if world.read_material(nx, 1, nz) == 1 {
+                        v.push((nx, 1, nz, world.ca.liquid_level(nx, 1, nz)));
+                    }
                 }
             }
-            assert_eq!(count, 1, "lone voxel duplicated/disappeared");
-            history.insert(pos);
-        }
-        // The voxel should have settled, not visited multiple cells.
-        assert_eq!(history.len(), 1,
-            "lone water voxel oscillated through {} cells: {:?}",
-            history.len(), history);
+            v
+        };
+        for _ in 0..16 { tick(&mut world); }
+        let after: Vec<(u32, u32, u32, u8)> = {
+            let mut v = Vec::new();
+            for dz in -3i32..=3 {
+                for dx in -3..=3 {
+                    let nx = (10i32 + dx) as u32;
+                    let nz = (10i32 + dz) as u32;
+                    if world.read_material(nx, 1, nz) == 1 {
+                        v.push((nx, 1, nz, world.ca.liquid_level(nx, 1, nz)));
+                    }
+                }
+            }
+            v
+        };
+        assert_eq!(snapshot, after, "puddle moved after settling — flicker");
     }
 
     #[test]

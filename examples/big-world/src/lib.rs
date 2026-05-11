@@ -24,11 +24,12 @@ use voxlconsl_sdk::physics;
 use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
 
 // Frames-per-sand-drop. With ~22 fps gameplay this gives ~5 drops/s.
-// Water drops on a slower cadence than sand: the v0.1.x liquid CA rule
-// spreads laterally one cell per pressure-event, and at 4-frame intervals
-// the source mass piles vertically faster than it can spread out.
+// Water uses the same cadence as sand now that the §10.3 liquid rule
+// tracks per-voxel fluid level (v0.1.5): the puddle equilibrates flat
+// instead of building a pyramid, so the source no longer has to be
+// rate-limited.
 const SAND_DROP_PERIOD:  u32 = 4;
-const WATER_DROP_PERIOD: u32 = 16;
+const WATER_DROP_PERIOD: u32 = 4;
 static mut SAND_DROP_COUNTER: u32 = 0;
 static mut WATER_DROP_COUNTER: u32 = 0;
 
@@ -433,9 +434,8 @@ pub extern "C" fn update(dt_ms: u32) {
         //
         // Sand drops on the player's east-south side; water on the
         // east-north side. Sand piles at its angle of repose; water
-        // spreads laterally. Water uses a longer drop period because
-        // the v0.1.x lateral-spread rule is slower than a 4-frame
-        // cadence — see the comment on liquid_tick in ca.rs.
+        // equilibrates level-aware (§10.3 liquid state byte) into a
+        // flat puddle.
         let drop_y = 60u32;
         SAND_DROP_COUNTER = SAND_DROP_COUNTER.saturating_add(1);
         if SAND_DROP_COUNTER >= SAND_DROP_PERIOD {

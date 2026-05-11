@@ -75,6 +75,7 @@ impl BrowserHost {
             actors: &world.actors,
             macro_grid: &world.macro_grid,
             materials: &world.materials,
+            ca: &world.ca,
             sun_dir: world.sun_dir,
             sky: world.sky_top,
         };

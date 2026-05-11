@@ -13,12 +13,13 @@
 //!   - Camera projections beyond perspective (§3.2)
 
 use voxlconsl_svo::{ray::RayHit, ChunkKey};
-use voxlconsl_types::{ActorId, Material, Vec3};
+use voxlconsl_types::{ActorId, Material, MaterialFlags, Vec3};
 
 use crate::actors::ActorTable;
+use crate::ca::{CaState, LIQUID_LEVEL_MAX};
 use crate::macro_grid::MacroGrid;
 use crate::palette::{SYSTEM_PALETTE, lit_color_index};
-use crate::world::ChunkState;
+use crate::world::{ChunkState, WORLD_SIDE};
 
 pub const WIDTH: u32 = 256;
 pub const HEIGHT: u32 = 144;
@@ -46,6 +47,10 @@ pub struct Scene<'a> {
     pub actors: &'a ActorTable,
     pub macro_grid: &'a MacroGrid,
     pub materials: &'a [Material; 256],
+    /// CA active-set state; sourced by the renderer for liquid sub-cell
+    /// surface heights (§10.3 "Renderer integration"). Liquid voxels
+    /// outside the active set default to full level.
+    pub ca: &'a CaState,
     pub sun_dir: Vec3,
     /// Sky color shown when a ray misses everything. Palette index.
     pub sky: u8,
@@ -125,7 +130,44 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
                         cz as f32 * 32.0,
                     );
                     let local_origin = camera.eye - chunk_origin;
-                    if let Some(hit) = cs.chunk.raycast(local_origin, dir, bound) {
+                    if let Some(mut hit) = cs.chunk.raycast(local_origin, dir, bound) {
+                        // §10.3 "Renderer integration": if the hit is
+                        // on a partial-fill liquid voxel and the ray
+                        // came in through the top face, drop t to the
+                        // sub-cell surface. Side and bottom entries
+                        // render as full this pass — handling those
+                        // requires SVO-level continuation, which we
+                        // defer.
+                        let m = scene.materials[hit.material as usize];
+                        if m.flags.contains(MaterialFlags::LIQUID)
+                            && hit.normal == (0, 1, 0)
+                            && dir.y < 0.0
+                        {
+                            let wx = hit.voxel.0 + cx * 32;
+                            let wy = hit.voxel.1 + cy * 32;
+                            let wz = hit.voxel.2 + cz * 32;
+                            // Only show a sub-cell surface for the
+                            // top voxel of a column — i.e., when the
+                            // cell directly above is NOT the same
+                            // liquid. A pressured cell (water above)
+                            // fluctuates levels as mass cycles through
+                            // it; rendering that as varying height
+                            // produces the flicker you'd otherwise
+                            // see at a stream's impact point.
+                            let pressured_above =
+                                read_world_material(scene.chunks, wx, wy + 1, wz) == hit.material;
+                            if !pressured_above {
+                                let level = scene.ca.liquid_level(wx, wy, wz);
+                                if level < LIQUID_LEVEL_MAX {
+                                    let surface_y =
+                                        wy as f32 + level as f32 / LIQUID_LEVEL_MAX as f32;
+                                    let t_surface = (surface_y - camera.eye.y) / dir.y;
+                                    if t_surface > hit.t {
+                                        hit.t = t_surface;
+                                    }
+                                }
+                            }
+                        }
                         if closest.as_ref().map(|c| hit.t < c.t).unwrap_or(true) {
                             closest = Some(hit);
                         }
@@ -179,6 +221,30 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
             framebuffer[i + 3] = 255;
         }
     }
+}
+
+/// Look up a world voxel's material directly from the chunk dense
+/// buffers. Used by the liquid surface-clip path to peek at the cell
+/// above a hit. Out-of-bounds and unallocated chunks return 0 (air).
+fn read_world_material(
+    chunks: &[Option<Box<ChunkState>>],
+    x: u32,
+    y: u32,
+    z: u32,
+) -> u8 {
+    if x >= WORLD_SIDE || y >= WORLD_SIDE || z >= WORLD_SIDE { return 0; }
+    let cx = (x >> 5) as u8;
+    let cy = (y >> 5) as u8;
+    let cz = (z >> 5) as u8;
+    let key = ChunkKey::new(cx, cy, cz);
+    let cs = match chunks.get(key.0 as usize).and_then(|c| c.as_deref()) {
+        Some(c) => c,
+        None => return 0,
+    };
+    let lx = (x & 31) as usize;
+    let ly = (y & 31) as usize;
+    let lz = (z & 31) as usize;
+    cs.dense[(lz * 32 + ly) * 32 + lx]
 }
 
 /// Cheap ray-AABB hit test: returns true if the ray enters the AABB before

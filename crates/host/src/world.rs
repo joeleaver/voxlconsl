@@ -208,10 +208,30 @@ impl WorldState {
             // CA hook: any change to or from a CA-flagged material
             // wakes the voxel + its 6-neighbors, so adjacent grains
             // can resume falling when air opens up beneath them.
+            //
+            // For liquids we also initialize the per-voxel level to
+            // LIQUID_LEVEL_MAX (15 = full) when a non-liquid cell is
+            // replaced with a liquid material — this is the "source"
+            // case (cart writes a fresh water voxel). When the CA rule
+            // itself writes a partial-level voxel it overrides the
+            // state immediately after, so the auto-init never sticks
+            // for moves.
+            let new_is_liquid = material != 0
+                && self.materials[material as usize]
+                    .flags
+                    .contains(MaterialFlags::LIQUID);
+            let prev_was_liquid = prev != 0
+                && self.materials[prev as usize]
+                    .flags
+                    .contains(MaterialFlags::LIQUID);
             if material_has_ca(&self.materials, material)
                 || material_has_ca(&self.materials, prev)
             {
-                self.ca.mark_active(x, y, z);
+                if new_is_liquid && !prev_was_liquid {
+                    self.ca.wake_with_state(x, y, z, crate::ca::LIQUID_LEVEL_MAX);
+                } else {
+                    self.ca.mark_active(x, y, z);
+                }
             }
         }
     }
