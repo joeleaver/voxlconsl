@@ -58,6 +58,17 @@ impl BrowserHost {
         // that the cart has had a chance to query input this frame.
         self.cart.world().input.end_of_frame(dt_ms as u32);
 
+        // Integrate Layer 2 rigid bodies (§10.2). Must run before the
+        // CA tick + final flush so any body-driven mutations the cart
+        // makes (in response to events drained during update) settle
+        // into a consistent world state before render.
+        //
+        // Bodies need a flushed world view for voxel-collision queries.
+        // The integrator reads `world.read_material` directly (not via
+        // SVO), so no flush is required here — `read_material` sees
+        // uncommitted writes.
+        voxlconsl_host::bodies::step(self.cart.world(), dt_ms / 1000.0);
+
         // Tick the CA sim (§10.3 layer 3). Must run before flush so the
         // SVO rebuild captures any voxel mutations from sand/water/etc.
         // CA tick reads/writes the dense buffer directly and re-marks

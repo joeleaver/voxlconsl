@@ -16,7 +16,7 @@ pub use voxlconsl_types::*;
 /// All multi-component values are passed as a flat list of primitives —
 /// WASM's ABI doesn't natively carry tuples or structs (§8.4).
 mod host {
-    use super::{Hit, SweepHit};
+    use super::{BodyState, CollisionEvent, Hit, SweepHit};
     unsafe extern "C" {
         pub fn set_voxel(x: u32, y: u32, z: u32, material: u32);
         pub fn fill_box(
@@ -114,6 +114,24 @@ mod host {
             out_hit: *mut SweepHit,
         ) -> u32;
         pub fn material_at(x: u32, y: u32, z: u32) -> u32;
+
+        // Bodies (§10.2)
+        pub fn body_spawn(
+            actor: u32, kind: u32, shape_tag: u32,
+            sx: f32, sy: f32, sz: f32,
+            mass: f32,
+        ) -> u32;
+        pub fn body_despawn(id: u32);
+        pub fn body_set_kind(id: u32, kind: u32);
+        pub fn body_set_position(id: u32, x: f32, y: f32, z: f32);
+        pub fn body_set_velocity(id: u32, x: f32, y: f32, z: f32);
+        pub fn body_apply_impulse(id: u32, jx: f32, jy: f32, jz: f32);
+        pub fn body_set_layer(id: u32, layer: u32, mask: u32);
+        pub fn body_set_sensor(id: u32, sensor: u32);
+        pub fn body_set_material(id: u32, restitution: f32, friction: f32);
+        pub fn body_get(id: u32, out_state: *mut BodyState) -> u32;
+        pub fn world_set_gravity(gx: f32, gy: f32, gz: f32);
+        pub fn drain_collision_events(buf: *mut CollisionEvent, max: u32) -> u32;
 
         // CA (§10.3)
         pub fn ca_set_budget(voxels_per_frame: u32);
@@ -380,6 +398,7 @@ pub fn actor_get_orientation(actor: ActorId) -> Orientation {
 }
 
 pub mod animation;
+pub mod bodies;
 pub mod ca;
 pub mod physics;
 pub mod text;

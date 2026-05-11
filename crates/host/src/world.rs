@@ -26,6 +26,7 @@ use voxlconsl_svo::{build, ChunkData, ChunkKey};
 use voxlconsl_types::{Material, MaterialFlags, Vec3};
 
 use crate::actors::ActorTable;
+use crate::bodies::BodyTable;
 use crate::ca::CaState;
 use crate::input::InputState;
 use crate::macro_grid::MacroGrid;
@@ -112,6 +113,7 @@ pub struct WorldState {
     pub prefabs: PrefabTable,
     pub macro_grid: MacroGrid,
     pub ca: CaState,
+    pub bodies: BodyTable,
 }
 
 impl WorldState {
@@ -135,6 +137,7 @@ impl WorldState {
             prefabs: PrefabTable::new(),
             macro_grid: MacroGrid::new(),
             ca: CaState::new(),
+            bodies: BodyTable::new(),
         }
     }
 

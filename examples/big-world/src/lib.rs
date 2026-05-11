@@ -20,6 +20,7 @@
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
+use voxlconsl_sdk::bodies;
 use voxlconsl_sdk::physics;
 use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
 
@@ -60,6 +61,7 @@ const M_SAND:      u8 = 11;
 const M_WATER:     u8 = 12;
 const M_FIRE:      u8 = 13;
 const M_EMBER:     u8 = 14;
+const M_CRATE:     u8 = 15;
 
 // ── Player ────────────────────────────────────────────────────────────────
 const DUDE_W: usize = 5;
@@ -164,6 +166,18 @@ static mut EMBERS:     [Ember;                EMBERS_CAP]     = [Ember {
 }; EMBERS_CAP];
 static mut EMBER_RNG:  u32 = 0xC0FF_EEBA;
 
+// ── Body-physics demo (§10.2) ─────────────────────────────────────────────
+//
+// On entering the game scene we spawn a short stack of dynamic AABB
+// crates above the player. The host integrates them each frame (gravity
+// + axis-separated voxel-grid sweep + pairwise body-vs-body), and the
+// `bodies::step` sync writes each body's world position into its
+// attached actor so the renderer follows the simulation. Cart-side this
+// is just "spawn it and forget" — no per-frame update logic needed.
+const CRATE_STACK_LEN: usize = 3;
+const CRATE_SIDE_VOX:  u8    = 3;
+static mut CRATES_SPAWNED: bool = false;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn init() {
     // ── Materials ─────────────────────────────────────────────
@@ -231,9 +245,18 @@ pub extern "C" fn init() {
         15,
         MaterialFlags::empty(),
     );
+    // Crate: warm bright orange. Painted into per-body owned actors
+    // for the §10.2 rigid-body demo; the actors follow the host's
+    // integrated body positions each frame (sync done in bodies::step).
+    material_define(M_CRATE, Material::pack_color(11, 2), 0, MaterialFlags::empty());
 
     sky_set_gradient(Material::pack_color(7, 0), Material::pack_color(6, 0));
     light_set_sun(Vec3::new(-0.6, 0.8, 0.4), 0, 0);
+
+    // Earth-ish gravity — voxlconsl voxels are dimensionless, but
+    // ~10 units/sec² along -Y feels right for "1 voxel ~ 1 meter"
+    // scale and makes the crates settle in roughly half a second.
+    bodies::world_set_gravity(Vec3::new(0.0, -10.0, 0.0));
 
     // The cart owns two scenes: a clean void where the title text
     // floats (scene 0) and the gameplay world below (scene 1). We
@@ -618,6 +641,62 @@ fn tick_embers() {
     }
 }
 
+/// Spawn a small stack of dynamic-body crates a few voxels above the
+/// player. Each crate is an owned-actor cube of side `CRATE_SIDE_VOX`
+/// painted in `M_CRATE`, with an attached AABB body. The host's
+/// integrator (§10.2) does the rest — gravity pulls them down, the
+/// voxel-grid sweep stops them on the terrain, and pairwise body-vs-body
+/// contact lets the stack settle on each other.
+fn spawn_crate_stack() {
+    if unsafe { CRATES_SPAWNED } { return; }
+    unsafe { CRATES_SPAWNED = true; }
+
+    let p = unsafe { PLAYER_POS };
+    // Spawn a few voxels east of the player so the dude doesn't get
+    // buried by his own crates on the first frame.
+    let base_x = (p.x + 4.0).clamp(2.0, (WORLD - 6) as f32);
+    let base_z = (p.z + 0.5).clamp(2.0, (WORLD - 6) as f32);
+
+    // Stack center starts well above terrain so gravity has room to
+    // act. With g=-10 and ~10 voxels of fall, they hit at ~14 v/s →
+    // mostly absorbed by friction=0.5, restitution=0.15.
+    let drop_height = p.y + 10.0;
+
+    let s = CRATE_SIDE_VOX as f32;
+    for i in 0..CRATE_STACK_LEN {
+        let Some(actor) = actor_spawn() else { break };
+        // Fill the actor's volume with crate material. Default actor
+        // size is DEFAULT_VOLUME_SIDE (16); we paint just the low
+        // s×s×s corner. The bodies::step sync writes actor.position
+        // to (body.position - half_extents), so the painted cube
+        // lines up with the simulated AABB.
+        actor_fill_box(
+            actor,
+            U8Vec3::new(0, 0, 0),
+            U8Vec3::new(CRATE_SIDE_VOX - 1, CRATE_SIDE_VOX - 1, CRATE_SIDE_VOX - 1),
+            M_CRATE,
+        );
+        let Some(body) = bodies::body_spawn(
+            Some(actor),
+            BodyKind::Dynamic,
+            Shape::Aabb { extents: Vec3::splat(s) },
+            /*mass*/ 1.0,
+        ) else { actor_despawn(actor); break };
+        // Stack them on top of each other; small lateral jitter so
+        // the contact pair-resolver has a non-degenerate normal.
+        let jitter = ((i as f32) - 1.0) * 0.05;
+        let pos = Vec3::new(
+            base_x + s * 0.5 + jitter,
+            drop_height + (i as f32) * (s + 0.1),
+            base_z + s * 0.5,
+        );
+        bodies::body_set_position(body, pos);
+        // Restitution low so they don't bounce off forever; friction
+        // moderate so they don't slide across the dirt indefinitely.
+        bodies::body_set_material(body, /*restitution*/0.15, /*friction*/0.5);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn update(dt_ms: u32) {
     // Title-screen state: orbit camera + wait for FIRE to start the game.
@@ -635,6 +714,10 @@ pub extern "C" fn update(dt_ms: u32) {
             // game scene — the §10.3 fire rule + cart-side embers
             // then carry the burn through the forest.
             seed_first_fire();
+            // Drop a stack of dynamic crates near the player so the
+            // §10.2 integration is visible end-to-end: actors spawn,
+            // bodies fall, voxel collision settles them on the terrain.
+            spawn_crate_stack();
         }
         return;
     }

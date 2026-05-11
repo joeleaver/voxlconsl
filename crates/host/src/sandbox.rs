@@ -18,8 +18,8 @@
 use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 use voxlconsl_types::{
-    ActionKind, ActorId, BindingHint, Material, MaterialFlags, Orientation, PrefabId,
-    U8Vec3, Vec3,
+    ActionKind, ActorId, BindingHint, BodyId, BodyKind, Material, MaterialFlags, Orientation,
+    PrefabId, Shape, ShapeTag, U8Vec3, Vec3,
     cart_format::{Cart as VoxlCart, CartError as VoxlError, MAGIC as VOXL_MAGIC},
 };
 
@@ -623,6 +623,161 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         |mut caller: Caller<WorldState>, x: u32, y: u32, z: u32| -> u32 {
             prepare_for_queries(caller.data_mut());
             crate::physics::material_at(caller.data(), x, y, z) as u32
+        },
+    )?;
+
+    // Bodies (§10.2) — Layer 2 rigid bodies. Cart spawns AABB / sphere
+    // bodies attached to actors; the host integrates them each frame.
+    //
+    // `body_spawn(actor, kind, shape_tag, sx, sy, sz, mass)` returns a
+    // BodyId or u32::MAX on cap exhaustion. `actor` of u32::MAX leaves
+    // the body unattached. Shape: tag 0 = AABB (sx, sy, sz = full
+    // extents), tag 1 = Sphere (sx = radius, sy/sz ignored).
+    linker.func_wrap(
+        "env", "body_spawn",
+        |mut caller: Caller<WorldState>,
+         actor: u32, kind: u32, shape_tag: u32,
+         sx: f32, sy: f32, sz: f32,
+         mass: f32| -> u32 {
+            let kind = BodyKind::from_u8(kind as u8);
+            let shape = Shape::from_parts(ShapeTag::from_u8(shape_tag as u8), [sx, sy, sz]);
+            let actor_opt = if actor == u32::MAX { None } else { Some(ActorId(actor)) };
+            let world = caller.data_mut();
+            let body = crate::bodies::Body {
+                kind,
+                shape,
+                position: actor_opt
+                    .and_then(|a| world.actors.get(a))
+                    .map(|a| a.position + shape.half_extents())
+                    .unwrap_or(Vec3::ZERO),
+                velocity: Vec3::ZERO,
+                mass: if mass > 0.0 { mass } else { 1.0 },
+                restitution: 0.0,
+                friction: 0.0,
+                layer: 0,
+                mask: 0xFF,
+                sensor: false,
+                actor: actor_opt,
+            };
+            world.bodies.spawn(body).map(|id| id.0).unwrap_or(u32::MAX)
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_despawn",
+        |mut caller: Caller<WorldState>, id: u32| {
+            caller.data_mut().bodies.despawn(BodyId(id));
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_set_kind",
+        |mut caller: Caller<WorldState>, id: u32, kind: u32| {
+            if let Some(b) = caller.data_mut().bodies.get_mut(BodyId(id)) {
+                b.kind = BodyKind::from_u8(kind as u8);
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_set_position",
+        |mut caller: Caller<WorldState>, id: u32, x: f32, y: f32, z: f32| {
+            if let Some(b) = caller.data_mut().bodies.get_mut(BodyId(id)) {
+                b.position = Vec3::new(x, y, z);
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_set_velocity",
+        |mut caller: Caller<WorldState>, id: u32, x: f32, y: f32, z: f32| {
+            if let Some(b) = caller.data_mut().bodies.get_mut(BodyId(id)) {
+                b.velocity = Vec3::new(x, y, z);
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_apply_impulse",
+        |mut caller: Caller<WorldState>, id: u32, jx: f32, jy: f32, jz: f32| {
+            if let Some(b) = caller.data_mut().bodies.get_mut(BodyId(id)) {
+                let inv_m = if matches!(b.kind, BodyKind::Dynamic) && b.mass > 0.0 {
+                    1.0 / b.mass
+                } else {
+                    0.0
+                };
+                b.velocity = b.velocity + Vec3::new(jx, jy, jz) * inv_m;
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_set_layer",
+        |mut caller: Caller<WorldState>, id: u32, layer: u32, mask: u32| {
+            if let Some(b) = caller.data_mut().bodies.get_mut(BodyId(id)) {
+                b.layer = (layer as u8) & 0x07;
+                b.mask = mask as u8;
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_set_sensor",
+        |mut caller: Caller<WorldState>, id: u32, sensor: u32| {
+            if let Some(b) = caller.data_mut().bodies.get_mut(BodyId(id)) {
+                b.sensor = sensor != 0;
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_set_material",
+        |mut caller: Caller<WorldState>, id: u32, restitution: f32, friction: f32| {
+            if let Some(b) = caller.data_mut().bodies.get_mut(BodyId(id)) {
+                b.restitution = restitution.clamp(0.0, 1.0);
+                b.friction = friction.clamp(0.0, 1.0);
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "body_get",
+        |mut caller: Caller<WorldState>, id: u32, out_ptr: u32| -> u32 {
+            let snap = match caller.data().bodies.get(BodyId(id)) {
+                Some(b) => b.snapshot(),
+                None => return 0,
+            };
+            let bytes = crate::bodies::encode_body_state(&snap);
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            let _ = memory.write(&mut caller, out_ptr as usize, &bytes);
+            1
+        },
+    )?;
+    linker.func_wrap(
+        "env", "world_set_gravity",
+        |mut caller: Caller<WorldState>, gx: f32, gy: f32, gz: f32| {
+            caller.data_mut().bodies.gravity = Vec3::new(gx, gy, gz);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "drain_collision_events",
+        |mut caller: Caller<WorldState>, buf_ptr: u32, max: u32| -> u32 {
+            let max = max as usize;
+            // Pull out up to `max` events, encode each in 36 bytes, write.
+            let events: Vec<voxlconsl_types::CollisionEvent> = {
+                let table = &mut caller.data_mut().bodies;
+                let n = table.events.len().min(max);
+                table.events.drain(0..n).collect()
+            };
+            if events.is_empty() {
+                return 0;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            for (i, ev) in events.iter().enumerate() {
+                let bytes = crate::bodies::encode_collision_event(ev);
+                let off = buf_ptr as usize + i * 36;
+                if memory.write(&mut caller, off, &bytes).is_err() {
+                    return i as u32;
+                }
+            }
+            events.len() as u32
         },
     )?;
 
