@@ -201,9 +201,31 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
                 ca_threshold: 0,
                 ca_lifetime: 0,
                 ca_viscosity: 0,
-                _reserved: [0; 9],
+                ignites_to: 0,
+                _reserved: [0; 8],
             };
             caller.data_mut().set_material(slot as u8, mat);
+        },
+    )?;
+
+    // CA-tuning fields on an already-defined material (§2 / §10.3).
+    // Lets carts set ca_threshold (granular angle-of-repose /
+    // flammable ignition heat), ca_lifetime (gas / fire frames),
+    // ca_viscosity (liquid flow rate), and ignites_to (flammable →
+    // fire transformation target).
+    linker.func_wrap(
+        "env", "material_set_ca",
+        |mut caller: Caller<WorldState>,
+         slot: u32,
+         threshold: u32, lifetime: u32, viscosity: u32, ignites_to: u32| {
+            let world = caller.data_mut();
+            let i = slot as usize & 0xFF;
+            let mut mat = world.materials[i];
+            mat.ca_threshold = threshold as u8;
+            mat.ca_lifetime = lifetime as u8;
+            mat.ca_viscosity = viscosity as u8;
+            mat.ignites_to = ignites_to as u8;
+            world.materials[i] = mat;
         },
     )?;
 

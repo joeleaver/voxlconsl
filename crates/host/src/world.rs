@@ -216,19 +216,47 @@ impl WorldState {
             // itself writes a partial-level voxel it overrides the
             // state immediately after, so the auto-init never sticks
             // for moves.
-            let new_is_liquid = material != 0
-                && self.materials[material as usize]
-                    .flags
-                    .contains(MaterialFlags::LIQUID);
-            let prev_was_liquid = prev != 0
-                && self.materials[prev as usize]
-                    .flags
-                    .contains(MaterialFlags::LIQUID);
+            let new_flags = if material != 0 {
+                self.materials[material as usize].flags
+            } else {
+                MaterialFlags::empty()
+            };
+            let prev_flags = if prev != 0 {
+                self.materials[prev as usize].flags
+            } else {
+                MaterialFlags::empty()
+            };
             if material_has_ca(&self.materials, material)
                 || material_has_ca(&self.materials, prev)
             {
-                if new_is_liquid && !prev_was_liquid {
+                // Per-rule source-init: when a non-X cell becomes
+                // material X, prime its CA state byte with X's "full"
+                // defaults. The CA rule may immediately override (e.g.,
+                // a liquid being moved by `place_liquid` writes the
+                // carried level right after), so the auto-init only
+                // sticks for cart-driven placements that don't follow
+                // up.
+                if new_flags.contains(MaterialFlags::LIQUID)
+                    && !prev_flags.contains(MaterialFlags::LIQUID)
+                {
                     self.ca.wake_with_state(x, y, z, crate::ca::LIQUID_LEVEL_MAX);
+                } else if new_flags.contains(MaterialFlags::GAS)
+                    && !prev_flags.contains(MaterialFlags::GAS)
+                {
+                    let lt = self.materials[material as usize].ca_lifetime;
+                    let lt = if lt == 0 { crate::ca::GAS_DEFAULT_LIFETIME } else { lt };
+                    self.ca.wake_with_state(x, y, z, lt);
+                } else if new_flags.contains(MaterialFlags::FIRE)
+                    && !prev_flags.contains(MaterialFlags::FIRE)
+                {
+                    let life_raw = self.materials[material as usize].ca_lifetime;
+                    let life = if life_raw == 0 {
+                        crate::ca::FIRE_DEFAULT_LIFE
+                    } else {
+                        life_raw.min(15)
+                    };
+                    let state = (crate::ca::FIRE_DEFAULT_TEMP & 0x0F) | ((life & 0x0F) << 4);
+                    self.ca.wake_with_state(x, y, z, state);
                 } else {
                     self.ca.mark_active(x, y, z);
                 }

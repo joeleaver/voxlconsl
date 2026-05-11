@@ -34,8 +34,13 @@ pub struct Material {
     pub ca_threshold: u8,
     pub ca_lifetime: u8,
     pub ca_viscosity: u8,
+    /// For `flammable` materials: which material slot this cell becomes
+    /// when its heat exceeds `ca_threshold`. Typically the cart's fire
+    /// material. 0 = vanish to air on ignition (no fire produced).
+    /// Unused for non-flammable materials.
+    pub ignites_to: u8,
     /// Reserved for v2; must be zero in v1.
-    pub _reserved: [u8; 9],
+    pub _reserved: [u8; 8],
 }
 
 impl Material {
@@ -46,7 +51,8 @@ impl Material {
         ca_threshold: 0,
         ca_lifetime: 0,
         ca_viscosity: 0,
-        _reserved: [0; 9],
+        ignites_to: 0,
+        _reserved: [0; 8],
     };
 
     /// Construct a `(ramp << 2) | shade` color byte from named components.

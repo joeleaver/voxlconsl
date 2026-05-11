@@ -30,6 +30,13 @@ mod host {
         pub fn scene_get_active() -> u32;
 
         pub fn material_define(slot: u32, color: u32, emission: u32, flags: u32);
+        pub fn material_set_ca(
+            slot: u32,
+            threshold: u32,
+            lifetime: u32,
+            viscosity: u32,
+            ignites_to: u32,
+        );
 
         pub fn camera_set_lookat(
             ex: f32, ey: f32, ez: f32,
@@ -162,6 +169,34 @@ pub fn scene_get_active() -> SceneId {
 pub fn material_define(slot: u8, color: u8, emission: u8, flags: MaterialFlags) {
     unsafe {
         host::material_define(slot as u32, color as u32, emission as u32, flags.0 as u32)
+    }
+}
+
+/// Set the §10.3 cellular-automata tuning fields on an
+/// already-defined material:
+/// - `threshold`: granular angle-of-repose / flammable ignition heat
+///   (0 = use platform default).
+/// - `lifetime`: gas lifetime in CA ticks / fire frames before
+///   burning out (0 = use platform default; fire caps at 15).
+/// - `viscosity`: liquid flow rate (0 = use platform default).
+/// - `ignites_to`: for flammable, the material slot this cell becomes
+///   when its heat exceeds `threshold` — typically the cart's fire
+///   material. 0 = vanish to air.
+pub fn material_set_ca(
+    slot: u8,
+    threshold: u8,
+    lifetime: u8,
+    viscosity: u8,
+    ignites_to: u8,
+) {
+    unsafe {
+        host::material_set_ca(
+            slot as u32,
+            threshold as u32,
+            lifetime as u32,
+            viscosity as u32,
+            ignites_to as u32,
+        )
     }
 }
 

@@ -58,6 +58,8 @@ const M_SIGN_FACE: u8 = 9;
 const M_RETICLE:   u8 = 10;
 const M_SAND:      u8 = 11;
 const M_WATER:     u8 = 12;
+const M_FIRE:      u8 = 13;
+const M_EMBER:     u8 = 14;
 
 // ── Player ────────────────────────────────────────────────────────────────
 const DUDE_W: usize = 5;
@@ -109,14 +111,80 @@ static mut AIM_ACTION:  ActionHandle = ActionHandle(0);
 static mut ZOOM_ACTION: ActionHandle = ActionHandle(0);
 static mut FIRE_ACTION: ActionHandle = ActionHandle(0);
 
+// ── Embers ────────────────────────────────────────────────────────────────
+// The §10.3 CA only spreads fire cell-by-cell to cardinal neighbors.
+// big-world's forest is too sparse for that to ever reach the next
+// tree, so the cart adds two layers on top:
+//
+//   1. Burn sites: cart-known positions where fire is currently
+//      active. Per tick, each site rolls to *launch* an ember.
+//   2. Embers: airborne `M_EMBER` voxels with a velocity vector.
+//      Each tick we clear the ember's previous cell, advance its
+//      position, write the new cell, and probe what we hit. If the
+//      cell underneath the ember (or the destination cell itself)
+//      is `M_LEAF` or `M_WOOD`, we ignite it and the ember dies;
+//      anything else solid snuffs the ember. The result is little
+//      glowing dots arcing through the canopy from burning tree to
+//      neighbouring trees — "embers", essentially.
+//
+// Embers carry no CA flags so they never enter the §10.3 active
+// set; the cart owns them top-to-bottom.
+
+const BURN_SITES_CAP:    usize = 128;
+const SITE_TTL_TICKS:    u32   = 360;
+const SITE_LAUNCH_MOD:   u32   = 12;   // 1-in-N chance per site per tick to launch an ember
+const EMBERS_CAP:        usize = 64;
+const EMBER_TTL_TICKS:   u32   = 240;  // max ticks a single ember stays airborne
+// Initial-velocity scales. The (x, z) components are signed in
+// [-EMBER_VEL_XZ, +EMBER_VEL_XZ]; the y component is biased upward
+// in [EMBER_VEL_Y_MIN, EMBER_VEL_Y_MAX] so embers initially shoot up
+// before gravity arcs them back down.
+const EMBER_VEL_XZ:       f32 = 0.45;
+const EMBER_VEL_Y_MIN:    f32 = 0.55;
+const EMBER_VEL_Y_MAX:    f32 = 1.20;
+const EMBER_GRAVITY:      f32 = 0.040;
+
+#[derive(Copy, Clone, Default)]
+struct Ember {
+    active: bool,
+    pos:    Vec3,
+    vel:    Vec3,
+    ttl:    u32,
+    /// Last cell the ember was painted into (so we can clear it
+    /// before painting the next one). `painted == false` means we
+    /// haven't drawn this ember yet (first tick of its life).
+    last:   UVec3,
+    painted: bool,
+}
+
+static mut BURN_SITES: [Option<(UVec3, u32)>; BURN_SITES_CAP] = [None; BURN_SITES_CAP];
+static mut EMBERS:     [Ember;                EMBERS_CAP]     = [Ember {
+    active: false, pos: Vec3 { x: 0.0, y: 0.0, z: 0.0 }, vel: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+    ttl: 0, last: UVec3 { x: 0, y: 0, z: 0 }, painted: false,
+}; EMBERS_CAP];
+static mut EMBER_RNG:  u32 = 0xC0FF_EEBA;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn init() {
     // ── Materials ─────────────────────────────────────────────
     material_define(M_STONE, Material::pack_color(14, 1), 0, MaterialFlags::empty());
     material_define(M_DIRT,  Material::pack_color( 0, 1), 0, MaterialFlags::empty());
     material_define(M_GRASS, Material::pack_color( 3, 2), 0, MaterialFlags::empty());
-    material_define(M_WOOD,  Material::pack_color( 0, 0), 0, MaterialFlags::empty());
-    material_define(M_LEAF,  Material::pack_color( 2, 2), 0, MaterialFlags::empty());
+    // Wood + leaves are flammable; they ignite into M_FIRE. Wood holds
+    // out a bit longer than leaves (higher heat threshold) so the
+    // trunk doesn't immediately collapse the moment a leaf catches.
+    material_define(
+        M_WOOD,
+        Material::pack_color( 0, 0), 0,
+        MaterialFlags::empty().with(MaterialFlags::FLAMMABLE),
+    );
+    material_set_ca(M_WOOD, /*threshold*/30, 0, 0, /*ignites_to*/M_FIRE);
+    material_define(
+        M_LEAF,
+        Material::pack_color( 2, 2), 0,
+        MaterialFlags::empty().with(MaterialFlags::FLAMMABLE),
+    );
+    material_set_ca(M_LEAF, /*threshold*/15, 0, 0, /*ignites_to*/M_FIRE);
     material_define(M_SKIN,  Material::pack_color( 1, 3), 0, MaterialFlags::empty());
     material_define(M_SHIRT, Material::pack_color( 7, 2), 0, MaterialFlags::empty());
     // Sign body = warm dark wood; face = bright emissive accent so the
@@ -141,6 +209,27 @@ pub extern "C" fn init() {
         Material::pack_color(5, 2),
         0,
         MaterialFlags::empty().with(MaterialFlags::LIQUID),
+    );
+    // Fire: bright orange + strong emission so it reads against the
+    // green forest. ca_lifetime=12 keeps each fire cell short-lived,
+    // matching the §10.3 4-bit cap and giving the cascade through a
+    // tree a snappy feel.
+    material_define(
+        M_FIRE,
+        Material::pack_color(11, 3),
+        14,
+        MaterialFlags::empty().with(MaterialFlags::FIRE),
+    );
+    material_set_ca(M_FIRE, 0, /*lifetime*/12, 0, 0);
+    // Ember: bright yellow + max emission, no CA flags. The cart
+    // moves these voxels manually each tick (write at new pos, clear
+    // at last pos), so they read as little glowing dots arcing
+    // through the air without ever entering the §10.3 active set.
+    material_define(
+        M_EMBER,
+        Material::pack_color(12, 3),
+        15,
+        MaterialFlags::empty(),
     );
 
     sky_set_gradient(Material::pack_color(7, 0), Material::pack_color(6, 0));
@@ -295,8 +384,179 @@ pub extern "C" fn init() {
         FIRE_ACTION = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "fire");
     }
 
-    // Boot into the title screen.
+    // Boot into the title screen. The world is now fully built; the
+    // first fire gets dropped *after* the player presses FIRE and the
+    // game scene becomes active (so the burn doesn't tick down
+    // invisibly behind the title).
     scene_set_active(SCENE_TITLE);
+}
+
+// ── Embers + RNG helpers ──────────────────────────────────────────────────
+
+fn ember_rand() -> u32 {
+    unsafe {
+        EMBER_RNG = EMBER_RNG
+            .wrapping_mul(0x6C8E_9CF5)
+            .wrapping_add(0x9E37_79B9);
+        EMBER_RNG
+    }
+}
+
+/// Pseudo-random f32 in [-1, 1].
+fn rand_signed() -> f32 {
+    let r = ember_rand();
+    ((r as i32) as f32) / (i32::MAX as f32)
+}
+
+/// Pseudo-random f32 in [0, 1).
+fn rand_unit() -> f32 {
+    (ember_rand() as f32) / (u32::MAX as f32 + 1.0)
+}
+
+fn add_burn_site(pos: UVec3) {
+    let sites = unsafe { &mut *(&raw mut BURN_SITES) };
+    // Prefer an empty slot; otherwise overwrite the slot with the
+    // smallest remaining TTL so a fresher site can take its place.
+    let mut worst_idx = 0usize;
+    let mut worst_ttl = u32::MAX;
+    for (i, slot) in sites.iter_mut().enumerate() {
+        match slot {
+            None => { *slot = Some((pos, SITE_TTL_TICKS)); return; }
+            Some((_, ttl)) => {
+                if *ttl < worst_ttl { worst_ttl = *ttl; worst_idx = i; }
+            }
+        }
+    }
+    sites[worst_idx] = Some((pos, SITE_TTL_TICKS));
+}
+
+fn launch_ember(origin: Vec3) {
+    let embers = unsafe { &mut *(&raw mut EMBERS) };
+    for e in embers.iter_mut() {
+        if e.active { continue; }
+        let vx = rand_signed() * EMBER_VEL_XZ;
+        let vz = rand_signed() * EMBER_VEL_XZ;
+        let vy = EMBER_VEL_Y_MIN + rand_unit() * (EMBER_VEL_Y_MAX - EMBER_VEL_Y_MIN);
+        *e = Ember {
+            active:  true,
+            pos:     origin,
+            vel:     Vec3::new(vx, vy, vz),
+            ttl:     EMBER_TTL_TICKS,
+            last:    UVec3::new(0, 0, 0),
+            painted: false,
+        };
+        return;
+    }
+    // All slots busy: drop this ember silently.
+}
+
+fn seed_first_fire() {
+    // Scan a small window above ground near the player's spawn for any
+    // M_LEAF or M_WOOD voxel and replace it with M_FIRE. Add the
+    // position as the first burn site so embers start radiating.
+    let px = unsafe { PLAYER_POS.x } as i32;
+    let pz = unsafe { PLAYER_POS.z } as i32;
+    for dy in 0..30 {
+        for dz in -16i32..=16 {
+            for dx in -16i32..=16 {
+                let x = (px + dx).clamp(0, WORLD as i32 - 1) as u32;
+                let z = (pz + dz).clamp(0, WORLD as i32 - 1) as u32;
+                let y = (terrain_height(x, z) as i32 + dy).clamp(0, WORLD as i32 - 1) as u32;
+                let m = physics::material_at(x, y, z);
+                if m == M_LEAF || m == M_WOOD {
+                    set_voxel(UVec3::new(x, y, z), M_FIRE);
+                    add_burn_site(UVec3::new(x, y, z));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Clear an ember's previously-painted voxel — but only if it's
+/// still our ember marker (sometimes the underlying CA or another
+/// rule has already overwritten it).
+fn clear_ember_voxel(p: UVec3) {
+    if physics::material_at(p.x, p.y, p.z) == M_EMBER {
+        set_voxel(p, 0);
+    }
+}
+
+fn tick_embers() {
+    // ── Phase 1: roll each burn site for a new ember launch. ──
+    let sites = unsafe { &mut *(&raw mut BURN_SITES) };
+    for slot in sites.iter_mut() {
+        if let Some((pos, ttl)) = *slot {
+            if ttl == 0 { *slot = None; continue; }
+            *slot = Some((pos, ttl - 1));
+            if ember_rand() % SITE_LAUNCH_MOD != 0 { continue; }
+            // Origin = exact burn site, lifted half a cell so the
+            // very first paint doesn't fight the active fire voxel.
+            let origin = Vec3::new(pos.x as f32 + 0.5, pos.y as f32 + 1.0, pos.z as f32 + 0.5);
+            launch_ember(origin);
+        }
+    }
+
+    // ── Phase 2: step every airborne ember. ──
+    let embers = unsafe { &mut *(&raw mut EMBERS) };
+    let mut new_sites: [Option<UVec3>; EMBERS_CAP] = [None; EMBERS_CAP];
+    let mut new_site_count = 0usize;
+
+    for e in embers.iter_mut() {
+        if !e.active { continue; }
+
+        // Clear last-painted cell.
+        if e.painted { clear_ember_voxel(e.last); e.painted = false; }
+
+        // TTL: snuff out silently if exceeded.
+        if e.ttl == 0 { e.active = false; continue; }
+        e.ttl -= 1;
+
+        // Integrate position + velocity.
+        e.pos = Vec3::new(e.pos.x + e.vel.x, e.pos.y + e.vel.y, e.pos.z + e.vel.z);
+        e.vel = Vec3::new(e.vel.x, e.vel.y - EMBER_GRAVITY, e.vel.z);
+
+        // Snap to integer cell. Clamp to world bounds; if we left
+        // the world, drop.
+        let xi = e.pos.x as i32;
+        let yi = e.pos.y as i32;
+        let zi = e.pos.z as i32;
+        if xi < 0 || yi < 0 || zi < 0
+            || xi >= WORLD as i32 || yi >= WORLD as i32 || zi >= WORLD as i32
+        {
+            e.active = false;
+            continue;
+        }
+        let cell = UVec3::new(xi as u32, yi as u32, zi as u32);
+        let m = physics::material_at(cell.x, cell.y, cell.z);
+
+        // Hit-detection — what's in the new cell?
+        if m == M_LEAF || m == M_WOOD {
+            // Ignition! Drop a fire voxel and birth a new burn site.
+            set_voxel(cell, M_FIRE);
+            if new_site_count < new_sites.len() {
+                new_sites[new_site_count] = Some(cell);
+                new_site_count += 1;
+            }
+            e.active = false;
+            continue;
+        }
+        if m != 0 && m != M_EMBER {
+            // Hit a non-flammable solid (terrain, water, etc.) —
+            // snuff the ember.
+            e.active = false;
+            continue;
+        }
+
+        // Empty (or our own previous trail) — paint and continue.
+        set_voxel(cell, M_EMBER);
+        e.last = cell;
+        e.painted = true;
+    }
+
+    for i in 0..new_site_count {
+        if let Some(p) = new_sites[i] { add_burn_site(p); }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -312,6 +572,10 @@ pub extern "C" fn update(dt_ms: u32) {
                 }
             }
             scene_set_active(SCENE_GAME);
+            // Light a tree near the player the moment we enter the
+            // game scene — the §10.3 fire rule + cart-side embers
+            // then carry the burn through the forest.
+            seed_first_fire();
         }
         return;
     }
@@ -455,6 +719,10 @@ pub extern "C" fn update(dt_ms: u32) {
                 set_voxel(UVec3::new(water_x, drop_y, water_z), M_WATER);
             }
         }
+
+        // Spread fire via cart-side embers (§10.3 spreads cell-by-cell,
+        // far too slow to torch a forest on its own).
+        tick_embers();
     }
 }
 
