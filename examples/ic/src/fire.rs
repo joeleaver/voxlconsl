@@ -49,6 +49,14 @@ const WIND_STRENGTH_JITTER: f32 = 0.12;
 const WIND_STRENGTH_MIN: f32   = 0.10;
 const WIND_STRENGTH_MAX: f32   = 0.95;
 
+/// Per-site, per-tick probability that a burn site directly ignites
+/// its downwind cardinal neighbour at max strength. Scales linearly
+/// with current wind strength so a calm wind is effectively a no-op.
+/// Layers on top of the §10.3 CA's omnidirectional heat spread and
+/// the ember-flight loop — three independent fire propagation paths,
+/// the wind one being the most direction-biased.
+const WIND_SPREAD_RATE:  f32   = 0.04;
+
 // World bound checks share this — borrows the host's 512³ scene size.
 const WORLD: u32 = 512;
 
@@ -250,10 +258,12 @@ impl FireState {
     }
 
     /// One full tick: drift wind, discover newly propagated fire,
-    /// roll launches, step every airborne ember.
+    /// run the wind-spread bias, roll ember launches, step every
+    /// airborne ember.
     pub(crate) fn tick(&mut self) {
         self.tick_wind();
         self.discover_propagated_fire();
+        self.wind_spread_step();
 
         // Roll each site.
         let sites_snapshot: [Option<(UVec3, u32)>; BURN_SITES_CAP] = self.burn_sites;
@@ -276,6 +286,71 @@ impl FireState {
         }
 
         self.step_embers();
+    }
+
+    /// Once per tick, every burn site rolls for a chance to directly
+    /// ignite its downwind cardinal neighbour. The chance scales with
+    /// `wind_strength` and is weighted on `|wx|` vs `|wz|` so a wind
+    /// at 45° (e.g. SE) splits its ignitions ~50/50 between +X and
+    /// +Z cells. This is what makes a strong wind visibly shape the
+    /// fire front into an oriented finger.
+    fn wind_spread_step(&mut self) {
+        let p = WIND_SPREAD_RATE * self.wind_strength;
+        if p < 0.001 { return; }
+        let wx = self.wind.x;
+        let wz = self.wind.z;
+        let abs_x = if wx < 0.0 { -wx } else { wx };
+        let abs_z = if wz < 0.0 { -wz } else { wz };
+        let total = abs_x + abs_z;
+        if total < 0.05 { return; }
+
+        let sites_snapshot: [Option<(UVec3, u32)>; BURN_SITES_CAP] = self.burn_sites;
+        const NEW_CAP: usize = 32;
+        let mut new_sites: [Option<UVec3>; NEW_CAP] = [None; NEW_CAP];
+        let mut new_count = 0usize;
+
+        for slot in sites_snapshot.iter() {
+            let pos = match *slot {
+                Some((p, _)) => p,
+                None => continue,
+            };
+            if physics::material_at(pos.x, pos.y, pos.z) != M_FIRE { continue; }
+            if self.rng.unit() > p { continue; }
+
+            // Pick which cardinal axis to spread on, weighted by
+            // wind component magnitude.
+            let r = self.rng.unit() * total;
+            let (dx, dz) = if r < abs_x {
+                (if wx >= 0.0 { 1 } else { -1 }, 0)
+            } else {
+                (0, if wz >= 0.0 { 1 } else { -1 })
+            };
+
+            let nx = (pos.x as i32 + dx).clamp(0, WORLD as i32 - 1) as u32;
+            let nz = (pos.z as i32 + dz).clamp(0, WORLD as i32 - 1) as u32;
+            let ny = pos.y;
+            let m = physics::material_at(nx, ny, nz);
+            // Only ignite flammables we know about. (The §10.3 CA's
+            // `Material.ignites_to` field handles the actual conversion
+            // for any FLAMMABLE-flagged slot, but we're skipping that
+            // path and writing M_FIRE directly — so be explicit about
+            // which slots the cart knows are flammable.)
+            let flammable = m == M_PINE_LEAVES
+                || m == M_PINE_WOOD
+                || m == M_CABIN_WOOD
+                || m == M_CABIN_ROOF;
+            if !flammable { continue; }
+
+            set_voxel(UVec3::new(nx, ny, nz), M_FIRE);
+            if new_count < NEW_CAP {
+                new_sites[new_count] = Some(UVec3::new(nx, ny, nz));
+                new_count += 1;
+            }
+        }
+
+        for i in 0..new_count {
+            if let Some(p) = new_sites[i] { self.add_burn_site(p); }
+        }
     }
 
     fn step_embers(&mut self) {
