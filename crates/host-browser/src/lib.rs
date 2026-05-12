@@ -7,23 +7,19 @@
 
 use wasm_bindgen::prelude::*;
 
-use voxlconsl_host::audio::{BLOCK_FRAMES, BLOCK_SAMPLES, SAMPLE_RATE};
+use voxlconsl_host::audio::SAMPLE_RATE;
 use voxlconsl_host::input::Key;
 use voxlconsl_host::renderer::{render_frame, Scene, HEIGHT, WIDTH};
 use voxlconsl_host::sandbox::Cart;
 
 const FB_BYTES: usize = (WIDTH as usize) * (HEIGHT as usize) * 4;
 
-/// Audio blocks rendered per JS-driven chunk pull. 8 blocks × 64
-/// frames @ 22.05 kHz ≈ 23 ms per chunk. Bigger chunks = fewer
-/// `AudioBufferSourceNode` allocations per second (~43 instead of
-/// 86) and proportionally less per-call wasm-bindgen overhead. JS
-/// keeps `AUDIO_LEAD_CHUNKS` (= 8) chunks scheduled ahead, putting
-/// total output latency around 185 ms — fine for cart audio, and
-/// generous enough that a single slow renderer frame on big-world
-/// can't underrun the audio pump.
-const AUDIO_CHUNK_BLOCKS: usize = 8;
-const AUDIO_CHUNK_FRAMES: usize = AUDIO_CHUNK_BLOCKS * BLOCK_FRAMES;
+// Stage 4b Phase 2c+ moved the entire mixer into the worklet, so the
+// host-browser no longer renders audio chunks for the main thread to
+// schedule. The old `AUDIO_CHUNK_BLOCKS` / `audio_l` / `audio_r` /
+// `render_audio_chunk` pipeline is gone; main.js drains the
+// cart→audio event log instead (`audio_events_ptr` / `_len` /
+// `_clear`) and posts events to the AudioWorkletProcessor.
 
 /// Embedded cart `.voxl`, produced by `scripts/build-web.sh` (which runs
 /// `voxlconsl bundle` and copies the resulting blob here before this
@@ -34,12 +30,6 @@ const EMBEDDED_CART: &[u8] = include_bytes!("../embedded-cart.voxl");
 pub struct BrowserHost {
     cart: Cart,
     framebuffer: Vec<u8>,
-    /// Scratch space for one mixer block, interleaved L/R i16.
-    audio_scratch: Vec<i16>,
-    /// Deinterleaved + i16→f32 chunk buffers fed to Web Audio.
-    /// `AudioBuffer` wants separate channel arrays.
-    audio_l: Vec<f32>,
-    audio_r: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -56,9 +46,6 @@ impl BrowserHost {
         Ok(Self {
             cart,
             framebuffer: vec![0; FB_BYTES],
-            audio_scratch: vec![0; BLOCK_SAMPLES],
-            audio_l: vec![0.0; AUDIO_CHUNK_FRAMES],
-            audio_r: vec![0.0; AUDIO_CHUNK_FRAMES],
         })
     }
 
@@ -66,54 +53,84 @@ impl BrowserHost {
     pub fn height(&self) -> u32 { HEIGHT }
     pub fn framebuffer_len(&self) -> usize { FB_BYTES }
 
-    /// Audio mixer sample rate (Hz) for AudioBuffer construction.
+    /// Audio mixer native sample rate (Hz). Main.js creates the
+    /// AudioContext at this rate so the worklet wasm's `render()`
+    /// block frame count lines up 1:1 with `process()`.
     pub fn audio_sample_rate(&self) -> u32 { SAMPLE_RATE }
 
-    /// Frames produced per `render_audio_chunk` call. Both audio
-    /// channel buffers are this length.
-    pub fn audio_chunk_frames(&self) -> u32 { AUDIO_CHUNK_FRAMES as u32 }
-
-    /// Pointer to the left-channel f32 buffer (length =
-    /// `audio_chunk_frames`). Stable across calls *unless* wasm memory
-    /// grows — re-read after every `render_audio_chunk` to be safe.
-    pub fn audio_l_ptr(&self) -> *const f32 { self.audio_l.as_ptr() }
-
-    /// Pointer to the right-channel f32 buffer.
-    pub fn audio_r_ptr(&self) -> *const f32 { self.audio_r.as_ptr() }
-
     /// Number of currently-playing voices in the mixer's 16-voice
-    /// pool. Pure read — useful for diagnostics and headless E2E
-    /// tests that want to confirm `sfx_play` landed without inspecting
-    /// the audio output stream.
+    /// pool. After Stage-4b Phase 2c+ the authoritative count lives
+    /// on the worklet thread; this reads the cached mirror that JS
+    /// updates from worklet `state` posts.
     pub fn audio_active_voice_count(&mut self) -> u32 {
-        self.cart.world().audio.active_voice_count() as u32
+        self.cart.world().audio_voices_active_cached
     }
 
-    /// Debug-only: directly call `voice_trigger` on the cart's mixer,
-    /// bypassing the cart's input handling. Lets E2E tests verify the
-    /// audio path without depending on cart-side input wiring.
-    /// Returns the raw VoiceId (0 = NONE).
+    /// Debug-only: directly push a `voice_trigger` event onto the
+    /// audio log so the worklet's mixer fires the voice on its next
+    /// `process()` call. Returns the cart-visible VoiceId token.
     pub fn audio_debug_voice_trigger(&mut self, patch: u32, note: u32, velocity: u32) -> u32 {
-        self.cart.world().audio.voice_trigger(patch as u8, note as u8, velocity as u8).0
+        let world = self.cart.world();
+        let token = world.alloc_voice_token();
+        world.audio_events.push_voice_trigger(
+            token, patch as u8, note as u8, velocity as u8,
+        );
+        token
     }
 
-    /// Pull `AUDIO_CHUNK_BLOCKS` blocks from the mixer, deinterleave
-    /// + convert i16 → f32 into `audio_l` / `audio_r`. JS then copies
-    /// these into an `AudioBuffer` and schedules it on an
-    /// `AudioBufferSourceNode`. Idempotent: each call advances the
-    /// mixer by `AUDIO_CHUNK_FRAMES` source frames.
-    pub fn render_audio_chunk(&mut self) {
-        let mixer = &mut self.cart.world().audio;
-        for b in 0..AUDIO_CHUNK_BLOCKS {
-            mixer.render_block(&mut self.audio_scratch);
-            let dst_off = b * BLOCK_FRAMES;
-            for i in 0..BLOCK_FRAMES {
-                let l = self.audio_scratch[i * 2] as f32 / 32768.0;
-                let r = self.audio_scratch[i * 2 + 1] as f32 / 32768.0;
-                self.audio_l[dst_off + i] = l;
-                self.audio_r[dst_off + i] = r;
-            }
-        }
+    /// Current SMF playback position in quarter-note beats, or 0 if no
+    /// song is active. E2E hook for confirming `music_play` ran.
+    /// Reads the cached mirror updated from worklet state posts.
+    pub fn audio_music_position_beats(&mut self) -> f32 {
+        self.cart.world().audio_music_beats_cached
+    }
+
+    /// `true` if a song is currently playing. Heuristic — derived
+    /// from the cached `music_position_beats` (any non-zero value
+    /// means the worklet's playhead is alive). Good enough for E2E
+    /// tests; not authoritative if the song happens to be at tick 0.
+    pub fn audio_music_is_playing(&mut self) -> u32 {
+        if self.cart.world().audio_music_beats_cached > 0.0 { 1 } else { 0 }
+    }
+
+    /// Debug-only: directly enqueue a `music_play` event so the
+    /// worklet starts playback on its next `process()` call. Lets
+    /// E2E tests verify Stage-4a playback without depending on the
+    /// (chronically flaky in headless Playwright) keyboard path.
+    pub fn audio_debug_music_play(&mut self, slot: u32, loop_: u32) {
+        self.cart.world().audio_events.push_music_play(slot as u8, loop_ != 0);
+    }
+
+    /// Pointer to the audio event log written by sandbox.rs's audio
+    /// imports. JS reads `audio_events_len()` bytes starting here
+    /// and relays each event to the AudioWorkletProcessor via
+    /// `port.postMessage`. The view is invalidated when wasm memory
+    /// grows; always re-create the Uint8Array view after a drain.
+    pub fn audio_events_ptr(&mut self) -> *const u8 {
+        self.cart.world().audio_events.buf.as_ptr()
+    }
+
+    /// Byte count in the audio event log. Cleared by
+    /// `audio_events_clear()` after JS has drained it.
+    pub fn audio_events_len(&mut self) -> u32 {
+        self.cart.world().audio_events.buf.len() as u32
+    }
+
+    /// Reset the audio event log. Call after JS has read its bytes
+    /// out to the worklet.
+    pub fn audio_events_clear(&mut self) {
+        self.cart.world().audio_events.clear();
+    }
+
+    /// Update the cached `music_position_beats()` value from the
+    /// worklet's authoritative mixer state. JS calls this each time
+    /// the worklet posts a state-mirror message.
+    pub fn set_audio_music_beats_cached(&mut self, beats: f32) {
+        self.cart.world().audio_music_beats_cached = beats;
+    }
+
+    pub fn set_audio_voices_active_cached(&mut self, voices: u32) {
+        self.cart.world().audio_voices_active_cached = voices;
     }
 
     pub fn frame(&mut self, dt_ms: f32) -> *const u8 {

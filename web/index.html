@@ -13,6 +13,47 @@
         </div>
         <div id="status">loading…</div>
     </main>
-    <script type="module" src="main.js?v=audio15"></script>
+    <!-- Register the COOP/COEP service worker BEFORE main.js so the
+         Stage-4b AudioWorklet path has SharedArrayBuffer available.
+         On a fresh load the SW is freshly installed and the page
+         isn't yet cross-origin-isolated; we reload once so the SW
+         can intercept every request and add the headers. -->
+    <script>
+        (async () => {
+            if (!window.isSecureContext) {
+                // localhost is treated as secure; this branch only
+                // fires if you somehow load over plain http://1.2.3.4/.
+                console.warn("page is not a secure context — SAB unavailable");
+            }
+            if (!("serviceWorker" in navigator)) {
+                console.warn("service workers unavailable; SAB will not work");
+            } else {
+                try {
+                    const reg = await navigator.serviceWorker.register("sw.js?v=coi1");
+                    if (reg.active && !window.crossOriginIsolated) {
+                        // SW is active but this page loaded before
+                        // it was, so headers aren't applied yet.
+                        // One reload fixes it.
+                        location.reload();
+                        return;
+                    }
+                    // Wait for the SW to take control on first install.
+                    if (!reg.active && !window.crossOriginIsolated) {
+                        await navigator.serviceWorker.ready;
+                        location.reload();
+                        return;
+                    }
+                } catch (e) {
+                    console.warn("SW registration failed:", e);
+                }
+            }
+            // Once cross-origin-isolated (or after we've fallen back
+            // gracefully), load the main app.
+            const s = document.createElement("script");
+            s.type = "module";
+            s.src = "main.js?v=worklet5";
+            document.body.appendChild(s);
+        })();
+    </script>
 </body>
 </html>

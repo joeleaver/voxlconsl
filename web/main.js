@@ -51,65 +51,372 @@ async function start() {
     const h = host.height();
     const imageData = ctx.createImageData(w, h);
 
-    // ── Audio (§5) ─────────────────────────────────────────────────────
+    // ── Audio (§5) — Stage 4b Phase 2c+: mixer-in-worklet ─────────────
     //
-    // The mixer runs on the main thread alongside the cart; this shim
-    // pulls a chunk of f32 samples and schedules it on an
-    // AudioBufferSourceNode. We keep ~AUDIO_LEAD_CHUNKS scheduled
-    // ahead of currentTime so a stuttering rAF doesn't underrun.
+    // The authoritative §5 mixer runs inside the AudioWorkletProcessor
+    // (web/audio-worklet.js) backed by `voxlconsl-audio-worklet.wasm`.
+    // This main-thread shim does three things per cart frame:
+    //   1. Drain the cart→audio event log written by sandbox.rs.
+    //   2. postMessage each event over to the worklet.
+    //   3. Cache state mirrors (music_position_beats / voice_count)
+    //      that the worklet posts back periodically.
     //
-    // AudioContext must be created from a user gesture (browser
-    // autoplay policy); we lazily build it inside the canvas-click
-    // handler that also engages pointer lock.
-    const AUDIO_LEAD_CHUNKS = 8;
+    // The previous SAB output ring is gone — the worklet outputs
+    // directly into the AudioContext, so total latency drops from
+    // ~50 ms (Phase 1 jitter buffer) to one worklet block (~5–10 ms).
     const audioSampleRate = host.audio_sample_rate();
-    const audioChunkFrames = host.audio_chunk_frames();
-    const audioChunkSeconds = audioChunkFrames / audioSampleRate;
     let audioCtx = null;
-    let audioNextStart = 0;
+    let workletNode = null;
 
-    function pumpAudio() {
-        if (!audioCtx) return;
-        const horizon = audioCtx.currentTime + AUDIO_LEAD_CHUNKS * audioChunkSeconds;
-        // Catch up if rAF stalled — drop missed chunks (silence in the gap).
-        if (audioNextStart < audioCtx.currentTime) {
-            audioNextStart = audioCtx.currentTime;
-        }
-        while (audioNextStart < horizon) {
-            host.render_audio_chunk();
-            // Re-read pointers each chunk: wasm memory can grow and
-            // detach earlier views without warning.
-            const lPtr = host.audio_l_ptr();
-            const rPtr = host.audio_r_ptr();
-            const lView = new Float32Array(wasm.memory.buffer, lPtr, audioChunkFrames);
-            const rView = new Float32Array(wasm.memory.buffer, rPtr, audioChunkFrames);
+    // Event-tag table — mirrors `crates/host/src/audio_events.rs` and
+    // the `EVT.*` consts in web/audio-worklet.js. Keep all three in
+    // lockstep when adding new tags.
+    const EVT_NOTE_ON              = 0;
+    const EVT_NOTE_OFF             = 1;
+    const EVT_ALL_NOTES_OFF        = 2;
+    const EVT_PITCH_BEND           = 3;
+    const EVT_CC                   = 4;
+    const EVT_PROGRAM_CHANGE       = 5;
+    const EVT_PATCH_SET_OSC        = 6;
+    const EVT_PATCH_SET_FILTER     = 7;
+    const EVT_PATCH_SET_AMP_ENV    = 8;
+    const EVT_PATCH_SET_FILTER_ENV = 9;
+    const EVT_PATCH_SET_LFO        = 10;
+    const EVT_PATCH_SET_GLIDE      = 11;
+    const EVT_PATCH_SET_FM         = 12;
+    const EVT_PATCH_SET_KIND       = 13;
+    const EVT_PATCH_SET_ZONE       = 14;
+    const EVT_PATCH_SET_ZONE_COUNT = 15;
+    const EVT_PATCH_RESET          = 16;
+    const EVT_PATCH_COPY           = 17;
+    const EVT_MUSIC_PLAY           = 18;
+    const EVT_MUSIC_STOP           = 19;
+    const EVT_MUSIC_SET_TEMPO_SC   = 20;
+    const EVT_REVERB_SET           = 21;
+    const EVT_DELAY_SET            = 22;
+    const EVT_SAMPLE_LOAD          = 23;
+    const EVT_MUSIC_LOAD           = 24;
+    const EVT_SFX_PLAY             = 25;
+    const EVT_SFX_STOP             = 26;
+    const EVT_SFX_SET_VOLUME       = 27;
+    const EVT_SFX_SET_PITCH        = 28;
+    const EVT_VOICE_TRIGGER        = 29;
+    const EVT_VOICE_RELEASE        = 30;
 
-            const buf = audioCtx.createBuffer(2, audioChunkFrames, audioSampleRate);
-            // `set` copies, so it's safe to reuse the wasm-backed views
-            // immediately on the next iteration.
-            buf.getChannelData(0).set(lView);
-            buf.getChannelData(1).set(rView);
+    function drainAudioEventsAndPost() {
+        if (!workletNode) return;
+        const len = host.audio_events_len();
+        if (len === 0) return;
+        const ptr = host.audio_events_ptr();
+        // Snapshot the bytes — we'll iterate over them and the wasm
+        // memory may grow on the next allocation.
+        const view = new Uint8Array(wasm.memory.buffer, ptr, len);
+        const bytes = view.slice();
+        host.audio_events_clear();
 
-            const src = audioCtx.createBufferSource();
-            src.buffer = buf;
-            src.connect(audioCtx.destination);
-            src.start(audioNextStart);
-            audioNextStart += audioChunkSeconds;
+        const dv = new DataView(bytes.buffer);
+        let p = 0;
+        while (p < bytes.length) {
+            const tag = bytes[p]; p++;
+            switch (tag) {
+                case EVT_NOTE_ON: {
+                    const token = dv.getUint32(p, true); p += 4;
+                    const channel = bytes[p++];
+                    const note = bytes[p++];
+                    const velocity = bytes[p++];
+                    workletNode.port.postMessage({
+                        type: "event", tag, token,
+                        channel, note, velocity,
+                    });
+                    break;
+                }
+                case EVT_NOTE_OFF: {
+                    const channel = bytes[p++];
+                    const note = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, channel, note });
+                    break;
+                }
+                case EVT_ALL_NOTES_OFF: {
+                    const channel = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, channel });
+                    break;
+                }
+                case EVT_PITCH_BEND: {
+                    const channel = bytes[p++];
+                    const value = dv.getInt16(p, true); p += 2;
+                    workletNode.port.postMessage({ type: "event", tag, channel, value });
+                    break;
+                }
+                case EVT_CC: {
+                    const channel = bytes[p++];
+                    const controller = bytes[p++];
+                    const value = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, channel, controller, value });
+                    break;
+                }
+                case EVT_PROGRAM_CHANGE: {
+                    const channel = bytes[p++];
+                    const patch = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, channel, patch });
+                    break;
+                }
+                case EVT_PATCH_SET_OSC: {
+                    const slot = bytes[p++];
+                    const osc_idx = bytes[p++];
+                    const mode = bytes[p++];
+                    const detune_cents = dv.getInt16(p, true); p += 2;
+                    const octave = dv.getInt8(p); p += 1;
+                    const level = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, slot, osc_idx, mode, detune_cents, octave, level });
+                    break;
+                }
+                case EVT_PATCH_SET_FILTER: {
+                    const slot = bytes[p++];
+                    const mode = bytes[p++];
+                    const cutoff_hz = dv.getUint16(p, true); p += 2;
+                    const resonance = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, slot, mode, cutoff_hz, resonance });
+                    break;
+                }
+                case EVT_PATCH_SET_AMP_ENV: {
+                    const slot = bytes[p++];
+                    const attack_ms = dv.getUint16(p, true); p += 2;
+                    const decay_ms = dv.getUint16(p, true); p += 2;
+                    const sustain = bytes[p++];
+                    const release_ms = dv.getUint16(p, true); p += 2;
+                    workletNode.port.postMessage({ type: "event", tag, slot, attack_ms, decay_ms, sustain, release_ms });
+                    break;
+                }
+                case EVT_PATCH_SET_FILTER_ENV: {
+                    const slot = bytes[p++];
+                    const attack_ms = dv.getUint16(p, true); p += 2;
+                    const decay_ms = dv.getUint16(p, true); p += 2;
+                    const sustain = bytes[p++];
+                    const release_ms = dv.getUint16(p, true); p += 2;
+                    const depth = dv.getInt8(p); p += 1;
+                    workletNode.port.postMessage({ type: "event", tag, slot, attack_ms, decay_ms, sustain, release_ms, depth });
+                    break;
+                }
+                case EVT_PATCH_SET_LFO: {
+                    const slot = bytes[p++];
+                    const rate_centihz = dv.getUint16(p, true); p += 2;
+                    const shape = bytes[p++];
+                    const target = bytes[p++];
+                    const depth = dv.getInt8(p); p += 1;
+                    workletNode.port.postMessage({ type: "event", tag, slot, rate_centihz, shape, target, depth });
+                    break;
+                }
+                case EVT_PATCH_SET_GLIDE: {
+                    const slot = bytes[p++];
+                    const ms = dv.getUint16(p, true); p += 2;
+                    workletNode.port.postMessage({ type: "event", tag, slot, ms });
+                    break;
+                }
+                case EVT_PATCH_SET_FM: {
+                    const slot = bytes[p++];
+                    const ratio_q88 = dv.getUint16(p, true); p += 2;
+                    const index_q88 = dv.getUint16(p, true); p += 2;
+                    workletNode.port.postMessage({ type: "event", tag, slot, ratio_q88, index_q88 });
+                    break;
+                }
+                case EVT_PATCH_SET_KIND: {
+                    const slot = bytes[p++];
+                    const kind = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, slot, kind });
+                    break;
+                }
+                case EVT_PATCH_SET_ZONE: {
+                    const slot = bytes[p++];
+                    const zone_idx = bytes[p++];
+                    const low_note = bytes[p++];
+                    const high_note = bytes[p++];
+                    const root_note = bytes[p++];
+                    const sample_slot = bytes[p++];
+                    const volume_offset = dv.getInt8(p); p += 1;
+                    const loop_start = dv.getUint32(p, true); p += 4;
+                    const loop_end = dv.getUint32(p, true); p += 4;
+                    const loop_enabled = bytes[p++];
+                    workletNode.port.postMessage({
+                        type: "event", tag,
+                        slot, zone_idx,
+                        low_note, high_note, root_note,
+                        sample_slot, volume_offset,
+                        loop_start, loop_end, loop_enabled,
+                    });
+                    break;
+                }
+                case EVT_PATCH_SET_ZONE_COUNT: {
+                    const slot = bytes[p++];
+                    const count = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, slot, count });
+                    break;
+                }
+                case EVT_PATCH_RESET: {
+                    const slot = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, slot });
+                    break;
+                }
+                case EVT_PATCH_COPY: {
+                    const src = bytes[p++];
+                    const dst = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, src, dst });
+                    break;
+                }
+                case EVT_MUSIC_PLAY: {
+                    const slot = bytes[p++];
+                    const loop = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, slot, loop });
+                    break;
+                }
+                case EVT_MUSIC_STOP: {
+                    workletNode.port.postMessage({ type: "event", tag });
+                    break;
+                }
+                case EVT_MUSIC_SET_TEMPO_SC: {
+                    const scale = dv.getFloat32(p, true); p += 4;
+                    workletNode.port.postMessage({ type: "event", tag, scale });
+                    break;
+                }
+                case EVT_REVERB_SET: {
+                    const room_size = bytes[p++];
+                    const damping = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, room_size, damping });
+                    break;
+                }
+                case EVT_DELAY_SET: {
+                    const time_ms = dv.getUint16(p, true); p += 2;
+                    const feedback = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, time_ms, feedback });
+                    break;
+                }
+                case EVT_SAMPLE_LOAD: {
+                    const slot = bytes[p++];
+                    const rate_code = bytes[p++];
+                    const flags = bytes[p++];
+                    const loop_start = dv.getUint32(p, true); p += 4;
+                    const loop_end = dv.getUint32(p, true); p += 4;
+                    const blob_len = dv.getUint32(p, true); p += 4;
+                    const payload = bytes.slice(p, p + blob_len);
+                    p += blob_len;
+                    workletNode.port.postMessage({
+                        type: "event", tag,
+                        slot, rate_code, flags,
+                        loop_start, loop_end,
+                        bytes: payload,
+                    }, [payload.buffer]);
+                    break;
+                }
+                case EVT_MUSIC_LOAD: {
+                    const slot = bytes[p++];
+                    const blob_len = dv.getUint32(p, true); p += 4;
+                    const payload = bytes.slice(p, p + blob_len);
+                    p += blob_len;
+                    workletNode.port.postMessage({
+                        type: "event", tag, slot, bytes: payload,
+                    }, [payload.buffer]);
+                    break;
+                }
+                case EVT_SFX_PLAY: {
+                    const token = dv.getUint32(p, true); p += 4;
+                    const slot = bytes[p++];
+                    const volume = bytes[p++];
+                    const pan = dv.getInt8(p); p += 1;
+                    const pitch_cents = dv.getInt16(p, true); p += 2;
+                    const loop = bytes[p++];
+                    workletNode.port.postMessage({
+                        type: "event", tag, token,
+                        slot, volume, pan, pitch_cents, loop,
+                    });
+                    break;
+                }
+                case EVT_SFX_STOP: {
+                    const voice = dv.getUint32(p, true); p += 4;
+                    workletNode.port.postMessage({ type: "event", tag, voice });
+                    break;
+                }
+                case EVT_SFX_SET_VOLUME: {
+                    const voice = dv.getUint32(p, true); p += 4;
+                    const volume = bytes[p++];
+                    workletNode.port.postMessage({ type: "event", tag, voice, volume });
+                    break;
+                }
+                case EVT_SFX_SET_PITCH: {
+                    const voice = dv.getUint32(p, true); p += 4;
+                    const pitch_cents = dv.getInt16(p, true); p += 2;
+                    workletNode.port.postMessage({ type: "event", tag, voice, pitch_cents });
+                    break;
+                }
+                case EVT_VOICE_TRIGGER: {
+                    const token = dv.getUint32(p, true); p += 4;
+                    const patch = bytes[p++];
+                    const note = bytes[p++];
+                    const velocity = bytes[p++];
+                    workletNode.port.postMessage({
+                        type: "event", tag, token,
+                        patch, note, velocity,
+                    });
+                    break;
+                }
+                case EVT_VOICE_RELEASE: {
+                    const voice = dv.getUint32(p, true); p += 4;
+                    workletNode.port.postMessage({ type: "event", tag, voice });
+                    break;
+                }
+                default: {
+                    console.warn("unknown audio event tag", tag, "at offset", p - 1);
+                    return;
+                }
+            }
         }
     }
 
-    function ensureAudioStarted() {
+    async function ensureAudioStarted() {
         if (audioCtx) return;
         const Ctx = window.AudioContext || window.webkitAudioContext;
         if (!Ctx) {
             console.warn("Web Audio not available — running silently");
             return;
         }
-        audioCtx = new Ctx({ latencyHint: "interactive" });
-        audioNextStart = audioCtx.currentTime;
-        // resume() is a no-op on a fresh context but covers the case
-        // where the browser created it in "suspended" state.
-        audioCtx.resume().catch((err) => console.warn("audio resume failed:", err));
+        // Force the AudioContext to run at the mixer's native rate so
+        // the worklet's `process()` block lines up 1:1 with the
+        // worklet wasm's render() output. No resampling in either side.
+        audioCtx = new Ctx({ latencyHint: "interactive", sampleRate: audioSampleRate });
+        try {
+            await audioCtx.audioWorklet.addModule("audio-worklet.js?v=worklet5");
+        } catch (err) {
+            console.error("worklet load failed:", err);
+            audioCtx = null;
+            return;
+        }
+        // Fetch the worklet wasm bytes ourselves and hand them in via
+        // processorOptions. Inside an AudioWorkletGlobalScope `fetch`
+        // is not universally available; passing the bytes is portable.
+        let workletWasmBytes;
+        try {
+            const r = await fetch("audio-worklet.wasm?v=worklet5");
+            workletWasmBytes = await r.arrayBuffer();
+        } catch (err) {
+            console.error("worklet wasm fetch failed:", err);
+            return;
+        }
+        workletNode = new AudioWorkletNode(audioCtx, "voxl-mixer", {
+            outputChannelCount: [2],
+            processorOptions: { wasmBytes: workletWasmBytes },
+        });
+        workletNode.port.onmessage = (e) => {
+            const m = e.data;
+            if (!m) return;
+            if (m.type === "state") {
+                host.set_audio_music_beats_cached(m.music_beats);
+                host.set_audio_voices_active_cached(m.active_voices);
+            } else if (m.type === "ready") {
+                console.log("[audio-worklet] mixer wasm ready");
+            } else if (m.type === "error") {
+                console.error("[audio-worklet] error:", m.error);
+            }
+        };
+        workletNode.connect(audioCtx.destination);
+        await audioCtx.resume().catch((err) => console.warn("audio resume failed:", err));
     }
 
     // ── Pointer-lock state ──────────────────────────────────────────────
@@ -181,6 +488,10 @@ async function start() {
     // safe to leave in place even in release builds.
     window.__host = host;
     window.__wasm = wasm;
+    // Stage-4b Phase 2c+: the SAB output ring is gone — the mixer
+    // lives in the worklet wasm and feeds the AudioContext directly.
+    // Expose the worklet node so E2E tests can poke its port if needed.
+    window.__audio = { get workletNode() { return workletNode; } };
 
     let lastTime = performance.now();
 
@@ -196,7 +507,7 @@ async function start() {
         imageData.data.set(memory);
         ctx.putImageData(imageData, 0, 0);
 
-        pumpAudio();
+        drainAudioEventsAndPost();
 
         if (frameCursor === 0) {
             const avg = FRAME_TIMES.reduce((a, b) => a + b, 0) / FRAME_TIMES.length;

@@ -15,7 +15,15 @@
 
 pub mod renderer;
 pub mod palette;
-pub mod audio;
+// §5 audio engine lives in its own crate (`voxlconsl-audio`) so the
+// audio-worklet wasm can pull it in without dragging in the rest of
+// the host. Re-export it under the historical `audio` name so the
+// rest of the host code (and downstream tools) need no rename.
+pub use voxlconsl_audio as audio;
+
+/// Cart→audio event log written from sandbox.rs imports and drained
+/// by the browser-host shim after every cart frame (SPEC.md §5.8).
+pub mod audio_events;
 pub mod input;
 pub mod physics;
 pub mod bodies;

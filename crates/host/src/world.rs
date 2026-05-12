@@ -115,7 +115,29 @@ pub struct WorldState {
     pub macro_grid: MacroGrid,
     pub ca: CaState,
     pub bodies: BodyTable,
+    /// Main-thread "shadow" AudioState. After Stage 4b Phase 2c+ the
+    /// authoritative mixer lives in the worklet wasm; this copy is
+    /// only kept up-to-date with patch parameters (so `patch_save`
+    /// can read them synchronously) and isn't connected to any audio
+    /// output. Its `render_block` is no longer called.
     pub audio: AudioState,
+    /// Cart→audio event log (SPEC.md §5.8). Each audio host import
+    /// writes its args here; the browser-host shim drains it after
+    /// each frame and relays the bytes to the AudioWorkletProcessor.
+    pub audio_events: crate::audio_events::AudioEventLog,
+    /// Music playhead in quarter-note beats, mirrored from the worklet
+    /// thread. Worklet posts this back periodically via port.postMessage;
+    /// main JS calls `set_audio_music_beats_cached(beats)` to update it.
+    pub audio_music_beats_cached: f32,
+    /// Active voice count, mirrored from the worklet.
+    pub audio_voices_active_cached: u32,
+    /// Monotonic counter for cart-visible VoiceId tokens. Main hands
+    /// out tokens for `sfx_play` / `voice_trigger` / `note_on`; the
+    /// worklet keeps a JS-side `Map<token, real_voice_id>` so later
+    /// `sfx_stop(token)` / `voice_release(token)` calls resolve to the
+    /// worklet's actual VoiceId. Starts at 1 so 0 stays the canonical
+    /// "no voice" sentinel.
+    pub next_voice_token: u32,
 }
 
 impl WorldState {
@@ -140,8 +162,26 @@ impl WorldState {
             macro_grid: MacroGrid::new(),
             ca: CaState::new(),
             bodies: BodyTable::new(),
-            audio: AudioState::new(),
+            // Stage-4b: the authoritative mixer lives in the worklet,
+            // so this main-thread shadow doesn't need the boot drum
+            // kit (~150 ms of synthesis). `new_silent` keeps just the
+            // patch table — that's all we read synchronously for
+            // `patch_save`.
+            audio: AudioState::new_silent(),
+            audio_events: crate::audio_events::AudioEventLog::new(),
+            audio_music_beats_cached: 0.0,
+            audio_voices_active_cached: 0,
+            next_voice_token: 1,
         }
+    }
+
+    /// Hand out a fresh opaque VoiceId token. The worklet's JS shim
+    /// maps it to a real VoiceId on first event arrival.
+    pub fn alloc_voice_token(&mut self) -> u32 {
+        let t = self.next_voice_token;
+        // Wrap past 0 — that's `VoiceId::NONE`, reserved.
+        self.next_voice_token = self.next_voice_token.wrapping_add(1).max(1);
+        t
     }
 
     /// Read the material at a world coord directly from the active

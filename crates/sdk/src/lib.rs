@@ -165,6 +165,17 @@ mod host {
         );
         pub fn patch_set_lfo(slot: u32, rate_centihz: u32, shape: u32, target: u32, depth: i32);
         pub fn patch_set_glide(slot: u32, ms: u32);
+        pub fn patch_set_fm(slot: u32, ratio_q88: u32, index_q88: u32);
+        pub fn patch_set_kind(slot: u32, kind_code: u32);
+        pub fn patch_set_zone_count(slot: u32, count: u32);
+        pub fn patch_set_zone(
+            slot: u32, zone_idx: u32,
+            low_note: u32, high_note: u32, root_note: u32,
+            sample_slot: u32, volume_offset: i32,
+            loop_start: u32, loop_end: u32, loop_enabled: u32,
+        );
+        pub fn patch_save(slot: u32, ptr: *mut u8, max_len: u32) -> u32;
+        pub fn patch_load(slot: u32, ptr: *const u8, len: u32) -> u32;
         pub fn patch_reset(slot: u32);
         pub fn patch_copy(src: u32, dst: u32);
         pub fn voice_trigger(patch: u32, note: u32, velocity: u32) -> u32;
@@ -177,6 +188,17 @@ mod host {
         pub fn cc(channel: u32, controller: u32, value: u32);
         pub fn program_change(channel: u32, patch: u32);
         pub fn all_notes_off(channel: u32);
+
+        // Audio (§5) — Stage 4a: SMF song playback.
+        pub fn music_load(slot: u32, ptr: *const u8, len: u32) -> u32;
+        pub fn music_play(slot: u32, loop_: u32);
+        pub fn music_stop();
+        pub fn music_set_tempo_scale(scale: f32);
+        pub fn music_position_beats() -> f32;
+
+        // Audio (§5) — Stage 5: global FX bus (reverb + delay).
+        pub fn reverb_set(room_size: u32, damping: u32);
+        pub fn delay_set(time_ms: u32, feedback: u32);
     }
 }
 

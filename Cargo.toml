@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "crates/types",
     "crates/svo",
+    "crates/audio",
     "crates/host",
     "crates/host-browser",
+    "crates/audio-worklet",
     "crates/sdk",
     "crates/bundler",
     "crates/cli",
@@ -12,12 +14,13 @@ members = [
     "examples/big-world",
 ]
 
-# host-browser and example carts are wasm32-only cdylibs. Keep them out of the
-# default `cargo build` so plain `cargo check`/`cargo build` from the workspace
-# root still work for the native crates.
+# host-browser, audio-worklet and example carts are wasm32-only cdylibs.
+# Keep them out of the default `cargo build` so plain `cargo check`/`cargo
+# build` from the workspace root still work for the native crates.
 default-members = [
     "crates/types",
     "crates/svo",
+    "crates/audio",
     "crates/host",
     "crates/sdk",
     "crates/bundler",
@@ -35,6 +38,7 @@ rust-version = "1.85"
 # Internal crates — referenced from siblings via path
 voxlconsl-types = { path = "crates/types", version = "0.0.1" }
 voxlconsl-svo = { path = "crates/svo", version = "0.0.1" }
+voxlconsl-audio = { path = "crates/audio", version = "0.0.1" }
 voxlconsl-host = { path = "crates/host", version = "0.0.1" }
 voxlconsl-sdk = { path = "crates/sdk", version = "0.0.1" }
 voxlconsl-bundler = { path = "crates/bundler", version = "0.0.1" }

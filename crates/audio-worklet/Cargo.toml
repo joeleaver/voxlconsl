@@ -1,0 +1,19 @@
+[package]
+name = "voxlconsl-audio-worklet"
+description = "Raw wasm module loaded by the AudioWorkletProcessor — runs the §5 mixer on the audio thread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+voxlconsl-audio = { workspace = true }
+
+# Per-crate `[profile.release]` is ignored from a workspace member;
+# bundle-size knobs (lto, panic=abort) come from the workspace root
+# Cargo.toml's profile section instead. The worklet wasm is fetched
+# and compiled on the audio thread, so smaller = faster startup.

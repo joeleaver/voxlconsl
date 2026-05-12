@@ -825,8 +825,13 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
 
-    // Audio (§5) — Stage 1: sample bank + one-shot SFX. Synth, MIDI,
-    // SMF, FX, runtime patch editing land in Stages 2-6.
+    // Audio (§5). Every cart-facing audio import does two things:
+    //   1. Update the main-thread "shadow" `AudioState` so synchronous
+    //      reads (patch_save, etc.) stay current.
+    //   2. Append the event to `audio_events`. The browser-host shim
+    //      drains that log after each cart frame and relays the bytes
+    //      to the AudioWorkletProcessor, where the authoritative
+    //      mixer runs (SPEC.md §5.8, Stage 4b Phase 2c+).
     linker.func_wrap(
         "env", "sample_load",
         |mut caller: Caller<WorldState>,
@@ -841,11 +846,12 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
             if memory.read(&caller, ptr as usize, &mut buf).is_err() {
                 return 0;
             }
-            let rate = crate::audio::SampleRate::from_code(rate_code as u8);
-            let loop_points = if flags & 0x1 != 0 { Some((loop_start, loop_end)) } else { None };
-            caller.data_mut().audio.register_sample(
-                slot as u8,
-                crate::audio::Sample { data: buf, rate, loop_points },
+            // No shadow update: only the worklet's mixer reads sample
+            // bytes (cart-side `sample_register` always returns ok
+            // before this; the worklet may reject the slot later).
+            caller.data_mut().audio_events.push_sample_load(
+                slot as u8, rate_code as u8, flags as u8,
+                loop_start, loop_end, &buf,
             );
             1
         },
@@ -854,37 +860,30 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "sfx_play",
         |mut caller: Caller<WorldState>,
          slot: u32, volume: u32, pan: i32, pitch_cents: i32, loop_: u32| -> u32 {
-            caller.data_mut().audio.sfx_play(
-                slot as u8,
-                volume as u8,
-                pan as i8,
-                pitch_cents as i16,
-                loop_ != 0,
-            ).0
+            let world = caller.data_mut();
+            let token = world.alloc_voice_token();
+            world.audio_events.push_sfx_play(
+                token, slot as u8, volume as u8, pan as i8, pitch_cents as i16, loop_ != 0,
+            );
+            token
         },
     )?;
     linker.func_wrap(
         "env", "sfx_stop",
         |mut caller: Caller<WorldState>, voice: u32| {
-            caller.data_mut().audio.sfx_stop(crate::audio::VoiceId(voice));
+            caller.data_mut().audio_events.push_sfx_stop(voice);
         },
     )?;
     linker.func_wrap(
         "env", "sfx_set_volume",
         |mut caller: Caller<WorldState>, voice: u32, volume: u32| {
-            caller.data_mut().audio.sfx_set_volume(
-                crate::audio::VoiceId(voice),
-                volume as u8,
-            );
+            caller.data_mut().audio_events.push_sfx_set_volume(voice, volume as u8);
         },
     )?;
     linker.func_wrap(
         "env", "sfx_set_pitch",
         |mut caller: Caller<WorldState>, voice: u32, pitch_cents: i32| {
-            caller.data_mut().audio.sfx_set_pitch(
-                crate::audio::VoiceId(voice),
-                pitch_cents as i16,
-            );
+            caller.data_mut().audio_events.push_sfx_set_pitch(voice, pitch_cents as i16);
         },
     )?;
 
@@ -894,13 +893,15 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         |mut caller: Caller<WorldState>,
          slot: u32, osc_idx: u32,
          mode: u32, detune_cents: i32, octave: i32, level: u32| {
-            caller.data_mut().audio.patch_set_osc(
-                slot as u8,
-                osc_idx as u8,
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_osc(
+                slot as u8, osc_idx as u8, mode as u8,
+                detune_cents as i16, octave as i8, level as u8,
+            );
+            world.audio.patch_set_osc(
+                slot as u8, osc_idx as u8,
                 crate::audio::OscMode::from_code(mode as u8),
-                detune_cents as i16,
-                octave as i8,
-                level as u8,
+                detune_cents as i16, octave as i8, level as u8,
             );
         },
     )?;
@@ -908,11 +909,14 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "patch_set_filter",
         |mut caller: Caller<WorldState>,
          slot: u32, mode: u32, cutoff_hz: u32, resonance: u32| {
-            caller.data_mut().audio.patch_set_filter(
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_filter(
+                slot as u8, mode as u8, cutoff_hz as u16, resonance as u8,
+            );
+            world.audio.patch_set_filter(
                 slot as u8,
                 crate::audio::FilterMode::from_code(mode as u8),
-                cutoff_hz as u16,
-                resonance as u8,
+                cutoff_hz as u16, resonance as u8,
             );
         },
     )?;
@@ -920,12 +924,12 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "patch_set_amp_env",
         |mut caller: Caller<WorldState>,
          slot: u32, attack_ms: u32, decay_ms: u32, sustain: u32, release_ms: u32| {
-            caller.data_mut().audio.patch_set_amp_env(
-                slot as u8,
-                attack_ms as u16,
-                decay_ms as u16,
-                sustain as u8,
-                release_ms as u16,
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_amp_env(
+                slot as u8, attack_ms as u16, decay_ms as u16, sustain as u8, release_ms as u16,
+            );
+            world.audio.patch_set_amp_env(
+                slot as u8, attack_ms as u16, decay_ms as u16, sustain as u8, release_ms as u16,
             );
         },
     )?;
@@ -933,13 +937,14 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "patch_set_filter_env",
         |mut caller: Caller<WorldState>,
          slot: u32, attack_ms: u32, decay_ms: u32, sustain: u32, release_ms: u32, depth: i32| {
-            caller.data_mut().audio.patch_set_filter_env(
-                slot as u8,
-                attack_ms as u16,
-                decay_ms as u16,
-                sustain as u8,
-                release_ms as u16,
-                depth as i8,
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_filter_env(
+                slot as u8, attack_ms as u16, decay_ms as u16,
+                sustain as u8, release_ms as u16, depth as i8,
+            );
+            world.audio.patch_set_filter_env(
+                slot as u8, attack_ms as u16, decay_ms as u16,
+                sustain as u8, release_ms as u16, depth as i8,
             );
         },
     )?;
@@ -947,9 +952,12 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "patch_set_lfo",
         |mut caller: Caller<WorldState>,
          slot: u32, rate_centihz: u32, shape: u32, target: u32, depth: i32| {
-            caller.data_mut().audio.patch_set_lfo(
-                slot as u8,
-                rate_centihz as u16,
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_lfo(
+                slot as u8, rate_centihz as u16, shape as u8, target as u8, depth as i8,
+            );
+            world.audio.patch_set_lfo(
+                slot as u8, rate_centihz as u16,
                 crate::audio::LfoShape::from_code(shape as u8),
                 crate::audio::LfoTarget::from_code(target as u8),
                 depth as i8,
@@ -959,35 +967,131 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
     linker.func_wrap(
         "env", "patch_set_glide",
         |mut caller: Caller<WorldState>, slot: u32, ms: u32| {
-            caller.data_mut().audio.patch_set_glide(slot as u8, ms as u16);
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_glide(slot as u8, ms as u16);
+            world.audio.patch_set_glide(slot as u8, ms as u16);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_fm",
+        |mut caller: Caller<WorldState>, slot: u32, ratio_q88: u32, index_q88: u32| {
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_fm(slot as u8, ratio_q88 as u16, index_q88 as u16);
+            world.audio.patch_set_fm(slot as u8, ratio_q88 as u16, index_q88 as u16);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_kind",
+        |mut caller: Caller<WorldState>, slot: u32, kind_code: u32| {
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_kind(slot as u8, kind_code as u8);
+            world.audio.patch_set_kind(
+                slot as u8,
+                crate::audio::PatchKind::from_code(kind_code as u8),
+            );
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_zone_count",
+        |mut caller: Caller<WorldState>, slot: u32, count: u32| {
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_zone_count(slot as u8, count as u8);
+            world.audio.patch_set_zone_count(slot as u8, count as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_save",
+        |mut caller: Caller<WorldState>, slot: u32, ptr: u32, max_len: u32| -> u32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            let mut buf = vec![0u8; max_len as usize];
+            let n = caller.data().audio.patch_save(slot as u8, &mut buf);
+            if n == 0 || n as usize > buf.len() {
+                return 0;
+            }
+            if memory.write(&mut caller, ptr as usize, &buf[..n as usize]).is_err() {
+                return 0;
+            }
+            n
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_load",
+        |mut caller: Caller<WorldState>, slot: u32, ptr: u32, len: u32| -> u32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            let mut buf = vec![0u8; len as usize];
+            if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+                return 0;
+            }
+            if caller.data_mut().audio.patch_load(slot as u8, &buf) {
+                1
+            } else {
+                0
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "patch_set_zone",
+        |mut caller: Caller<WorldState>,
+         slot: u32, zone_idx: u32,
+         low_note: u32, high_note: u32, root_note: u32,
+         sample_slot: u32, volume_offset: i32,
+         loop_start: u32, loop_end: u32, loop_enabled: u32| {
+            let world = caller.data_mut();
+            world.audio_events.push_patch_set_zone(
+                slot as u8, zone_idx as u8,
+                low_note as u8, high_note as u8, root_note as u8,
+                sample_slot as u8, volume_offset as i8,
+                loop_start, loop_end, loop_enabled != 0,
+            );
+            world.audio.patch_set_zone(
+                slot as u8, zone_idx as u8,
+                crate::audio::KeyZone {
+                    low_note: low_note as u8,
+                    high_note: high_note as u8,
+                    root_note: root_note as u8,
+                    sample_slot: sample_slot as u8,
+                    volume_offset: volume_offset as i8,
+                    loop_start, loop_end,
+                    loop_enabled: loop_enabled != 0,
+                },
+            );
         },
     )?;
     linker.func_wrap(
         "env", "patch_reset",
         |mut caller: Caller<WorldState>, slot: u32| {
-            caller.data_mut().audio.patch_reset(slot as u8);
+            let world = caller.data_mut();
+            world.audio_events.push_patch_reset(slot as u8);
+            world.audio.patch_reset(slot as u8);
         },
     )?;
     linker.func_wrap(
         "env", "patch_copy",
         |mut caller: Caller<WorldState>, src: u32, dst: u32| {
-            caller.data_mut().audio.patch_copy(src as u8, dst as u8);
+            let world = caller.data_mut();
+            world.audio_events.push_patch_copy(src as u8, dst as u8);
+            world.audio.patch_copy(src as u8, dst as u8);
         },
     )?;
     linker.func_wrap(
         "env", "voice_trigger",
         |mut caller: Caller<WorldState>, patch: u32, note: u32, velocity: u32| -> u32 {
-            caller.data_mut().audio.voice_trigger(
-                patch as u8,
-                note as u8,
-                velocity as u8,
-            ).0
+            let world = caller.data_mut();
+            let token = world.alloc_voice_token();
+            world.audio_events.push_voice_trigger(token, patch as u8, note as u8, velocity as u8);
+            token
         },
     )?;
     linker.func_wrap(
         "env", "voice_release",
         |mut caller: Caller<WorldState>, voice: u32| {
-            caller.data_mut().audio.voice_release(crate::audio::VoiceId(voice));
+            caller.data_mut().audio_events.push_voice_release(voice);
         },
     )?;
 
@@ -995,39 +1099,103 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
     linker.func_wrap(
         "env", "note_on",
         |mut caller: Caller<WorldState>, channel: u32, note: u32, velocity: u32| -> u32 {
-            caller.data_mut().audio.note_on(
-                channel as u8, note as u8, velocity as u8,
-            ).0
+            let world = caller.data_mut();
+            let token = world.alloc_voice_token();
+            world.audio_events.push_note_on(token, channel as u8, note as u8, velocity as u8);
+            token
         },
     )?;
     linker.func_wrap(
         "env", "note_off",
         |mut caller: Caller<WorldState>, channel: u32, note: u32| {
-            caller.data_mut().audio.note_off(channel as u8, note as u8);
+            caller.data_mut().audio_events.push_note_off(channel as u8, note as u8);
         },
     )?;
     linker.func_wrap(
         "env", "pitch_bend",
         |mut caller: Caller<WorldState>, channel: u32, value: i32| {
-            caller.data_mut().audio.pitch_bend(channel as u8, value as i16);
+            caller.data_mut().audio_events.push_pitch_bend(channel as u8, value as i16);
         },
     )?;
     linker.func_wrap(
         "env", "cc",
         |mut caller: Caller<WorldState>, channel: u32, controller: u32, value: u32| {
-            caller.data_mut().audio.cc(channel as u8, controller as u8, value as u8);
+            caller.data_mut().audio_events.push_cc(channel as u8, controller as u8, value as u8);
         },
     )?;
     linker.func_wrap(
         "env", "program_change",
         |mut caller: Caller<WorldState>, channel: u32, patch: u32| {
-            caller.data_mut().audio.program_change(channel as u8, patch as u8);
+            caller.data_mut().audio_events.push_program_change(channel as u8, patch as u8);
         },
     )?;
     linker.func_wrap(
         "env", "all_notes_off",
         |mut caller: Caller<WorldState>, channel: u32| {
-            caller.data_mut().audio.all_notes_off(channel as u8);
+            caller.data_mut().audio_events.push_all_notes_off(channel as u8);
+        },
+    )?;
+
+    // Stage 4a — SMF song playback (§5.3).
+    linker.func_wrap(
+        "env", "music_load",
+        |mut caller: Caller<WorldState>, slot: u32, ptr: u32, len: u32| -> u32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            let mut buf = vec![0u8; len as usize];
+            if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+                return 0;
+            }
+            // Best-effort parse-validation on main so cart's return
+            // value still reflects whether the bytes are syntactically
+            // a valid SMF (mismatched MThd, format-2, etc.). Worklet
+            // does its own parse for the playback state.
+            let ok = crate::audio::parse_smf(&buf).is_ok();
+            caller.data_mut().audio_events.push_music_load(slot as u8, &buf);
+            if ok { 1 } else { 0 }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "music_play",
+        |mut caller: Caller<WorldState>, slot: u32, loop_: u32| {
+            caller.data_mut().audio_events.push_music_play(slot as u8, loop_ != 0);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "music_stop",
+        |mut caller: Caller<WorldState>| {
+            caller.data_mut().audio_events.push_music_stop();
+        },
+    )?;
+    linker.func_wrap(
+        "env", "music_set_tempo_scale",
+        |mut caller: Caller<WorldState>, scale: f32| {
+            caller.data_mut().audio_events.push_music_set_tempo_scale(scale);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "music_position_beats",
+        |caller: Caller<WorldState>| -> f32 {
+            // Authoritative value lives on the worklet thread; main
+            // reads the cached mirror updated by JS after each
+            // worklet `state` post.
+            caller.data().audio_music_beats_cached
+        },
+    )?;
+
+    // Stage 5 — global FX bus (§5.5).
+    linker.func_wrap(
+        "env", "reverb_set",
+        |mut caller: Caller<WorldState>, room_size: u32, damping: u32| {
+            caller.data_mut().audio_events.push_reverb_set(room_size as u8, damping as u8);
+        },
+    )?;
+    linker.func_wrap(
+        "env", "delay_set",
+        |mut caller: Caller<WorldState>, time_ms: u32, feedback: u32| {
+            caller.data_mut().audio_events.push_delay_set(time_ms as u16, feedback as u8);
         },
     )?;
 

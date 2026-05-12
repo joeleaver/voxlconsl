@@ -137,6 +137,11 @@ pub enum OscMode {
     Square = 2,
     Triangle = 3,
     Noise = 4,
+    /// FM2OP (§5.1): osc A is the carrier, osc B becomes a sine
+    /// modulator at `carrier_freq × fm_ratio`. The carrier's phase
+    /// argument gets `mod_signal × fm_index × filter_env` added per
+    /// sample. Set ratio + index via [`patch_set_fm`].
+    Fm2Op = 5,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -256,6 +261,115 @@ pub fn patch_set_glide(patch: u8, ms: u16) {
     unsafe { host::patch_set_glide(patch as u32, ms as u32) }
 }
 
+/// Patch source family (§5.1). Switch a patch between subtractive
+/// synth (the default) and sampler (sample bank with key zones) via
+/// [`patch_set_kind`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PatchKind {
+    Synth = 0,
+    Sampler = 1,
+}
+
+/// One of up to 8 key zones in a sampler patch (§5.1). `low_note`
+/// and `high_note` define the inclusive note range this zone serves;
+/// `root_note` is the note at which the sample plays at its declared
+/// sample rate (other notes are resampled `(note - root_note)`
+/// semitones up/down). `loop_points` is optional sustain-loop info.
+#[derive(Copy, Clone, Debug)]
+pub struct KeyZone {
+    pub low_note: u8,
+    pub high_note: u8,
+    pub root_note: u8,
+    pub sample_slot: u8,
+    /// -64..=63. Adds/subtracts gain at trigger time.
+    pub volume_offset: i8,
+    pub loop_points: Option<(u32, u32)>,
+}
+
+/// Switch a patch's source family. The non-source fields (filter,
+/// envelopes, LFO, glide, FX sends) carry across the switch — the
+/// cart only needs to reconfigure the source itself (osc params for
+/// Synth, zones for Sampler).
+pub fn patch_set_kind(patch: u8, kind: PatchKind) {
+    unsafe { host::patch_set_kind(patch as u32, kind as u32) }
+}
+
+/// How many of the patch's 8 zone slots are checked at trigger time.
+/// Defaults to 0 — sampler patches need at least one zone configured
+/// + `patch_set_zone_count(_, 1)` before they'll trigger anything.
+pub fn patch_set_zone_count(patch: u8, count: u8) {
+    unsafe { host::patch_set_zone_count(patch as u32, count as u32) }
+}
+
+/// Configure one key zone in a sampler patch. `zone_idx` 0..=7.
+/// Zones with `zone_idx >= zone_count` are inert.
+pub fn patch_set_zone(patch: u8, zone_idx: u8, zone: KeyZone) {
+    let (loop_start, loop_end, loop_enabled) = match zone.loop_points {
+        Some((s, e)) => (s, e, 1u32),
+        None => (0, 0, 0u32),
+    };
+    unsafe {
+        host::patch_set_zone(
+            patch as u32,
+            zone_idx as u32,
+            zone.low_note as u32,
+            zone.high_note as u32,
+            zone.root_note as u32,
+            zone.sample_slot as u32,
+            zone.volume_offset as i32,
+            loop_start,
+            loop_end,
+            loop_enabled,
+        )
+    }
+}
+
+/// Maximum size in bytes of a serialized patch blob (synth + 8
+/// full zones). Carts can size a `[u8; PATCH_BLOB_MAX]` buffer
+/// against this to be safe regardless of patch kind.
+pub const PATCH_BLOB_MAX: usize = 160;
+
+/// Serialize a patch into `dst` per the §5.7 blob format. Returns
+/// the number of bytes written (between [`PATCH_BLOB_MAX`] / 8 and
+/// [`PATCH_BLOB_MAX`]), or 0 if `dst` is too small or the slot is
+/// out of range.
+///
+/// Synth patches use 48 bytes (no zones); sampler patches use
+/// 48 + 14 × `zone_count` bytes.
+pub fn patch_save(patch: u8, dst: &mut [u8]) -> usize {
+    unsafe {
+        host::patch_save(patch as u32, dst.as_mut_ptr(), dst.len() as u32) as usize
+    }
+}
+
+/// Parse a §5.7 patch blob and write it into `patch`. Returns
+/// `true` on success, `false` if the slot is out of range or the
+/// blob is corrupt (bad magic, unsupported version, truncated).
+/// On failure the slot is left untouched.
+pub fn patch_load(patch: u8, src: &[u8]) -> bool {
+    unsafe {
+        host::patch_load(patch as u32, src.as_ptr(), src.len() as u32) != 0
+    }
+}
+
+/// Configure FM2OP modulator parameters for a patch (§5.1). Only
+/// takes effect when osc A's mode is [`OscMode::Fm2Op`].
+///
+/// - `ratio_q88`: Q8.8 fixed-point modulator-to-carrier frequency
+///   ratio. Common: 256 = 1.0 (unison), 512 = 2.0 (octave),
+///   384 = 1.5 (perfect fifth → metallic), 128 = 0.5 (sub-octave).
+/// - `index_q88`: Q8.8 modulation index (peak phase deflection in
+///   radians). Common: 256 = 1.0 (gentle FM), 1280 = 5.0 (bright
+///   bell), 2560 = 10.0 (aggressive metallic / noise territory).
+///
+/// The modulator's amplitude is shaped over the note by the patch's
+/// filter envelope (so the bell strike → soft tail behaviour of a
+/// real FM bell falls out for free if you set the filter env's
+/// `decay_ms` to taste).
+pub fn patch_set_fm(patch: u8, ratio_q88: u16, index_q88: u16) {
+    unsafe { host::patch_set_fm(patch as u32, ratio_q88 as u32, index_q88 as u32) }
+}
+
 /// Reset a patch to the default sine + snappy ADSR.
 pub fn patch_reset(patch: u8) {
     unsafe { host::patch_reset(patch as u32) }
@@ -351,4 +465,89 @@ pub fn program_change(channel: u8, patch: u8) {
 /// note. Standard "panic" / scene-cleanup primitive.
 pub fn all_notes_off(channel: u8) {
     unsafe { host::all_notes_off(channel as u32) }
+}
+
+// ============================================================================
+// Sequenced music (§5.3) — Stage 4a. SMF type 0 / 1 playback.
+// ============================================================================
+
+/// Maximum number of SMF song slots a cart can register (§5.3).
+pub const SONG_SLOTS: u8 = 8;
+
+/// Load and parse a Standard MIDI File into a song slot (§5.3). The
+/// host copies the bytes into its own storage; the cart can drop the
+/// source buffer after this returns.
+///
+/// Returns `true` on success, `false` for an out-of-range slot or
+/// when the parser rejected the bytes (bad header, format 2, SMPTE
+/// division, etc.).
+///
+/// Loading a slot that's currently playing implicitly stops playback
+/// — the cart should `music_play` again afterward if it wants the
+/// new song to resume.
+pub fn music_load(slot: u8, smf: &[u8]) -> bool {
+    let ok =
+        unsafe { host::music_load(slot as u32, smf.as_ptr(), smf.len() as u32) };
+    ok != 0
+}
+
+/// Start playback of `slot` from the top. `loop_=true` wraps to the
+/// beginning at end-of-song with a clean `all_notes_off` panic so
+/// notes don't hang across the seam. Only one song can play at a
+/// time; calling `music_play` while another song is active silences
+/// the previous song first. No-op on empty / out-of-range slot.
+pub fn music_play(slot: u8, loop_: bool) {
+    unsafe { host::music_play(slot as u32, loop_ as u32) }
+}
+
+/// Stop the currently-playing song. Sends `all_notes_off` to every
+/// MIDI channel so released voices don't continue ringing.
+pub fn music_stop() {
+    unsafe { host::music_stop() }
+}
+
+/// Scale the authored tempo. 1.0 = as authored, 2.0 = double speed,
+/// 0.5 = half speed. Clamped by the host to [0.01, 100.0].
+pub fn music_set_tempo_scale(scale: f32) {
+    unsafe { host::music_set_tempo_scale(scale) }
+}
+
+/// Quarter-note beats since the current song started playing. Returns
+/// 0.0 when no song is active. Useful for syncing visuals to music.
+pub fn music_position_beats() -> f32 {
+    unsafe { host::music_position_beats() }
+}
+
+// ============================================================================
+// Effects bus (§5.5) — Stage 5. Two shared sends with fixed architecture:
+// Schroeder reverb (room_size + damping) and stereo cross-feedback delay
+// (time + feedback). Each voice's contribution scales by its source
+// channel's CC 91 (reverb) / CC 93 (delay) at note_on time.
+// ============================================================================
+
+/// CC numbers for the effect sends. Other CCs are ignored per §5.2.
+pub const CC_REVERB_SEND: u8 = 91;
+pub const CC_DELAY_SEND: u8 = 93;
+
+/// Set the global reverb. `room_size` 0..=127 controls comb feedback
+/// (longer tails as the value grows — approaches but never reaches
+/// self-oscillation at 127); `damping` 0..=127 sets the in-feedback
+/// lowpass (more damping = darker, more "absorbed" tail).
+///
+/// The reverb runs at boot with medium room + medium damping, so
+/// just sending `cc(ch, CC_REVERB_SEND, n)` produces an audible
+/// effect without first configuring it.
+pub fn reverb_set(room_size: u8, damping: u8) {
+    unsafe { host::reverb_set(room_size as u32, damping as u32) }
+}
+
+/// Set the global stereo cross-feedback delay. `time_ms` is the per-
+/// tap delay (1..=2000); `feedback` 0..=127 maps to gain in [0, 0.95]
+/// for the cross-feedback path (hard ceiling at 0.95 so the line
+/// always decays — no runaway feedback).
+///
+/// Default at boot is 250 ms / feedback 50, so a cart that only
+/// sends `cc(ch, CC_DELAY_SEND, n)` already hears ping-pong taps.
+pub fn delay_set(time_ms: u16, feedback: u8) {
+    unsafe { host::delay_set(time_ms as u32, feedback as u32) }
 }

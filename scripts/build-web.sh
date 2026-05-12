@@ -55,6 +55,16 @@ echo "[build-web] cart voxl: $(wc -c < "$EMBEDDED_VOXL") bytes -> $EMBEDDED_VOXL
 echo "[build-web] building voxlconsl-host-browser ($PROFILE)..."
 cargo build --target wasm32-unknown-unknown -p voxlconsl-host-browser "${BUILD_FLAGS[@]}"
 
+# Stage-4b audio-worklet wasm. Built every time alongside the host
+# so the worklet's loaded blob can't drift out of sync with the
+# voxlconsl-audio crate it wraps. Output is a raw .wasm (no wasm-
+# bindgen) the AudioWorkletProcessor fetches and instantiates
+# directly.
+echo "[build-web] building voxlconsl-audio-worklet ($PROFILE)..."
+cargo build --target wasm32-unknown-unknown -p voxlconsl-audio-worklet "${BUILD_FLAGS[@]}"
+cp "$OUT_DIR/voxlconsl_audio_worklet.wasm" web/audio-worklet.wasm
+echo "[build-web] worklet wasm: $(wc -c < web/audio-worklet.wasm) bytes -> web/audio-worklet.wasm"
+
 echo "[build-web] running wasm-bindgen..."
 wasm-bindgen \
     "$OUT_DIR/voxlconsl_host_browser.wasm" \
