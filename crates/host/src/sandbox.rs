@@ -323,6 +323,23 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         },
     )?;
     linker.func_wrap(
+        "env", "viewport_set",
+        |mut caller: Caller<WorldState>, x: u32, y: u32, w: u32, h: u32| {
+            let world = caller.data_mut();
+            // Clamp the rect against the framebuffer. A zero-width or
+            // zero-height rect is allowed (renderer just skips the
+            // ray-march entirely) — useful when the cart wants a UI-
+            // only frame.
+            let fb_w = crate::renderer::WIDTH;
+            let fb_h = crate::renderer::HEIGHT;
+            let x = x.min(fb_w);
+            let y = y.min(fb_h);
+            let w = w.min(fb_w.saturating_sub(x));
+            let h = h.min(fb_h.saturating_sub(y));
+            world.viewport = (x, y, w, h);
+        },
+    )?;
+    linker.func_wrap(
         "env", "camera_set_fov",
         |mut caller: Caller<WorldState>, fov_y_deg: f32| {
             caller.data_mut().camera.fov_y_deg = fov_y_deg;

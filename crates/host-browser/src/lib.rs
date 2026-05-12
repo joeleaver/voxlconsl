@@ -190,6 +190,7 @@ impl BrowserHost {
             sun_dir: world.sun_dir,
             sky_top: world.sky_top,
             sky_horizon: world.sky_horizon,
+            viewport: world.viewport,
         };
         render_frame(&scene, &world.camera, &mut self.framebuffer);
 

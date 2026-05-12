@@ -58,6 +58,11 @@ pub struct Scene<'a> {
     /// both to the same index gives a flat-colour sky.
     pub sky_top: u8,
     pub sky_horizon: u8,
+    /// (x, y, w, h) of the rect the ray-march should fill. Pixels
+    /// outside this rect are zeroed (palette 0) before the Billboard
+    /// / Screen composite passes paint over them. Default is the
+    /// full framebuffer.
+    pub viewport: (u32, u32, u32, u32),
 }
 
 /// Render one frame into `framebuffer`. Buffer is RGBA8 row-major,
@@ -103,9 +108,33 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
     // Generous cap; macro_grid::ray_iter clips to WORLD_SIDE internally.
     let max_t = 512.0;
 
-    for py in 0..HEIGHT {
+    // Resolve the viewport rect, clipped to the framebuffer.
+    let (vx, vy, vw, vh) = scene.viewport;
+    let vx = vx.min(WIDTH);
+    let vy = vy.min(HEIGHT);
+    let vx_end = (vx + vw).min(WIDTH);
+    let vy_end = (vy + vh).min(HEIGHT);
+
+    // If the viewport doesn't cover the whole framebuffer, zero the
+    // outside region (palette 0 → black) so prior frame data doesn't
+    // bleed through. Billboard / Screen composites can still write
+    // here.
+    if vx > 0 || vy > 0 || vx_end < WIDTH || vy_end < HEIGHT {
+        for py in 0..HEIGHT {
+            for px in 0..WIDTH {
+                if px >= vx && px < vx_end && py >= vy && py < vy_end { continue; }
+                let i = ((py * WIDTH + px) * 4) as usize;
+                framebuffer[i]     = 0;
+                framebuffer[i + 1] = 0;
+                framebuffer[i + 2] = 0;
+                framebuffer[i + 3] = 255;
+            }
+        }
+    }
+
+    for py in vy..vy_end {
         let v = ((py as f32 + 0.5) / HEIGHT as f32) * 2.0 - 1.0;
-        for px in 0..WIDTH {
+        for px in vx..vx_end {
             let u = ((px as f32 + 0.5) / WIDTH as f32) * 2.0 - 1.0;
 
             let dir = (basis.forward

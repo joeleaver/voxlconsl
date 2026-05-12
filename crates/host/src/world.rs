@@ -138,6 +138,12 @@ pub struct WorldState {
     /// worklet's actual VoiceId. Starts at 1 so 0 stays the canonical
     /// "no voice" sentinel.
     pub next_voice_token: u32,
+    /// Subrect of the framebuffer the renderer ray-marches into.
+    /// Pixels outside this rect are filled with palette index 0
+    /// (black) before the Billboard + Screen composite passes run.
+    /// Defaults to the full framebuffer; carts call `viewport_set`
+    /// to free a sidebar / panel region from the ray-march cost.
+    pub viewport: (u32, u32, u32, u32),
 }
 
 impl WorldState {
@@ -172,6 +178,7 @@ impl WorldState {
             audio_music_beats_cached: 0.0,
             audio_voices_active_cached: 0,
             next_voice_token: 1,
+            viewport: (0, 0, crate::renderer::WIDTH, crate::renderer::HEIGHT),
         }
     }
 

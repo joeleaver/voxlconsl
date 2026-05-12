@@ -129,6 +129,11 @@ pub extern "C" fn init() {
     // state initialisation reads from it.
     scenario::init(MISSION_SEED);
 
+    // Reserve the left 36 pixels of the framebuffer for the
+    // sidebar: the world ray-march skips that strip entirely.
+    // World viewport = (36, 0, 220, 144).
+    viewport_set(36, 0, 220, 144);
+
     terrain::paint_world();
 
     let focus_x = terrain::HELI_PAD_X as f32;

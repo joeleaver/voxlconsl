@@ -44,6 +44,7 @@ mod host {
             ux: f32, uy: f32, uz: f32,
         );
         pub fn camera_set_fov(fov_y_deg: f32);
+        pub fn viewport_set(x: u32, y: u32, w: u32, h: u32);
 
         pub fn light_set_sun(dx: f32, dy: f32, dz: f32, color: u32, intensity: u32);
         pub fn sky_set_gradient(top: u32, horizon: u32);
@@ -294,6 +295,17 @@ pub fn camera_set_lookat(eye: Vec3, target: Vec3, up: Vec3) {
 /// Set vertical FOV (degrees) when using `Projection::Perspective`.
 pub fn camera_set_fov(fov_y_deg: f32) {
     unsafe { host::camera_set_fov(fov_y_deg) }
+}
+
+/// Restrict the world ray-march to a subrect of the 256×144
+/// framebuffer (SPEC §3.X). Pixels outside the rect are zeroed
+/// (palette 0 = black) before the Billboard / Screen actor
+/// composite passes run, so the cart can paint a UI panel over
+/// the rest of the screen without paying ray-march cost for those
+/// pixels. Default is the full framebuffer. Setting w=0 or h=0
+/// skips the ray-march entirely (useful for a pure-UI frame).
+pub fn viewport_set(x: u32, y: u32, w: u32, h: u32) {
+    unsafe { host::viewport_set(x, y, w, h) }
 }
 
 /// Set the directional sun. `direction` should point *toward* the sun.
