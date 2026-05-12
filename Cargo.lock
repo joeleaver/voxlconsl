@@ -169,6 +169,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ic"
+version = "0.0.1"
+dependencies = [
+ "voxlconsl-sdk",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

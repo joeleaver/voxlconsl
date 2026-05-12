@@ -1,0 +1,15 @@
+[cart]
+name         = "ic"
+title        = "Incident Command"
+version      = "0.1.0"
+spec_version = "0.1"
+author       = "voxlconsl"
+description  = "RTS wildfire sim — direct crews to protect the town from an advancing forest fire."
+license      = "MIT OR Apache-2.0"
+
+[code]
+build  = "cargo build --release --target wasm32-unknown-unknown -p ic"
+output = "../../target/wasm32-unknown-unknown/release/ic.wasm"
+
+[materials]
+file = "materials.toml"

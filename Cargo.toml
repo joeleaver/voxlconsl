@@ -13,6 +13,7 @@ members = [
     "examples/hello-cube",
     "examples/big-world",
     "examples/voxdude",
+    "examples/ic",
 ]
 
 # host-browser, audio-worklet and example carts are wasm32-only cdylibs.

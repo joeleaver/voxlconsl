@@ -1,0 +1,178 @@
+# Incident Command — material slot table (SPEC.md §12.6.2).
+#
+# Slot 0 is reserved for air. Slots 1-23 are world materials and
+# actor pigments used by this cart. Future Phase-2 expansions
+# (retardant, air tanker, hose crew) will sit in 24-31.
+
+# ── Terrain ───────────────────────────────────────────────────────
+
+[[material]]
+slot  = 1
+name  = "stone"
+color = "cool_gray:1"
+
+[[material]]
+slot  = 2
+name  = "dirt"
+color = "brown:1"
+
+[[material]]
+slot  = 3
+name  = "grass"
+color = "grass_green:2"
+
+# ── Forest ────────────────────────────────────────────────────────
+# Pines: trunk catches slower than needles. Both ignite into fire (7).
+
+[[material]]
+slot         = 4
+name         = "pine_wood"
+color        = "brown:0"
+flags        = ["flammable"]
+ca_threshold = 120
+ignites_to   = 7
+
+[[material]]
+slot         = 5
+name         = "pine_leaves"
+color        = "forest_green:2"
+flags        = ["flammable"]
+ca_threshold = 50
+ignites_to   = 7
+
+# ── Liquids ───────────────────────────────────────────────────────
+
+[[material]]
+slot  = 6
+name  = "water"
+color = "cyan:2"
+flags = ["liquid"]
+
+# ── Fire + embers ─────────────────────────────────────────────────
+# Fire CA caps lifetime at 15 ticks so each cell burns out quickly.
+# Embers carry no CA flags — the cart's fire.rs steps them by hand.
+
+[[material]]
+slot        = 7
+name        = "fire"
+color       = "orange:3"
+emission    = 14
+flags       = ["fire"]
+ca_lifetime = 15
+
+[[material]]
+slot     = 8
+name     = "ember"
+color    = "yellow:3"
+emission = 15
+
+# ── Town ──────────────────────────────────────────────────────────
+# Cabins are treated lumber: higher ignition threshold than raw pine
+# so the fire takes a beat to actually cross from the forest into a
+# structure. Roof shingles catch a bit sooner — that's where embers
+# tend to land.
+
+[[material]]
+slot         = 9
+name         = "cabin_wood"
+color        = "brown:3"
+flags        = ["flammable"]
+ca_threshold = 140
+ignites_to   = 7
+
+[[material]]
+slot         = 10
+name         = "cabin_roof"
+color        = "red:1"
+flags        = ["flammable"]
+ca_threshold = 100
+ignites_to   = 7
+
+[[material]]
+slot  = 11
+name  = "road_dirt"
+color = "tan:1"
+
+# Firebreak — non-flammable dug-up strip. Visually distinct from
+# regular dirt so the player can see crew progress. No flammable
+# flag, so the §10.3 fire propagation stops here.
+[[material]]
+slot  = 12
+name  = "firebreak_dirt"
+color = "warm_gray:1"
+
+# ── UI / markers ──────────────────────────────────────────────────
+
+[[material]]
+slot     = 13
+name     = "cursor_marker"
+color    = "magenta:3"
+emission = 15
+
+[[material]]
+slot     = 14
+name     = "select_marker"
+color    = "yellow:3"
+emission = 15
+
+[[material]]
+slot  = 15
+name  = "heli_pad"
+color = "warm_gray:2"
+
+# ── Unit pigments (actor volumes) ─────────────────────────────────
+
+[[material]]
+slot  = 16
+name  = "helicopter_body"
+color = "cool_gray:0"
+
+[[material]]
+slot     = 17
+name     = "helicopter_rotor"
+color    = "warm_gray:2"
+emission = 4
+
+[[material]]
+slot     = 18
+name     = "crew_body"
+color    = "orange:3"
+emission = 6
+
+[[material]]
+slot  = 19
+name  = "crew_helmet"
+color = "yellow:3"
+
+[[material]]
+slot     = 20
+name     = "bucket_water"
+color    = "cyan:3"
+emission = 4
+
+# ── HUD text + backing ────────────────────────────────────────────
+
+[[material]]
+slot     = 21
+name     = "hud_text"
+color    = "warm_gray:3"
+emission = 15
+
+[[material]]
+slot  = 22
+name  = "hud_outline"
+color = "cool_gray:0"
+
+# Win/lose flash colors live on slots 23-24 so the cart can repaint
+# them in place without disturbing other slots.
+[[material]]
+slot     = 23
+name     = "flash_win"
+color    = "grass_green:3"
+emission = 12
+
+[[material]]
+slot     = 24
+name     = "flash_lose"
+color    = "red:3"
+emission = 12
