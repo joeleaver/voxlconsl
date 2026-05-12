@@ -13,7 +13,7 @@
 //!   - Camera projections beyond perspective (§3.2)
 
 use voxlconsl_svo::{ray::RayHit, ChunkKey};
-use voxlconsl_types::{ActorId, Material, MaterialFlags, Vec3};
+use voxlconsl_types::{ActorId, ActorRenderMode, Material, MaterialFlags, Vec3};
 
 use crate::actors::ActorTable;
 use crate::ca::{CaState, LIQUID_LEVEL_MAX};
@@ -85,6 +85,9 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
     actor_aabbs.resize(scene.actors.capacity(), (Vec3::ZERO, Vec3::ZERO));
     let mut actor_present: Vec<bool> = vec![false; scene.actors.capacity()];
     scene.actors.for_each_visible_with_index(|i, a| {
+        // Only Worldspace actors participate in the world ray-march.
+        // Billboard / Screen actors have their own composite pass.
+        if a.render_mode != ActorRenderMode::Worldspace { return; }
         actor_aabbs[i as usize] = a.world_aabb();
         actor_present[i as usize] = true;
     });
@@ -224,6 +227,166 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
             framebuffer[i + 1] = color.g;
             framebuffer[i + 2] = color.b;
             framebuffer[i + 3] = 255;
+        }
+    }
+
+    composite_billboard_actors(scene, camera, &basis, half_w, half_h, framebuffer);
+    composite_screen_actors(scene, framebuffer);
+}
+
+/// Composite every visible `Billboard`-mode actor onto the framebuffer
+/// after the world ray-march. `position` is interpreted as a world
+/// anchor; we project it through the camera basis to a framebuffer
+/// pixel and blit the actor's voxel grid **centered** on that point
+/// (1 voxel = 1 pixel). Local `+X` → screen-right; local `+Y` →
+/// screen-up, so an actor painted with `Axis::XY` reads right-side
+/// up. Air voxels are transparent. No depth test in Phase 1 —
+/// billboards always sit on top of the world ray-march.
+///
+/// Anchors behind the camera (forward distance ≤ 0) are skipped. A
+/// future depth-buffer pass can clip billboards against world hits;
+/// for HUD-style use (cursors, labels) "always on top" is the right
+/// default.
+fn composite_billboard_actors(
+    scene: &Scene,
+    camera: &Camera,
+    basis: &Basis,
+    half_w: f32,
+    half_h: f32,
+    framebuffer: &mut [u8],
+) {
+    let fb_w = WIDTH as i32;
+    let fb_h = HEIGHT as i32;
+    let cx = WIDTH as f32 * 0.5;
+    let cy = HEIGHT as f32 * 0.5;
+
+    scene.actors.for_each_visible_with_index(|i, actor| {
+        if actor.render_mode != ActorRenderMode::Billboard { return; }
+        let _ = i;
+        // Project anchor through camera basis.
+        let to = actor.position - camera.eye;
+        let z_along_fwd = to.x * basis.forward.x
+                        + to.y * basis.forward.y
+                        + to.z * basis.forward.z;
+        if z_along_fwd <= 0.001 { return; }    // behind camera or on the eye plane
+        let r_dot = to.x * basis.right.x + to.y * basis.right.y + to.z * basis.right.z;
+        let u_dot = to.x * basis.up.x    + to.y * basis.up.y    + to.z * basis.up.z;
+        // Normalized device coords in [-1, 1] within the camera frustum.
+        let ndc_x = r_dot / (z_along_fwd * half_w);
+        let ndc_y = u_dot / (z_along_fwd * half_h);
+
+        let size = actor.volume_size();
+        let sw = size.x as i32;
+        let sh = size.y as i32;
+
+        // Center of the blit rect in framebuffer pixels. Y is flipped
+        // since pixel Y grows down but NDC Y grows up.
+        let center_x = (cx + ndc_x * cx) as i32;
+        let center_y = (cy - ndc_y * cy) as i32;
+        let sx = center_x - sw / 2;
+        let sy = center_y - sh / 2;
+
+        // Clip against framebuffer.
+        let px_min = sx.max(0);
+        let py_min = sy.max(0);
+        let px_max = (sx + sw).min(fb_w);
+        let py_max = (sy + sh).min(fb_h);
+        if px_min >= px_max || py_min >= py_max { return; }
+
+        for py in py_min..py_max {
+            for px in px_min..px_max {
+                let lx = (px - sx) as u8;
+                let ly = (size.y as i32 - 1 - (py - sy)) as u8;
+                let mut paint: Option<u8> = None;
+                for lz in 0..size.z {
+                    let m = actor.get_voxel(lx, ly, lz);
+                    if m != 0 { paint = Some(m); break; }
+                }
+                if let Some(mat) = paint {
+                    let color_index = scene.materials[mat as usize].color;
+                    let rgb = SYSTEM_PALETTE[color_index.min(63) as usize];
+                    let fbi = ((py * fb_w + px) * 4) as usize;
+                    framebuffer[fbi]     = rgb.r;
+                    framebuffer[fbi + 1] = rgb.g;
+                    framebuffer[fbi + 2] = rgb.b;
+                    framebuffer[fbi + 3] = 255;
+                }
+            }
+        }
+    });
+}
+
+
+/// Composite every visible `Screen`-mode actor onto the framebuffer
+/// after the world ray-march. Each Screen actor is a 2D blit:
+/// `position.(x, y)` are framebuffer pixel coords of the rect's
+/// upper-left corner, `position.z` is the layer key (lower z paints
+/// first → higher z overwrites). The actor's local `+X` maps to
+/// screen-right; local `+Y` maps to screen-up, so the volume's top
+/// row paints at the top of the rect (consistent with `Axis::XY`
+/// glyph painting where row 0 lands at the highest local Y).
+///
+/// Air voxels (material 0) are transparent. Along the volume's local
+/// Z axis we walk front-to-back and keep the first non-air voxel —
+/// gives the cart a simple way to draw layered icons by stacking
+/// slices.
+fn composite_screen_actors(scene: &Scene, framebuffer: &mut [u8]) {
+    // Collect Screen actors with their layer key for sort.
+    let cap = scene.actors.capacity();
+    let mut entries: Vec<(i32, u32)> = Vec::with_capacity(cap.min(64));
+    scene.actors.for_each_visible_with_index(|i, a| {
+        if a.render_mode == ActorRenderMode::Screen {
+            entries.push((a.position.z as i32, i));
+        }
+    });
+    if entries.is_empty() { return; }
+    entries.sort_by_key(|&(z, _)| z);
+
+    let fb_w = WIDTH as i32;
+    let fb_h = HEIGHT as i32;
+
+    for &(_z, idx) in &entries {
+        let actor = match scene.actors.get(ActorId(idx)) {
+            Some(a) => a,
+            None => continue,
+        };
+        let size = actor.volume_size();
+        let sx = actor.position.x as i32;
+        let sy = actor.position.y as i32;
+        let sw = size.x as i32;
+        let sh = size.y as i32;
+
+        // Clip the actor's screen rect against the framebuffer.
+        let px_min = sx.max(0);
+        let py_min = sy.max(0);
+        let px_max = (sx + sw).min(fb_w);
+        let py_max = (sy + sh).min(fb_h);
+        if px_min >= px_max || py_min >= py_max { continue; }
+
+        for py in py_min..py_max {
+            for px in px_min..px_max {
+                // Map framebuffer pixel back into actor-local (x, y).
+                // Local +Y maps to screen-up, so flip vertically: the
+                // top row of the rect (py_min) corresponds to the
+                // largest local Y (`size.y - 1`).
+                let lx = (px - sx) as u8;
+                let ly = (size.y as i32 - 1 - (py - sy)) as u8;
+                // Front-most non-air voxel along Z wins.
+                let mut paint: Option<u8> = None;
+                for lz in 0..size.z {
+                    let m = actor.get_voxel(lx, ly, lz);
+                    if m != 0 { paint = Some(m); break; }
+                }
+                if let Some(mat) = paint {
+                    let color_index = scene.materials[mat as usize].color;
+                    let rgb = SYSTEM_PALETTE[color_index.min(63) as usize];
+                    let fbi = ((py * fb_w + px) * 4) as usize;
+                    framebuffer[fbi]     = rgb.r;
+                    framebuffer[fbi + 1] = rgb.g;
+                    framebuffer[fbi + 2] = rgb.b;
+                    framebuffer[fbi + 3] = 255;
+                }
+            }
         }
     }
 }

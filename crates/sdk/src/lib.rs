@@ -68,6 +68,8 @@ mod host {
         pub fn actor_set_prefab(actor_id: u32, prefab_id: u32);
         pub fn actor_set_orientation(actor_id: u32, orientation: u32);
         pub fn actor_get_orientation(actor_id: u32) -> u32;
+        pub fn actor_set_render_mode(actor_id: u32, mode: u32) -> u32;
+        pub fn actor_get_render_mode(actor_id: u32) -> u32;
 
         pub fn prefab_define(
             prefab_id: u32,
@@ -455,6 +457,18 @@ pub fn actor_get_orientation(actor: ActorId) -> Orientation {
         23 => Orientation::SouthUpRot270,
         _ => Orientation::Up,
     }
+}
+
+/// Set the actor's render mode (§11). See [`ActorRenderMode`] for the
+/// three modes and what `position` means under each. Returns `true`
+/// if the actor exists.
+pub fn actor_set_render_mode(actor: ActorId, mode: ActorRenderMode) -> bool {
+    unsafe { host::actor_set_render_mode(actor.0, mode as u32) != 0 }
+}
+
+pub fn actor_get_render_mode(actor: ActorId) -> ActorRenderMode {
+    let v = unsafe { host::actor_get_render_mode(actor.0) };
+    ActorRenderMode::from_code(v).unwrap_or(ActorRenderMode::Worldspace)
 }
 
 pub mod animation;

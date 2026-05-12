@@ -23,7 +23,7 @@
 use std::rc::Rc;
 
 use voxlconsl_svo::{build, ChunkData};
-use voxlconsl_types::{ActorId, Orientation, PrefabId, U8Vec3, Vec3};
+use voxlconsl_types::{ActorId, ActorRenderMode, Orientation, PrefabId, U8Vec3, Vec3};
 
 use crate::prefabs::{
     build_padded_chunk, matmul, matrix_transpose, orientation_matrix, rotate_dense_by_matrix,
@@ -158,6 +158,11 @@ pub struct Actor {
     /// Set on actors spawned via `actor_spawn_from`; used when `actor_set_prefab`
     /// or `actor_set_orientation` need to look up a baked volume.
     pub prefab: Option<PrefabId>,
+    /// How the renderer treats this actor — see [`ActorRenderMode`].
+    /// Default `Worldspace` matches v0.1.21 behavior; Screen-mode
+    /// actors skip the world ray-march and get a 2D blit pass after
+    /// the framebuffer is otherwise complete.
+    pub render_mode: ActorRenderMode,
 }
 
 impl Actor {
@@ -169,6 +174,7 @@ impl Actor {
             volume: ActorVolume::Owned(OwnedVolume::empty(DEFAULT_VOLUME_SIDE)),
             orientation: Orientation::Up,
             prefab: None,
+            render_mode: ActorRenderMode::Worldspace,
         }
     }
 
@@ -180,6 +186,7 @@ impl Actor {
             volume: ActorVolume::Shared(baked),
             orientation,
             prefab: Some(prefab),
+            render_mode: ActorRenderMode::Worldspace,
         }
     }
 

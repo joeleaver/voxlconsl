@@ -18,8 +18,8 @@
 use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 use voxlconsl_types::{
-    ActionKind, ActorId, BindingHint, BodyId, BodyKind, Material, MaterialFlags, Orientation,
-    PrefabId, Shape, ShapeTag, U8Vec3, Vec3,
+    ActionKind, ActorId, ActorRenderMode, BindingHint, BodyId, BodyKind, Material, MaterialFlags,
+    Orientation, PrefabId, Shape, ShapeTag, U8Vec3, Vec3,
     cart_format::{Cart as VoxlCart, CartError as VoxlError, MAGIC as VOXL_MAGIC, SectionId},
 };
 
@@ -521,6 +521,31 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
                 .actors
                 .get(ActorId(actor_id))
                 .map(|a| a.orientation as u32)
+                .unwrap_or(0)
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_set_render_mode",
+        |mut caller: Caller<WorldState>, actor_id: u32, mode: u32| -> u32 {
+            let m = match ActorRenderMode::from_code(mode) {
+                Some(m) => m,
+                None => return 0,    // unknown code → no-op, return false
+            };
+            let world = caller.data_mut();
+            match world.actors.get_mut(ActorId(actor_id)) {
+                Some(a) => { a.render_mode = m; 1 }
+                None => 0,
+            }
+        },
+    )?;
+    linker.func_wrap(
+        "env", "actor_get_render_mode",
+        |caller: Caller<WorldState>, actor_id: u32| -> u32 {
+            caller
+                .data()
+                .actors
+                .get(ActorId(actor_id))
+                .map(|a| a.render_mode as u32)
                 .unwrap_or(0)
         },
     )?;

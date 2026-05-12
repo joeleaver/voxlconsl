@@ -135,6 +135,48 @@ impl Orientation {
     }
 }
 
+/// How the renderer treats an actor each frame — see SPEC.md §11.
+///
+/// `Worldspace` is the default 3D path: the actor lives at a world
+/// position, ray-marched through the same camera basis as the voxel
+/// world.
+///
+/// `Billboard` keeps the world position but renders the actor's voxel
+/// grid screen-aligned (no perspective tilt) — for HUD floats over
+/// units, screen-aligned reticles, damage numbers. (Reserved for a
+/// future engine pass; not implemented yet.)
+///
+/// `Screen` reinterprets the actor's position fields: `(x, y)` are
+/// framebuffer pixel coords of the rect's **upper-left** corner; `z`
+/// is the layer (drawn later = drawn on top of lower-`z` Screen
+/// actors). The actor's local `+X` maps to screen-right; local `+Y`
+/// maps to screen-up (so glyph row 0 stays at the visual top after
+/// painting via `Axis::XY`). The volume's depth (local Z) is unused
+/// for compositing — the front-most non-air voxel along Z wins.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ActorRenderMode {
+    Worldspace = 0,
+    Billboard  = 1,
+    Screen     = 2,
+}
+
+impl Default for ActorRenderMode {
+    fn default() -> Self { Self::Worldspace }
+}
+
+impl ActorRenderMode {
+    pub const fn from_code(c: u32) -> Option<Self> {
+        match c {
+            0 => Some(Self::Worldspace),
+            1 => Some(Self::Billboard),
+            2 => Some(Self::Screen),
+            _ => None,
+        }
+    }
+    pub const fn to_code(self) -> u32 { self as u32 }
+}
+
 /// Bitset of actors potentially overlapping a query. See SPEC.md §10.1.
 ///
 /// Concrete representation is a host concern; this is just the type the

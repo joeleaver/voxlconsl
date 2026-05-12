@@ -5,8 +5,11 @@
 //! into either world voxels (for permanent signs) or a caller-provided
 //! dense buffer (for actor-volume HUD / dialog text).
 //!
-//! Two built-in fonts ship with the SDK:
+//! Three built-in fonts ship with the SDK:
 //!
+//! - [`FONT_TINY`] — 4×6, the smallest legible cell for the 256×144
+//!   framebuffer. Uppercase + digits + punctuation only. Sidebar
+//!   HUDs and dense score readouts.
 //! - [`FONT_ANSI`] — 10×11, derived from the figlet "ANSI Regular" font.
 //!   Clean blocky letterforms, good for HUD and dialog.
 //! - [`FONT_DCP1`] — 16×18, derived from the figlet "Delta Corps Priest 1"
@@ -420,6 +423,7 @@ pub fn rasterize_into(
 
 const FONT_ANSI_BYTES: &[u8] = include_bytes!("fonts/ansi_regular.vfnt");
 const FONT_DCP1_BYTES: &[u8] = include_bytes!("fonts/delta_corps_priest_1.vfnt");
+const FONT_TINY_BYTES: &[u8] = include_bytes!("fonts/tiny.vfnt");
 
 /// Built-in 10×11 font derived from the figlet "ANSI Regular" face.
 /// Clean blocky letterforms; a sensible default for HUD and dialog.
@@ -434,6 +438,17 @@ pub static FONT_ANSI: Font<'static> = match Font::from_bytes(FONT_ANSI_BYTES) {
 pub static FONT_DCP1: Font<'static> = match Font::from_bytes(FONT_DCP1_BYTES) {
     Ok(f) => f,
     Err(_) => panic!("invalid built-in Delta Corps Priest 1 .vfnt"),
+};
+
+/// Built-in 4×6 font — the smallest legible voxel cell for the
+/// console's 256×144 framebuffer. Uppercase + digits + punctuation
+/// only (lowercase codepoints are absent and render as blanks; carts
+/// should uppercase their text before painting). Use this for
+/// sidebar HUDs, score readouts, and any text that needs to share a
+/// screen with the world. Source spec is `scripts/build_tiny_font.py`.
+pub static FONT_TINY: Font<'static> = match Font::from_bytes(FONT_TINY_BYTES) {
+    Ok(f) => f,
+    Err(_) => panic!("invalid built-in tiny .vfnt"),
 };
 
 #[cfg(test)]
