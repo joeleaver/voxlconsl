@@ -1058,6 +1058,18 @@ The closest hit (world or actor) wins. Lighting uses the world's directional lig
 
 Yaw bloats the actor's world-space AABB by at most ~1.41× on the X/Z axes (sqrt(2)). The 32-voxel macro-grid cell size absorbs this with no observable broad-phase cost.
 
+#### 11.6.1 Render modes
+
+Every actor carries an `ActorRenderMode` enum that selects which compositor path the renderer uses for it:
+
+- **`Worldspace`** *(default)*. The 3D ray-march path described above. `position` is a world coord; `yaw`/`orientation` apply normally.
+- **`Billboard`**. The actor is anchored to a world position but rendered as a 2D sprite blit aligned to the camera. After the world ray-march finishes, the host projects `actor.position` through the camera basis to a framebuffer pixel and blits the actor's voxel grid **centered** on that point (1 voxel = 1 pixel; local `+X` → screen-right, local `+Y` → screen-up). Anchors behind the camera are skipped. Air voxels are transparent. v0.1 has no depth-test — billboards always sit on top of the world.
+- **`Screen`**. Pure 2D UI: `position.(x, y)` are framebuffer pixel coords of the rect's **upper-left** corner; `position.z` is the layer (lower z paints first → higher z overwrites). The actor's voxel grid blits 1:1 to that rect with the same axis mapping as Billboard mode.
+
+**Pass order:** world ray-march → Billboard composite → Screen composite. Within each composite, ties are broken by spawn order; Screen actors also sort by `position.z` ascending so the cart can stack UI layers.
+
+**Prefab size limit (v0.1):** because Billboard/Screen actors still live in the actor table and their volume is built via the same prefab → SVO path, each axis is capped at 32 voxels (one SVO chunk). Wider panels are composed from multiple Screen actors. The SVO is unused for non-Worldspace actors but the cap remains for now to avoid forking the actor representation.
+
 ### 11.7 API
 
 ```rust
@@ -1077,6 +1089,8 @@ fn actor_get_orientation(id: ActorId) -> Orientation;
 fn actor_set_anchor(id: ActorId, anchor: Vec3);
 fn actor_set_visible(id: ActorId, visible: bool);
 fn actor_get_bounds(id: ActorId) -> (Vec3, Vec3);  // world-space AABB
+fn actor_set_render_mode(id: ActorId, mode: ActorRenderMode) -> bool;  // §11.6.1
+fn actor_get_render_mode(id: ActorId) -> ActorRenderMode;
 
 // Prefab swap — the basis of flipbook animation (§11.9)
 fn actor_set_prefab(id: ActorId, prefab: PrefabId);  // swaps the actor's volume reference
