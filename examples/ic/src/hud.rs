@@ -20,7 +20,6 @@
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::text::{Font, FONT_TINY};
 
-use crate::units::UnitId;
 use crate::M_HUD_TEXT;
 
 // ── Panel geometry ────────────────────────────────────────────────
@@ -74,9 +73,12 @@ struct StatusKey {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct UnitKey {
-    name:   [u8; 4],
-    state:  [u8; 4],
-    bucket: [u8; 4],
+    heli_state:  [u8; 4],
+    heli_bucket: [u8; 4],
+    crew_state:  [u8; 4],
+    line_active: bool,
+    line_count:  u32,
+    queue_total: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -170,22 +172,37 @@ impl Hud {
     }
 
     fn paint_unit(&mut self, ctx: &HudCtx<'_>) {
-        let key = unit_key_from_ctx(ctx);
+        let key = UnitKey {
+            heli_state:  pad4(ctx.heli_state),
+            heli_bucket: pad4(ctx.heli_bucket),
+            crew_state:  pad4(ctx.crew_state),
+            line_active: ctx.line_mode_active,
+            line_count:  ctx.line_mode_count,
+            queue_total: ctx.queue_total,
+        };
         if self.unit_cache == Some(key) { return; }
         self.unit_cache = Some(key);
         let actor = match self.actors[Section::Unit as usize] { Some(a) => a, None => return };
         actor_clear(actor);
 
         let mut buf = [b' '; SIDEBAR_LINE_MAX];
-        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "UNIT");
-        let s = label_value(&mut buf, "  ", &key.name);
+        // Line 0: compact heli summary — "H " + state + " " + bucket.
+        let s = format_heli(&mut buf, ctx.heli_state, ctx.heli_bucket);
+        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, s);
+        // Line 1: compact crew summary — "C " + state.
+        let s = format_crew(&mut buf, ctx.crew_state);
         paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, s);
-        let s = label_value(&mut buf, "ST", &key.state);
-        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
-        if ctx.selected == Some(UnitId::Heli) {
-            let s = label_value(&mut buf, "BK", &key.bucket);
-            paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, s);
-        }
+        // Line 2: current command mode (always painted).
+        let mode = if ctx.line_mode_active { "MD LINE" } else { "MD NORM" };
+        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, mode);
+        // Line 3: in line mode show point count of the draft;
+        // otherwise show total queued orders.
+        let s = if ctx.line_mode_active {
+            format_line_count(&mut buf, ctx.line_mode_count)
+        } else {
+            format_queue_total(&mut buf, ctx.queue_total)
+        };
+        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, s);
     }
 
     fn paint_orders(&mut self, ctx: &HudCtx<'_>) {
@@ -213,10 +230,10 @@ impl Hud {
     fn paint_help(&mut self) {
         let actor = match self.actors[Section::Help as usize] { Some(a) => a, None => return };
         actor_clear(actor);
-        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "WSAD PAN");
-        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, "WHL ZOOM");
-        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, "J ORDER");
-        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, "K SEL");
+        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "J DROP");
+        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, "K LINE");
+        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, "ENT OK");
+        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, "WSAD");
     }
 }
 
@@ -227,30 +244,25 @@ pub(crate) struct HudCtx<'a> {
     pub alive_mask:    u32,
     pub fire_sites:    u32,
     pub wind_dir:      &'a str,
-    pub wind_strength: u32,        // 0..9
-    pub selected:      Option<UnitId>,
-    pub unit_label:    &'a str,
-    pub unit_state:    &'a str,
+    pub wind_strength: u32,
+    pub heli_state:    &'a str,
     pub heli_bucket:   &'a str,
+    pub crew_state:    &'a str,
     pub heli_target:   Option<(u32, u32)>,
     pub crew_target:   Option<(u32, u32)>,
+    pub line_mode_active: bool,
+    pub line_mode_count:  u32,
+    pub queue_total:   u32,
+    pub queue_water:   u32,
+    pub queue_lines:   u32,
 }
 
-fn unit_key_from_ctx(ctx: &HudCtx<'_>) -> UnitKey {
-    let mut name = [b' '; 4];
-    let mut state = [b' '; 4];
-    let mut bucket = [b' '; 4];
-    copy_label(&mut name, ctx.unit_label);
-    copy_label(&mut state, ctx.unit_state);
-    copy_label(&mut bucket, ctx.heli_bucket);
-    UnitKey { name, state, bucket }
-}
-
-fn copy_label(dst: &mut [u8; 4], src: &str) {
-    let bytes = src.as_bytes();
+fn pad4(s: &str) -> [u8; 4] {
+    let mut out = [b' '; 4];
+    let bytes = s.as_bytes();
     let n = bytes.len().min(4);
-    dst[..n].copy_from_slice(&bytes[..n]);
-    for b in &mut dst[n..] { *b = b' '; }
+    out[..n].copy_from_slice(&bytes[..n]);
+    out
 }
 
 // ── Glyph painter ─────────────────────────────────────────────────
@@ -339,20 +351,54 @@ fn format_fire<'a>(buf: &'a mut [u8], sites: u32) -> &'a str {
     core::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 
-fn label_value<'a>(buf: &'a mut [u8], label: &str, value: &[u8; 4]) -> &'a str {
-    let lb = label.as_bytes();
-    let lb_n = lb.len().min(3);
-    buf[..lb_n].copy_from_slice(&lb[..lb_n]);
-    buf[lb_n] = b' ';
-    let mut len = lb_n + 1;
-    for &b in value.iter() {
-        if b == b' ' && len == lb_n + 1 { continue; }   // trim leading spaces
+/// "H FLY  F"  /  "H IDLE F" — heli state + bucket on one line.
+/// `state` is ≤ 4 chars, bucket is a single letter ("F"/"E"/"-").
+fn format_heli<'a>(buf: &'a mut [u8], state: &str, bucket: &str) -> &'a str {
+    buf[..2].copy_from_slice(b"H ");
+    let mut len = 2;
+    for &b in state.as_bytes().iter().take(4) {
         if len >= buf.len() { break; }
         buf[len] = b;
         len += 1;
     }
-    // trim trailing spaces
-    while len > 0 && buf[len - 1] == b' ' { len -= 1; }
+    if len < buf.len() { buf[len] = b' '; len += 1; }
+    if len < buf.len() {
+        if let Some(&b) = bucket.as_bytes().first() { buf[len] = b; len += 1; }
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// "C WALK" / "C IDLE".
+fn format_crew<'a>(buf: &'a mut [u8], state: &str) -> &'a str {
+    buf[..2].copy_from_slice(b"C ");
+    let mut len = 2;
+    for &b in state.as_bytes().iter().take(4) {
+        if len >= buf.len() { break; }
+        buf[len] = b;
+        len += 1;
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// "LN N/8" — current draft size, max LINE_CAP=8.
+fn format_line_count<'a>(buf: &'a mut [u8], n: u32) -> &'a str {
+    buf[..3].copy_from_slice(b"LN ");
+    buf[3] = b'0' + (n.min(9)) as u8;
+    buf[4] = b'/';
+    buf[5] = b'8';
+    core::str::from_utf8(&buf[..6]).unwrap_or("")
+}
+
+/// "Q NN" — total pending orders across both unit types.
+fn format_queue_total<'a>(buf: &'a mut [u8], n: u32) -> &'a str {
+    buf[..2].copy_from_slice(b"Q ");
+    let nn = n.min(99);
+    let tens = nn / 10;
+    let ones = nn % 10;
+    let mut len = 2;
+    if tens > 0 { buf[len] = b'0' + tens as u8; len += 1; }
+    buf[len] = b'0' + ones as u8;
+    len += 1;
     core::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 

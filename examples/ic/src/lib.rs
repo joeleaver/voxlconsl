@@ -44,6 +44,7 @@ mod camera;
 mod cursor;
 mod fire;
 mod hud;
+mod line_mode;
 mod mathlib;
 mod rng;
 mod scenario;
@@ -108,9 +109,14 @@ static mut ROSTER: Option<units::Roster> = None;
 static mut PAN_ACTION:    ActionHandle = ActionHandle(0);
 static mut AIM_ACTION:    ActionHandle = ActionHandle(0);
 static mut ZOOM_ACTION:   ActionHandle = ActionHandle(0);
+/// PRIMARY — queue a water drop, or append a fire-line point.
 static mut ORDER_ACTION:  ActionHandle = ActionHandle(0);
-static mut SELECT_ACTION: ActionHandle = ActionHandle(0);
-static mut CYCLE_ACTION:  ActionHandle = ActionHandle(0);
+/// SECONDARY — toggle fire-line drafting mode.
+static mut MODE_ACTION:   ActionHandle = ActionHandle(0);
+/// CONFIRM — commit the fire-line draft into the queue.
+static mut COMMIT_ACTION: ActionHandle = ActionHandle(0);
+
+static mut LINE_MODE: line_mode::LineMode = line_mode::LineMode::new();
 
 // ── Boot ─────────────────────────────────────────────────────────
 
@@ -145,6 +151,7 @@ pub extern "C" fn init() {
         register_actions();
         (&mut *(&raw mut HUD)).init();
         (&mut *(&raw mut CURSOR)).init();
+        (&mut *(&raw mut LINE_MODE)).init();
     }
 
     // First fire — seed it now so the player sees smoke from the
@@ -163,8 +170,8 @@ fn register_actions() {
         AIM_ACTION    = input_declare_action(ActionKind::Axis2D, BindingHint::Aim, "cursor");
         ZOOM_ACTION   = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom, "zoom");
         ORDER_ACTION  = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "order");
-        SELECT_ACTION = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "select");
-        CYCLE_ACTION  = input_declare_action(ActionKind::Button, BindingHint::Confirm, "cycle");
+        MODE_ACTION   = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "line_mode");
+        COMMIT_ACTION = input_declare_action(ActionKind::Button, BindingHint::Confirm, "commit");
     }
 }
 
@@ -185,32 +192,58 @@ pub extern "C" fn update(dt_ms: u32) {
     cam.update(mx, my, zoom, dt);
     cur.pan(ax, ay, cam.cursor_speed());
 
-    // Selection + order edges. Reading these once per frame keeps
-    // the cart deterministic regardless of how many times
-    // `input_action_pressed` would echo otherwise.
+    // Input edges. Reading once per frame keeps the cart deterministic
+    // regardless of how many times `_pressed` would echo.
     let pressed_order  = input_action_pressed(unsafe { ORDER_ACTION });
-    let pressed_select = input_action_pressed(unsafe { SELECT_ACTION });
-    let pressed_cycle  = input_action_pressed(unsafe { CYCLE_ACTION });
+    let pressed_mode   = input_action_pressed(unsafe { MODE_ACTION });
+    let pressed_commit = input_action_pressed(unsafe { COMMIT_ACTION });
 
     let phase = unsafe { PHASE };
     if phase == Phase::Playing {
-        if pressed_select {
-            let (cx, cz) = cur.cell();
-            let cy = cur.marker_y();
-            if let Some(roster) = unsafe { &mut *(&raw mut ROSTER) } {
-                roster.select_nearest(UVec3::new(cx, cy, cz), 10.0);
+        // SECONDARY (K) toggles fire-line drafting mode. Exiting via
+        // K discards the in-progress polyline (orders are
+        // non-cancellable, but a *draft* still in the player's head
+        // never reaches the queue, so dropping it here is fair).
+        if pressed_mode {
+            unsafe {
+                let lm = &mut *(&raw mut LINE_MODE);
+                lm.active = !lm.active;
+                if !lm.active { lm.clear(); }
             }
         }
-        if pressed_cycle {
-            if let Some(roster) = unsafe { &mut *(&raw mut ROSTER) } {
-                roster.cycle_selection();
-            }
-        }
+
+        // PRIMARY (J) does double duty based on mode:
+        //   normal mode → queue a water drop at the cursor cell
+        //   line mode   → append the cursor cell to the draft line
         if pressed_order {
             let (cx, cz) = cur.cell();
             let cy = cur.marker_y();
-            if let Some(roster) = unsafe { &mut *(&raw mut ROSTER) } {
-                roster.issue_order(UVec3::new(cx, cy, cz));
+            let p = UVec3::new(cx, cy, cz);
+            unsafe {
+                let lm = &mut *(&raw mut LINE_MODE);
+                if lm.active {
+                    lm.push_point(p);
+                } else if let Some(roster) = &mut *(&raw mut ROSTER) {
+                    roster.dispatch_water_drop(p);
+                }
+            }
+        }
+
+        // CONFIRM (Enter) finalises the draft polyline (line mode
+        // only). Empty drafts no-op. After commit, line mode is
+        // implicitly exited.
+        if pressed_commit {
+            unsafe {
+                let lm = &mut *(&raw mut LINE_MODE);
+                if lm.active && lm.count > 0 {
+                    let mut buf = [UVec3::ZERO; line_mode::LINE_CAP];
+                    let n = lm.copy_points_into(&mut buf);
+                    if let Some(roster) = &mut *(&raw mut ROSTER) {
+                        roster.dispatch_fire_line(&buf[..n]);
+                    }
+                    lm.clear();
+                    lm.active = false;
+                }
             }
         }
 
@@ -243,54 +276,43 @@ pub extern "C" fn update(dt_ms: u32) {
 unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
     let roster_ref = unsafe { &*(&raw const ROSTER) };
     let fire_ref   = unsafe { &*(&raw const FIRE_STATE) };
+    let line_ref   = unsafe { &*(&raw const LINE_MODE) };
+
     let wind_dir = fire_ref.wind_direction_label();
     let wind_strength = fire_ref.wind_strength_digit();
-    let (selected, unit_label, unit_state, bucket, heli_target, crew_target) =
+
+    let (heli_state, heli_bucket, crew_state, heli_target, crew_target,
+         queue_total, queue_water, queue_lines) =
         match roster_ref {
-            Some(r) => {
-                let heli_target = r.heli.target_xz();
-                let crew_target = r.crew.target_xz();
-                match r.selected {
-                    Some(units::UnitId::Heli) => (
-                        Some(units::UnitId::Heli),
-                        "HELI",
-                        r.heli.state_label(),
-                        r.heli.bucket_label(),
-                        heli_target,
-                        crew_target,
-                    ),
-                    Some(units::UnitId::Crew) => (
-                        Some(units::UnitId::Crew),
-                        "CREW",
-                        r.crew.state_label(),
-                        "",
-                        heli_target,
-                        crew_target,
-                    ),
-                    None => (
-                        None,
-                        "NONE",
-                        "-",
-                        "",
-                        heli_target,
-                        crew_target,
-                    ),
-                }
-            }
-            None => (None, "NONE", "-", "", None, None),
+            Some(r) => (
+                r.heli.state_label(),
+                r.heli.bucket_label(),
+                r.crew.state_label(),
+                r.heli.target_xz(),
+                r.crew.target_xz(),
+                r.queue.pending_total(),
+                r.queue.pending_water(),
+                r.queue.pending_lines(),
+            ),
+            None => ("-", "-", "-", None, None, 0, 0, 0),
         };
+
     hud::HudCtx {
         time_left_ms: unsafe { TIME_LEFT_MS },
         alive_mask,
         fire_sites:   unsafe { FIRE_SITES_LAST },
         wind_dir,
         wind_strength,
-        selected,
-        unit_label,
-        unit_state,
-        heli_bucket: bucket,
+        heli_state,
+        heli_bucket,
+        crew_state,
         heli_target,
         crew_target,
+        line_mode_active: line_ref.active,
+        line_mode_count:  line_ref.count as u32,
+        queue_total,
+        queue_water,
+        queue_lines,
     }
 }
 

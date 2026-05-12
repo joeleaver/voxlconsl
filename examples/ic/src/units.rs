@@ -36,16 +36,8 @@ use crate::terrain::{
 use crate::{
     M_BUCKET_WATER, M_CREW_BODY, M_CREW_HELMET, M_EMBER, M_FIRE,
     M_FIREBREAK_DIRT, M_HELICOPTER_BODY, M_HELICOPTER_ROTOR, M_PINE_LEAVES,
-    M_PINE_WOOD, M_SELECT_MARKER, M_WATER,
+    M_PINE_WOOD, M_WATER,
 };
-
-// ── Unit IDs ──────────────────────────────────────────────────────
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum UnitId {
-    Heli,
-    Crew,
-}
 
 // ── Helicopter ────────────────────────────────────────────────────
 
@@ -184,6 +176,8 @@ impl Helicopter {
         Some((self.target_xz.0 as u32, self.target_xz.1 as u32))
     }
 
+    pub(crate) fn is_idle(&self) -> bool { matches!(self.state, HeliState::Idle) }
+
     pub(crate) fn issue_drop(&mut self, target: UVec3) {
         // Target is the cell the player wants water on. Heli flies
         // to it; if the bucket is empty we route through the lake
@@ -238,13 +232,13 @@ impl Helicopter {
                 if next == 0 {
                     self.bucket_full = true;
                     self.update_bucket_visual();
-                    // Auto-return to last drop target if we still have one
-                    // set, otherwise idle at the pad.
-                    if self.target_xz != self.home_xz {
-                        self.state = HeliState::FlyToTarget;
-                    } else {
-                        self.state = HeliState::Idle;
-                    }
+                    // Drop back to Idle so the Roster can pop the next
+                    // water-drop off the queue at the top of the next
+                    // tick. The cart's no-cancel rule means in-flight
+                    // orders always run to completion, so we never go
+                    // straight from Refilling to FlyToTarget anymore.
+                    self.state = HeliState::Idle;
+                    self.target_xz = self.home_xz;
                 } else {
                     self.state = HeliState::Refilling(next);
                 }
@@ -305,17 +299,24 @@ const CREW_SIZE_Y: u8 = 3;
 const CREW_SPEED:  f32 = 0.10;
 /// Half-width of the firebreak the crew lays as it walks.
 const CREW_BREAK_HALF_WIDTH: i32 = 1;
+pub(crate) const CREW_PATH_CAP: usize = 8;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum CrewState {
     Idle,
-    WalkingTo,
+    /// Walking toward waypoint `index` of `path`. Advances to
+    /// `index + 1` on arrival; goes Idle when the next slot is
+    /// `None`.
+    Walking(u8),
 }
 
 pub(crate) struct GroundCrew {
     actor:     ActorId,
     pub pos:   Vec3,
-    target_xz: (f32, f32),
+    /// Polyline the crew is currently working through. `path[0]` is
+    /// the current target while walking; cell on arrival rolls the
+    /// index forward.
+    path:      [Option<(u32, u32)>; CREW_PATH_CAP],
     state:     CrewState,
     last_cell: Option<(u32, u32)>,
 }
@@ -329,7 +330,7 @@ impl GroundCrew {
         let g = Self {
             actor,
             pos,
-            target_xz: (pos.x, pos.z),
+            path: [None; CREW_PATH_CAP],
             state: CrewState::Idle,
             last_cell: None,
         };
@@ -345,29 +346,55 @@ impl GroundCrew {
 
     pub(crate) fn state_label(&self) -> &'static str {
         match self.state {
-            CrewState::Idle      => "IDLE",
-            CrewState::WalkingTo => "WALK",
+            CrewState::Idle       => "IDLE",
+            CrewState::Walking(_) => "WALK",
         }
     }
 
+    /// The waypoint the crew is currently heading toward — drives
+    /// the "C  X,Z" line in the HUD ORDERS section.
     pub(crate) fn target_xz(&self) -> Option<(u32, u32)> {
-        if self.state == CrewState::Idle { return None; }
-        Some((self.target_xz.0 as u32, self.target_xz.1 as u32))
+        match self.state {
+            CrewState::Walking(i) => self.path.get(i as usize).and_then(|s| *s),
+            CrewState::Idle => None,
+        }
     }
 
-    pub(crate) fn issue_move(&mut self, target: UVec3) {
-        self.target_xz = (target.x as f32, target.z as f32);
-        self.state = CrewState::WalkingTo;
+    pub(crate) fn is_idle(&self) -> bool { matches!(self.state, CrewState::Idle) }
+
+    /// Hand the crew a polyline of waypoints to walk in order.
+    /// Empty input clears the path and parks the crew. Slots
+    /// beyond `CREW_PATH_CAP` are silently dropped.
+    pub(crate) fn issue_path(&mut self, points: &[UVec3]) {
+        self.path = [None; CREW_PATH_CAP];
+        for (i, p) in points.iter().take(CREW_PATH_CAP).enumerate() {
+            self.path[i] = Some((p.x, p.z));
+        }
+        if self.path[0].is_some() {
+            self.state = CrewState::Walking(0);
+        } else {
+            self.state = CrewState::Idle;
+        }
     }
 
     pub(crate) fn tick(&mut self) {
-        if let CrewState::WalkingTo = self.state {
-            let (tx, tz) = self.target_xz;
+        if let CrewState::Walking(idx) = self.state {
+            let target = match self.path.get(idx as usize).and_then(|s| *s) {
+                Some(t) => t,
+                None => { self.state = CrewState::Idle; return; }
+            };
+            let (tx, tz) = (target.0 as f32, target.1 as f32);
             let dx = tx - self.pos.x;
             let dz = tz - self.pos.z;
             let d = sqrt(dx * dx + dz * dz);
             if d < 0.5 {
-                self.state = CrewState::Idle;
+                // Arrived — advance to the next waypoint, or park.
+                let next = idx + 1;
+                if (next as usize) < CREW_PATH_CAP && self.path[next as usize].is_some() {
+                    self.state = CrewState::Walking(next);
+                } else {
+                    self.state = CrewState::Idle;
+                }
             } else {
                 let step = CREW_SPEED.min(d);
                 self.pos.x += dx / d * step;
@@ -418,140 +445,149 @@ impl GroundCrew {
     }
 }
 
-// ── Selection state ───────────────────────────────────────────────
+// ── Command queue ────────────────────────────────────────────────
+//
+// The player no longer micro-controls units. Each click pushes an
+// order onto a per-type FIFO; whenever a unit goes idle it pops the
+// next compatible order off the queue. Limited unit count = the
+// dominant gameplay constraint, since orders aren't cancellable —
+// once you click, that water drop is committed.
 
-pub(crate) struct Roster {
-    pub heli:     Helicopter,
-    pub crew:     GroundCrew,
-    pub selected: Option<UnitId>,
-    select_actor: ActorId,
+pub(crate) const WATER_DROP_QUEUE_CAP: usize = 16;
+pub(crate) const FIRE_LINE_QUEUE_CAP:  usize = 8;
+
+#[derive(Copy, Clone, Default)]
+pub(crate) struct FireLinePath {
+    pub points: [Option<UVec3>; CREW_PATH_CAP],
+    pub count:  u8,
 }
 
-// 5×5 downward-pointing triangle for the selection marker. Row 0 is
-// the top of the arrow (the wide base); row 4 is the tip.
-const SELECT_W: u8 = 5;
-const SELECT_H: u8 = 5;
-const SELECT_VOL_BYTES: usize = (SELECT_W as usize) * (SELECT_H as usize) * 1;
-const SELECT_PREFAB: PrefabId = PrefabId(66);
-const SELECT_BITMAP: [[u8; SELECT_W as usize]; SELECT_H as usize] = [
-    [1, 1, 1, 1, 1],
-    [0, 1, 1, 1, 0],
-    [0, 1, 1, 1, 0],
-    [0, 0, 1, 0, 0],
-    [0, 0, 1, 0, 0],
-];
+impl FireLinePath {
+    pub(crate) fn from_slice(src: &[UVec3]) -> Self {
+        let mut out = Self::default();
+        for (i, p) in src.iter().take(CREW_PATH_CAP).enumerate() {
+            out.points[i] = Some(*p);
+            out.count    += 1;
+        }
+        out
+    }
+    fn as_slice(&self) -> [UVec3; CREW_PATH_CAP] {
+        let mut out = [UVec3::ZERO; CREW_PATH_CAP];
+        for i in 0..self.count as usize {
+            if let Some(p) = self.points[i] { out[i] = p; }
+        }
+        out
+    }
+}
 
-static mut SELECT_DENSE: [u8; SELECT_VOL_BYTES] = [0; SELECT_VOL_BYTES];
+pub(crate) struct CommandQueue {
+    water:       [Option<UVec3>; WATER_DROP_QUEUE_CAP],
+    water_count: u8,
+    lines:       [Option<FireLinePath>; FIRE_LINE_QUEUE_CAP],
+    line_count:  u8,
+}
+
+impl CommandQueue {
+    pub(crate) const fn new() -> Self {
+        Self {
+            water:       [None; WATER_DROP_QUEUE_CAP],
+            water_count: 0,
+            lines:       [None; FIRE_LINE_QUEUE_CAP],
+            line_count:  0,
+        }
+    }
+
+    /// Append a water drop. Returns false if the queue is full —
+    /// the click is dropped on the floor (orders are non-cancellable,
+    /// so the alternative would be evicting a queued order the
+    /// player already committed to).
+    pub(crate) fn push_water(&mut self, cell: UVec3) -> bool {
+        if (self.water_count as usize) >= WATER_DROP_QUEUE_CAP { return false; }
+        self.water[self.water_count as usize] = Some(cell);
+        self.water_count += 1;
+        true
+    }
+
+    pub(crate) fn push_line(&mut self, line: FireLinePath) -> bool {
+        if (self.line_count as usize) >= FIRE_LINE_QUEUE_CAP { return false; }
+        self.lines[self.line_count as usize] = Some(line);
+        self.line_count += 1;
+        true
+    }
+
+    fn pop_water(&mut self) -> Option<UVec3> {
+        if self.water_count == 0 { return None; }
+        let head = self.water[0].take();
+        for i in 1..self.water_count as usize {
+            self.water[i - 1] = self.water[i];
+        }
+        self.water_count -= 1;
+        self.water[self.water_count as usize] = None;
+        head
+    }
+
+    fn pop_line(&mut self) -> Option<FireLinePath> {
+        if self.line_count == 0 { return None; }
+        let head = self.lines[0].take();
+        for i in 1..self.line_count as usize {
+            self.lines[i - 1] = self.lines[i].take();
+        }
+        self.line_count -= 1;
+        head
+    }
+
+    pub(crate) fn pending_total(&self) -> u32 {
+        self.water_count as u32 + self.line_count as u32
+    }
+    pub(crate) fn pending_water(&self) -> u32 { self.water_count as u32 }
+    pub(crate) fn pending_lines(&self) -> u32 { self.line_count as u32 }
+}
+
+// ── Roster ────────────────────────────────────────────────────────
+
+pub(crate) struct Roster {
+    pub heli:  Helicopter,
+    pub crew:  GroundCrew,
+    pub queue: CommandQueue,
+}
 
 impl Roster {
     pub(crate) fn init() -> Self {
         let heli = Helicopter::init();
         // Spawn the crew on the road just east of the heli pad.
         let crew = GroundCrew::init(HELI_PAD_X + 8, HELI_PAD_Z);
-
-        // Selection marker: a Billboard actor with a 5×5 arrow. Stays
-        // crisp at any zoom and never tilts with the camera.
-        unsafe {
-            let dense = &mut *(&raw mut SELECT_DENSE);
-            for (row_idx, row) in SELECT_BITMAP.iter().enumerate() {
-                for (col_idx, &on) in row.iter().enumerate() {
-                    if on == 0 { continue; }
-                    let lx = col_idx;
-                    let ly = (SELECT_H as usize - 1) - row_idx;
-                    let i = ly * SELECT_W as usize + lx;
-                    dense[i] = M_SELECT_MARKER;
-                }
-            }
-            prefab_define(
-                SELECT_PREFAB,
-                &*(&raw const SELECT_DENSE),
-                U8Vec3::new(SELECT_W, SELECT_H, 1),
-            );
-        }
-        let select_actor = actor_spawn_from(SELECT_PREFAB, Orientation::Up)
-            .expect("select marker actor spawn");
-        actor_set_render_mode(select_actor, ActorRenderMode::Billboard);
-        actor_set_visible(select_actor, false);
-
-        Self {
-            heli,
-            crew,
-            selected: None,
-            select_actor,
-        }
+        Self { heli, crew, queue: CommandQueue::new() }
     }
 
-    /// Tick both units.
+    /// Hand out queued orders to idle units, then tick both units.
+    /// Idle is the only state in which a unit picks up new work, so
+    /// in-flight orders run to completion regardless of what arrives
+    /// later in the queue — matches the no-cancel rule.
     pub(crate) fn tick(&mut self) {
+        if self.heli.is_idle() {
+            if let Some(cell) = self.queue.pop_water() {
+                self.heli.issue_drop(cell);
+            }
+        }
+        if self.crew.is_idle() {
+            if let Some(line) = self.queue.pop_line() {
+                let path = line.as_slice();
+                self.crew.issue_path(&path[..line.count as usize]);
+            }
+        }
         self.heli.tick();
         self.crew.tick();
-        self.update_select_marker();
     }
 
-    pub(crate) fn select_nearest(&mut self, cell: UVec3, max_r: f32) {
-        let cx = cell.x as f32;
-        let cz = cell.z as f32;
-        let d_heli = dist_xz(self.heli.pos, cx, cz);
-        let d_crew = dist_xz(self.crew.pos, cx, cz);
-        // Tighter selection radius than max — both unit centres must
-        // be within max_r of the cursor to count.
-        let mut best: Option<(UnitId, f32)> = None;
-        if d_heli < max_r { best = Some((UnitId::Heli, d_heli)); }
-        if d_crew < max_r {
-            if best.map_or(true, |(_, d)| d_crew < d) {
-                best = Some((UnitId::Crew, d_crew));
-            }
-        }
-        if let Some((id, _)) = best {
-            self.selected = Some(id);
-        }
+    pub(crate) fn dispatch_water_drop(&mut self, cell: UVec3) {
+        self.queue.push_water(cell);
     }
 
-    /// Cycle through the roster: None → Heli → Crew → None.
-    pub(crate) fn cycle_selection(&mut self) {
-        self.selected = match self.selected {
-            None              => Some(UnitId::Heli),
-            Some(UnitId::Heli) => Some(UnitId::Crew),
-            Some(UnitId::Crew) => None,
-        };
-    }
-
-    /// Order the currently-selected unit to act on the cursor cell.
-    pub(crate) fn issue_order(&mut self, cell: UVec3) {
-        match self.selected {
-            Some(UnitId::Heli) => self.heli.issue_drop(cell),
-            Some(UnitId::Crew) => self.crew.issue_move(cell),
-            None => {}
-        }
-    }
-
-    /// Re-position the select-marker actor above the selected unit
-    /// (or hide it).
-    fn update_select_marker(&self) {
-        let (visible, pos) = match self.selected {
-            Some(UnitId::Heli) => (
-                true,
-                Vec3::new(
-                    self.heli.pos.x + HELI_SIZE_X as f32 * 0.5,
-                    self.heli.pos.y + HELI_SIZE_Y as f32 + 2.0,
-                    self.heli.pos.z + HELI_SIZE_Z as f32 * 0.5,
-                ),
-            ),
-            Some(UnitId::Crew) => (
-                true,
-                Vec3::new(self.crew.pos.x, self.crew.pos.y + CREW_SIZE_Y as f32 + 2.0, self.crew.pos.z),
-            ),
-            None => (false, Vec3::new(0.0, 0.0, 0.0)),
-        };
-        actor_set_visible(self.select_actor, visible);
-        if visible {
-            actor_set_position(self.select_actor, pos);
-        }
+    pub(crate) fn dispatch_fire_line(&mut self, points: &[UVec3]) {
+        if points.is_empty() { return; }
+        self.queue.push_line(FireLinePath::from_slice(points));
     }
 }
 
-fn dist_xz(p: Vec3, x: f32, z: f32) -> f32 {
-    let dx = p.x - x;
-    let dz = p.z - z;
-    sqrt(dx * dx + dz * dz)
-}
+#[allow(dead_code)]
+fn _crew_size_hint() -> u8 { CREW_SIZE_Y }
