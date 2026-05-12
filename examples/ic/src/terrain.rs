@@ -231,7 +231,10 @@ fn scatter_pines() {
     let mut rng = Rng::new(crate::scenario::get().forest_rng);
     let mut planted = 0u32;
     let mut tries = 0u32;
-    while planted < 250 && tries < 5000 {
+    // 500 pines × 9-cell canopy ≈ 12% leaf-coverage of the footprint.
+    // At lower counts neighbouring trees rarely touched and fire
+    // burnt itself out per tree without spreading.
+    while planted < 500 && tries < 10_000 {
         tries += 1;
         // Bias north (lower z) a bit so the forest faces the fire.
         let bias_z = rng.unit() * (TOWN_Z as f32 - FOOT_MIN as f32 - 16.0);

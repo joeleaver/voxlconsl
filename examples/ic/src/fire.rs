@@ -26,17 +26,20 @@ use crate::{
 const BURN_SITES_CAP:  usize = 256;
 const SITE_TTL_TICKS:  u32   = 480;
 /// 1-in-N chance per site per tick to launch an ember. Higher =
-/// rarer launches = slower long-distance jumps. Used to sit at 10
-/// (~6 launches/tick at 60 active sites), which combined with the
-/// CA heat spread + wind direct-ignition was a runaway. 30 hits a
-/// "fire grows steadily but isn't a sprint" pace that crews can
-/// realistically race.
-const SITE_LAUNCH_MOD: u32   = 30;
+/// rarer launches = slower long-distance jumps. Original 10 was a
+/// runaway. 30 starved the fire entirely once trees were sparse —
+/// each tree burnt out before chaining. 20 splits the difference:
+/// a tree's ~25 burn sites cumulatively roll ~1.2 launches/tick,
+/// enough to chain into the next tree most of the time without
+/// rocketing through the whole forest.
+const SITE_LAUNCH_MOD: u32   = 20;
 
 const EMBERS_CAP:        usize = 96;
 /// How many ticks an ember stays in the air before snuffing itself
-/// out. Shorter life = fewer landings per launch = less spread.
-const EMBER_TTL_TICKS:   u32   = 200;
+/// out. 280 ticks ≈ 16 s of flight at the cart's tick rate — long
+/// enough to cross a gap between two trees on a still day, much
+/// longer on a strong wind.
+const EMBER_TTL_TICKS:   u32   = 280;
 const EMBER_VEL_XZ:      f32   = 0.40;
 const EMBER_VEL_Y_MIN:   f32   = 0.55;
 const EMBER_VEL_Y_MAX:   f32   = 1.20;
