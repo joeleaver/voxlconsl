@@ -25,11 +25,18 @@ use crate::{
 
 const BURN_SITES_CAP:  usize = 256;
 const SITE_TTL_TICKS:  u32   = 480;
-/// 1-in-N chance per site per tick to launch an ember.
-const SITE_LAUNCH_MOD: u32   = 10;
+/// 1-in-N chance per site per tick to launch an ember. Higher =
+/// rarer launches = slower long-distance jumps. Used to sit at 10
+/// (~6 launches/tick at 60 active sites), which combined with the
+/// CA heat spread + wind direct-ignition was a runaway. 30 hits a
+/// "fire grows steadily but isn't a sprint" pace that crews can
+/// realistically race.
+const SITE_LAUNCH_MOD: u32   = 30;
 
 const EMBERS_CAP:        usize = 96;
-const EMBER_TTL_TICKS:   u32   = 320;
+/// How many ticks an ember stays in the air before snuffing itself
+/// out. Shorter life = fewer landings per launch = less spread.
+const EMBER_TTL_TICKS:   u32   = 200;
 const EMBER_VEL_XZ:      f32   = 0.40;
 const EMBER_VEL_Y_MIN:   f32   = 0.55;
 const EMBER_VEL_Y_MAX:   f32   = 1.20;
@@ -53,9 +60,9 @@ const WIND_STRENGTH_MAX: f32   = 0.95;
 /// its downwind cardinal neighbour at max strength. Scales linearly
 /// with current wind strength so a calm wind is effectively a no-op.
 /// Layers on top of the §10.3 CA's omnidirectional heat spread and
-/// the ember-flight loop — three independent fire propagation paths,
-/// the wind one being the most direction-biased.
-const WIND_SPREAD_RATE:  f32   = 0.04;
+/// the ember-flight loop. Halved from the original 0.04 so the
+/// three vectors don't compound into a runaway.
+const WIND_SPREAD_RATE:  f32   = 0.02;
 
 // World bound checks share this — borrows the host's 512³ scene size.
 const WORLD: u32 = 512;
