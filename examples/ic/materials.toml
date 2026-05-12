@@ -93,13 +93,15 @@ slot  = 11
 name  = "road_dirt"
 color = "tan:1"
 
-# Firebreak — non-flammable dug-up strip. Visually distinct from
-# regular dirt so the player can see crew progress. No flammable
-# flag, so the §10.3 fire propagation stops here.
+# Firebreak — non-flammable dug-up strip. Bright sandy yellow with
+# emission so the laid strip is unmistakable against grass / dirt
+# in the overhead view. No flammable flag → §10.3 fire propagation
+# stops here.
 [[material]]
-slot  = 12
-name  = "firebreak_dirt"
-color = "warm_gray:1"
+slot     = 12
+name     = "firebreak_dirt"
+color    = "yellow:1"
+emission = 6
 
 # ── UI / markers ──────────────────────────────────────────────────
 
@@ -175,4 +177,13 @@ emission = 12
 slot     = 24
 name     = "flash_lose"
 color    = "red:3"
+emission = 12
+
+# Planned-line preview — floating magenta voxels the cart paints
+# along the segments of the player's in-progress fire-line draft.
+# Cleared on commit / cancel.
+[[material]]
+slot     = 25
+name     = "planned_line"
+color    = "magenta:3"
 emission = 12

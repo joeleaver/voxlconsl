@@ -75,6 +75,7 @@ pub(crate) const M_CREW_BODY:        u8 = 18;
 pub(crate) const M_CREW_HELMET:      u8 = 19;
 pub(crate) const M_BUCKET_WATER:     u8 = 20;
 pub(crate) const M_HUD_TEXT:         u8 = 21;
+pub(crate) const M_PLANNED_LINE:     u8 = 25;
 
 // ── Mission tuning ────────────────────────────────────────────────
 
