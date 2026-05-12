@@ -160,6 +160,30 @@ impl Helicopter {
         }
     }
 
+    /// Short label for the heli's current state — shown in the HUD's
+    /// UNIT section. Constrained to ≤ 4 chars to fit the 32-wide
+    /// sidebar at 4 px / glyph.
+    pub(crate) fn state_label(&self) -> &'static str {
+        match self.state {
+            HeliState::Idle           => "IDLE",
+            HeliState::FlyToTarget    => "FLY",
+            HeliState::Dropping(_)    => "DROP",
+            HeliState::FlyToWater     => "RTRN",
+            HeliState::Refilling(_)   => "FILL",
+        }
+    }
+
+    pub(crate) fn bucket_label(&self) -> &'static str {
+        if self.bucket_full { "FULL" } else { "EMPT" }
+    }
+
+    /// (x, z) of the current go-to target if the heli is acting on an
+    /// order, else `None` (idle at the pad).
+    pub(crate) fn target_xz(&self) -> Option<(u32, u32)> {
+        if self.state == HeliState::Idle { return None; }
+        Some((self.target_xz.0 as u32, self.target_xz.1 as u32))
+    }
+
     pub(crate) fn issue_drop(&mut self, target: UVec3) {
         // Target is the cell the player wants water on. Heli flies
         // to it; if the bucket is empty we route through the lake
@@ -317,6 +341,18 @@ impl GroundCrew {
         actor_set_voxel(self.actor, U8Vec3::new(0, 0, 0), M_CREW_BODY);
         actor_set_voxel(self.actor, U8Vec3::new(0, 1, 0), M_CREW_BODY);
         actor_set_voxel(self.actor, U8Vec3::new(0, 2, 0), M_CREW_HELMET);
+    }
+
+    pub(crate) fn state_label(&self) -> &'static str {
+        match self.state {
+            CrewState::Idle      => "IDLE",
+            CrewState::WalkingTo => "WALK",
+        }
+    }
+
+    pub(crate) fn target_xz(&self) -> Option<(u32, u32)> {
+        if self.state == CrewState::Idle { return None; }
+        Some((self.target_xz.0 as u32, self.target_xz.1 as u32))
     }
 
     pub(crate) fn issue_move(&mut self, target: UVec3) {

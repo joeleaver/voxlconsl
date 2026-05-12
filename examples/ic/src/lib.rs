@@ -72,9 +72,6 @@ pub(crate) const M_CREW_BODY:        u8 = 18;
 pub(crate) const M_CREW_HELMET:      u8 = 19;
 pub(crate) const M_BUCKET_WATER:     u8 = 20;
 pub(crate) const M_HUD_TEXT:         u8 = 21;
-pub(crate) const M_HUD_OUTLINE:      u8 = 22;
-pub(crate) const M_FLASH_WIN:        u8 = 23;
-pub(crate) const M_FLASH_LOSE:       u8 = 24;
 
 // ── Mission tuning ────────────────────────────────────────────────
 
@@ -93,10 +90,6 @@ enum Phase {
 static mut PHASE: Phase = Phase::Playing;
 static mut TIME_LEFT_MS: u32 = MISSION_DURATION_MS;
 static mut FIRE_SITES_LAST: u32 = 0;
-
-/// Read by hud.rs to display the FIRE NN line. Updated each frame
-/// after the fire state ticks.
-pub(crate) fn fire_sites_sampled() -> u32 { unsafe { FIRE_SITES_LAST } }
 
 static mut CAMERA: camera::Camera = camera::Camera::new(0.0, 0.0);
 static mut CURSOR: cursor::Cursor = cursor::Cursor::new(0.0, 0.0);
@@ -224,22 +217,56 @@ pub extern "C" fn update(dt_ms: u32) {
     // HUD paints regardless of phase so the player can see the
     // final timer + dot state on the end screen.
     let alive_mask = surviving_mask();
-    let unit_label = unsafe {
-        match &*(&raw const ROSTER) {
-            Some(r) => match r.selected {
-                Some(units::UnitId::Heli) => "HELI",
-                Some(units::UnitId::Crew) => "CREW",
-                None                      => "NONE",
-            },
-            None => "NONE",
-        }
-    };
-    unsafe {
-        (&mut *(&raw mut HUD)).paint(
-            TIME_LEFT_MS,
-            alive_mask,
-            unit_label,
-        );
+    let ctx = unsafe { build_hud_ctx(alive_mask) };
+    unsafe { (&mut *(&raw mut HUD)).paint(ctx); }
+}
+
+unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
+    let roster_ref = unsafe { &*(&raw const ROSTER) };
+    let (selected, unit_label, unit_state, bucket, heli_target, crew_target) =
+        match roster_ref {
+            Some(r) => {
+                let heli_target = r.heli.target_xz();
+                let crew_target = r.crew.target_xz();
+                match r.selected {
+                    Some(units::UnitId::Heli) => (
+                        Some(units::UnitId::Heli),
+                        "HELI",
+                        r.heli.state_label(),
+                        r.heli.bucket_label(),
+                        heli_target,
+                        crew_target,
+                    ),
+                    Some(units::UnitId::Crew) => (
+                        Some(units::UnitId::Crew),
+                        "CREW",
+                        r.crew.state_label(),
+                        "",
+                        heli_target,
+                        crew_target,
+                    ),
+                    None => (
+                        None,
+                        "NONE",
+                        "-",
+                        "",
+                        heli_target,
+                        crew_target,
+                    ),
+                }
+            }
+            None => (None, "NONE", "-", "", None, None),
+        };
+    hud::HudCtx {
+        time_left_ms: unsafe { TIME_LEFT_MS },
+        alive_mask,
+        fire_sites:   unsafe { FIRE_SITES_LAST },
+        selected,
+        unit_label,
+        unit_state,
+        heli_bucket: bucket,
+        heli_target,
+        crew_target,
     }
 }
 
