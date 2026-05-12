@@ -15,6 +15,7 @@
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::physics;
 
+use crate::mathlib::{cosine, sine};
 use crate::rng::Rng;
 use crate::{
     M_CABIN_ROOF, M_CABIN_WOOD, M_EMBER, M_FIRE, M_PINE_LEAVES, M_PINE_WOOD,
@@ -33,6 +34,20 @@ const EMBER_VEL_XZ:      f32   = 0.40;
 const EMBER_VEL_Y_MIN:   f32   = 0.55;
 const EMBER_VEL_Y_MAX:   f32   = 1.20;
 const EMBER_GRAVITY:     f32   = 0.040;
+
+/// Max wind contribution to an ember's initial XZ velocity, at
+/// strength = 1.0. Tuned to dominate the random component
+/// (EMBER_VEL_XZ = 0.40) so a strong wind unmistakably pushes the
+/// fire front in one direction.
+const WIND_MAX_SPEED:    f32   = 0.60;
+
+/// Wind drifts on a slow clock so the player has time to read the
+/// HUD between changes. ~3 s at the cart's ~17 fps tick rate.
+const WIND_DRIFT_TICKS:  u32   = 50;
+const WIND_ANGLE_JITTER: f32   = 0.30;       // ±rad per drift step
+const WIND_STRENGTH_JITTER: f32 = 0.12;
+const WIND_STRENGTH_MIN: f32   = 0.10;
+const WIND_STRENGTH_MAX: f32   = 0.95;
 
 // World bound checks share this — borrows the host's 512³ scene size.
 const WORLD: u32 = 512;
@@ -53,14 +68,28 @@ pub(crate) struct FireState {
     burn_sites: [Option<(UVec3, u32)>; BURN_SITES_CAP],
     embers:     [Ember; EMBERS_CAP],
     rng:        Rng,
-    /// Wind direction in voxels-per-tick. Updated each tick — see
-    /// `tick`. Always points toward the town in Phase 1; future
-    /// scenarios can rotate it.
-    pub wind:   Vec3,
+    /// Cached XZ wind vector derived from `wind_angle` + `wind_strength`
+    /// every drift step. Embers add this to their initial velocity.
+    wind:   Vec3,
+    /// Direction the wind is *blowing toward*, in radians. `0` = north
+    /// (toward -Z); `+π/2` = east (toward +X). Matches the
+    /// camera-relative basis so a wind angle of 3π/4 (south-east) on
+    /// the HUD shows embers drifting toward the bottom-right of the
+    /// screen.
+    wind_angle:    f32,
+    wind_strength: f32,
+    wind_tick:     u32,
 }
 
 impl FireState {
     pub(crate) const fn new() -> Self {
+        // SE-bound wind aimed roughly at the town's heading. Each
+        // mission starts here and drifts from this anchor.
+        let wind_angle = 3.0 * core::f32::consts::FRAC_PI_4;
+        let wind_strength = 0.4_f32;
+        // wind_xz derived from angle/strength but core::f32::cos
+        // isn't const, so the cached vector starts at zero and gets
+        // filled on the first `tick`.
         Self {
             burn_sites: [None; BURN_SITES_CAP],
             embers: [Ember {
@@ -72,8 +101,73 @@ impl FireState {
                 painted: false,
             }; EMBERS_CAP],
             rng: Rng(0xC0FF_EE17),
-            wind: Vec3 { x: 0.15, y: 0.0, z: 0.20 },
+            wind: Vec3 { x: 0.0, y: 0.0, z: 0.0 },
+            wind_angle,
+            wind_strength,
+            wind_tick: 0,
         }
+    }
+
+    /// Current wind in voxels/tick (XZ plane only). Embers sample
+    /// this at launch.
+    pub(crate) fn wind(&self) -> Vec3 { self.wind }
+
+    pub(crate) fn wind_angle_rad(&self) -> f32 { self.wind_angle }
+    pub(crate) fn wind_strength(&self) -> f32 { self.wind_strength }
+
+    /// 8-sector cardinal label for the wind's *blow-toward*
+    /// direction. Quantised into 45° wedges aligned so the HUD's
+    /// "S" lines up with screen-down for a north-up camera.
+    pub(crate) fn wind_direction_label(&self) -> &'static str {
+        let mut a = self.wind_angle;
+        let tau = core::f32::consts::TAU;
+        while a < 0.0 { a += tau; }
+        while a >= tau { a -= tau; }
+        let sector = ((a + core::f32::consts::FRAC_PI_8) / core::f32::consts::FRAC_PI_4) as u32;
+        match sector % 8 {
+            0 => "N",
+            1 => "NE",
+            2 => "E",
+            3 => "SE",
+            4 => "S",
+            5 => "SW",
+            6 => "W",
+            7 => "NW",
+            _ => "?",
+        }
+    }
+
+    /// Strength as a single digit 0..9 for the sidebar readout.
+    pub(crate) fn wind_strength_digit(&self) -> u32 {
+        let clamped = self.wind_strength.clamp(0.0, 1.0);
+        // `f32::round` isn't available in no_std without libm. Manual
+        // round-half-to-even isn't worth the bytes; nearest-integer
+        // via `+ 0.5` is good enough for a 0..9 display.
+        ((clamped * 9.0) + 0.5) as u32
+    }
+
+    fn refresh_wind_vec(&mut self) {
+        // `angle = 0` → north → wind blows toward -Z, so wz negative.
+        // angle = π/2 → east → wx positive.
+        let s = self.wind_strength.clamp(0.0, 1.0) * WIND_MAX_SPEED;
+        let wx =  sine(self.wind_angle)   * s;
+        let wz = -cosine(self.wind_angle) * s;
+        self.wind = Vec3::new(wx, 0.0, wz);
+    }
+
+    fn tick_wind(&mut self) {
+        self.wind_tick = self.wind_tick.wrapping_add(1);
+        if self.wind_tick < WIND_DRIFT_TICKS && self.wind != Vec3::ZERO {
+            return;
+        }
+        self.wind_tick = 0;
+        // Nudge angle (signed) + strength (signed, clamped).
+        let a_delta = self.rng.signed() * WIND_ANGLE_JITTER;
+        let s_delta = self.rng.signed() * WIND_STRENGTH_JITTER;
+        self.wind_angle += a_delta;
+        self.wind_strength = (self.wind_strength + s_delta)
+            .clamp(WIND_STRENGTH_MIN, WIND_STRENGTH_MAX);
+        self.refresh_wind_vec();
     }
 
     pub(crate) fn add_burn_site(&mut self, pos: UVec3) {
@@ -155,9 +249,10 @@ impl FireState {
         }
     }
 
-    /// One full tick: discover newly propagated fire, roll launches,
-    /// step every airborne ember.
+    /// One full tick: drift wind, discover newly propagated fire,
+    /// roll launches, step every airborne ember.
     pub(crate) fn tick(&mut self) {
+        self.tick_wind();
         self.discover_propagated_fire();
 
         // Roll each site.

@@ -223,6 +223,9 @@ pub extern "C" fn update(dt_ms: u32) {
 
 unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
     let roster_ref = unsafe { &*(&raw const ROSTER) };
+    let fire_ref   = unsafe { &*(&raw const FIRE_STATE) };
+    let wind_dir = fire_ref.wind_direction_label();
+    let wind_strength = fire_ref.wind_strength_digit();
     let (selected, unit_label, unit_state, bucket, heli_target, crew_target) =
         match roster_ref {
             Some(r) => {
@@ -261,6 +264,8 @@ unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
         time_left_ms: unsafe { TIME_LEFT_MS },
         alive_mask,
         fire_sites:   unsafe { FIRE_SITES_LAST },
+        wind_dir,
+        wind_strength,
         selected,
         unit_label,
         unit_state,

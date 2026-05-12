@@ -65,9 +65,11 @@ fn section_y(s: Section) -> f32 {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct StatusKey {
-    t_sec:  u32,
-    alive:  u32,
-    fire:   u32,
+    t_sec:    u32,
+    alive:    u32,
+    fire:     u32,
+    wind_dir: [u8; 2],   // padded with space when 1-letter
+    wind_str: u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -141,10 +143,15 @@ impl Hud {
     }
 
     fn paint_status(&mut self, ctx: &HudCtx<'_>) {
+        let wind_bytes = ctx.wind_dir.as_bytes();
+        let mut wind_dir = [b' '; 2];
+        for i in 0..2.min(wind_bytes.len()) { wind_dir[i] = wind_bytes[i]; }
         let key = StatusKey {
-            t_sec: ctx.time_left_ms / 1000,
-            alive: ctx.alive_mask.count_ones(),
-            fire:  ctx.fire_sites,
+            t_sec:    ctx.time_left_ms / 1000,
+            alive:    ctx.alive_mask.count_ones(),
+            fire:     ctx.fire_sites,
+            wind_dir,
+            wind_str: ctx.wind_strength,
         };
         if self.status_cache == Some(key) { return; }
         self.status_cache = Some(key);
@@ -158,6 +165,8 @@ impl Hud {
         paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, s);
         let s = format_fire(&mut buf, key.fire);
         paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
+        let s = format_wind(&mut buf, ctx.wind_dir, ctx.wind_strength);
+        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, s);
     }
 
     fn paint_unit(&mut self, ctx: &HudCtx<'_>) {
@@ -214,15 +223,17 @@ impl Hud {
 /// Per-frame inputs the cart hands to `Hud::paint`. Bundled into a
 /// struct so the call site doesn't drift if we add more fields.
 pub(crate) struct HudCtx<'a> {
-    pub time_left_ms: u32,
-    pub alive_mask:   u32,
-    pub fire_sites:   u32,
-    pub selected:     Option<UnitId>,
-    pub unit_label:   &'a str,
-    pub unit_state:   &'a str,
-    pub heli_bucket:  &'a str,
-    pub heli_target:  Option<(u32, u32)>,
-    pub crew_target:  Option<(u32, u32)>,
+    pub time_left_ms:  u32,
+    pub alive_mask:    u32,
+    pub fire_sites:    u32,
+    pub wind_dir:      &'a str,
+    pub wind_strength: u32,        // 0..9
+    pub selected:      Option<UnitId>,
+    pub unit_label:    &'a str,
+    pub unit_state:    &'a str,
+    pub heli_bucket:   &'a str,
+    pub heli_target:   Option<(u32, u32)>,
+    pub crew_target:   Option<(u32, u32)>,
 }
 
 fn unit_key_from_ctx(ctx: &HudCtx<'_>) -> UnitKey {
@@ -295,6 +306,23 @@ fn format_town<'a>(buf: &'a mut [u8], alive: u32) -> &'a str {
     buf[4] = b'/';
     buf[5] = b'6';
     core::str::from_utf8(&buf[..6]).unwrap_or("")
+}
+
+/// `WD SE 3` — direction (1-2 chars) followed by single-digit
+/// strength. Eight chars max so it fits a 32-wide panel at 4 px /
+/// glyph.
+fn format_wind<'a>(buf: &'a mut [u8], dir: &str, strength: u32) -> &'a str {
+    buf[..3].copy_from_slice(b"WD ");
+    let dir_bytes = dir.as_bytes();
+    let n = dir_bytes.len().min(2);
+    buf[3..3 + n].copy_from_slice(&dir_bytes[..n]);
+    let mut len = 3 + n;
+    if len < buf.len() { buf[len] = b' '; len += 1; }
+    if len < buf.len() {
+        buf[len] = b'0' + (strength.min(9)) as u8;
+        len += 1;
+    }
+    core::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 
 fn format_fire<'a>(buf: &'a mut [u8], sites: u32) -> &'a str {
