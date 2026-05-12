@@ -116,12 +116,16 @@ static mut ROSTER: Option<units::Roster> = None;
 static mut PAN_ACTION:    ActionHandle = ActionHandle(0);
 static mut AIM_ACTION:    ActionHandle = ActionHandle(0);
 static mut ZOOM_ACTION:   ActionHandle = ActionHandle(0);
-/// PRIMARY — queue a water drop, or append a fire-line point.
-static mut ORDER_ACTION:  ActionHandle = ActionHandle(0);
-/// SECONDARY — toggle fire-line drafting mode.
-static mut MODE_ACTION:   ActionHandle = ActionHandle(0);
-/// CONFIRM — commit the fire-line draft into the queue.
+/// PRIMARY (J) — queue a water drop at the cursor cell.
+static mut DROP_ACTION:   ActionHandle = ActionHandle(0);
+/// SECONDARY (K) — append a fire-line point at the cursor cell.
+/// Press repeatedly to draft up to LINE_CAP points.
+static mut LINE_ACTION:   ActionHandle = ActionHandle(0);
+/// CONFIRM (Enter) — commit the current fire-line draft into the
+/// queue. Empty drafts no-op.
 static mut COMMIT_ACTION: ActionHandle = ActionHandle(0);
+/// CANCEL (Esc) — discard the current fire-line draft.
+static mut CANCEL_ACTION: ActionHandle = ActionHandle(0);
 
 static mut LINE_MODE: line_mode::LineMode = line_mode::LineMode::new();
 static mut QUEUE_MARKERS: queue_markers::QueueMarkers = queue_markers::QueueMarkers::new();
@@ -179,9 +183,10 @@ fn register_actions() {
         PAN_ACTION    = input_declare_action(ActionKind::Axis2D, BindingHint::PrimaryMovement, "pan");
         AIM_ACTION    = input_declare_action(ActionKind::Axis2D, BindingHint::Aim, "cursor");
         ZOOM_ACTION   = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom, "zoom");
-        ORDER_ACTION  = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "order");
-        MODE_ACTION   = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "line_mode");
+        DROP_ACTION   = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "drop");
+        LINE_ACTION   = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "line_point");
         COMMIT_ACTION = input_declare_action(ActionKind::Button, BindingHint::Confirm, "commit");
+        CANCEL_ACTION = input_declare_action(ActionKind::Button, BindingHint::Cancel, "cancel");
     }
 }
 
@@ -204,57 +209,54 @@ pub extern "C" fn update(dt_ms: u32) {
 
     // Input edges. Reading once per frame keeps the cart deterministic
     // regardless of how many times `_pressed` would echo.
-    let pressed_order  = input_action_pressed(unsafe { ORDER_ACTION });
-    let pressed_mode   = input_action_pressed(unsafe { MODE_ACTION });
+    let pressed_drop   = input_action_pressed(unsafe { DROP_ACTION });
+    let pressed_line   = input_action_pressed(unsafe { LINE_ACTION });
     let pressed_commit = input_action_pressed(unsafe { COMMIT_ACTION });
+    let pressed_cancel = input_action_pressed(unsafe { CANCEL_ACTION });
 
     let phase = unsafe { PHASE };
     if phase == Phase::Playing {
-        // SECONDARY (K) toggles fire-line drafting mode. Exiting via
-        // K discards the in-progress polyline (orders are
-        // non-cancellable, but a *draft* still in the player's head
-        // never reaches the queue, so dropping it here is fair).
-        if pressed_mode {
-            unsafe {
-                let lm = &mut *(&raw mut LINE_MODE);
-                lm.active = !lm.active;
-                if !lm.active { lm.clear(); }
-            }
-        }
-
-        // PRIMARY (J) does double duty based on mode:
-        //   normal mode → queue a water drop at the cursor cell
-        //   line mode   → append the cursor cell to the draft line
-        if pressed_order {
+        // PRIMARY (J) — queue a water drop at the cursor cell.
+        // Always: the heli's order queue is independent of any
+        // fire-line draft.
+        if pressed_drop {
             let (cx, cz) = cur.cell();
             let cy = cur.marker_y();
-            let p = UVec3::new(cx, cy, cz);
-            unsafe {
-                let lm = &mut *(&raw mut LINE_MODE);
-                if lm.active {
-                    lm.push_point(p);
-                } else if let Some(roster) = &mut *(&raw mut ROSTER) {
-                    roster.dispatch_water_drop(p);
-                }
+            if let Some(roster) = unsafe { &mut *(&raw mut ROSTER) } {
+                roster.dispatch_water_drop(UVec3::new(cx, cy, cz));
             }
         }
 
-        // CONFIRM (Enter) finalises the draft polyline (line mode
-        // only). Empty drafts no-op. After commit, line mode is
-        // implicitly exited.
+        // SECONDARY (K) — append a fire-line point at the cursor cell.
+        // Each press adds one point; the player taps K repeatedly
+        // while panning the cursor to draft a polyline.
+        if pressed_line {
+            let (cx, cz) = cur.cell();
+            let cy = cur.marker_y();
+            unsafe {
+                (&mut *(&raw mut LINE_MODE)).push_point(UVec3::new(cx, cy, cz));
+            }
+        }
+
+        // CONFIRM (Enter) — commit the current fire-line draft.
+        // Empty drafts no-op.
         if pressed_commit {
             unsafe {
                 let lm = &mut *(&raw mut LINE_MODE);
-                if lm.active && lm.count > 0 {
+                if lm.count > 0 {
                     let mut buf = [UVec3::ZERO; line_mode::LINE_CAP];
                     let n = lm.copy_points_into(&mut buf);
                     if let Some(roster) = &mut *(&raw mut ROSTER) {
                         roster.dispatch_fire_line(&buf[..n]);
                     }
                     lm.clear();
-                    lm.active = false;
                 }
             }
+        }
+
+        // CANCEL (Esc) — discard the current draft without queueing.
+        if pressed_cancel {
+            unsafe { (&mut *(&raw mut LINE_MODE)).clear(); }
         }
 
         unsafe {
@@ -315,7 +317,7 @@ unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
         crew_busy,
         crew_total,
         tier: s.tier as u32,
-        line_mode_active: line_ref.active,
+        line_mode_active: line_ref.is_drafting(),
         line_mode_count:  line_ref.count as u32,
         queue_total,
     }

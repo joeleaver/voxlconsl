@@ -1,14 +1,20 @@
-//! Fire-line drafting mode. The player toggles in with SECONDARY (K),
-//! drops points with PRIMARY (J), and commits the draft with CONFIRM
-//! (Enter). Each drafted point gets a Billboard marker so the polyline
-//! is visible while it's being assembled. On commit, the points are
-//! handed to the Roster as a single FireLine command — the queue takes
-//! it from there.
+//! Fire-line drafting. The player presses K once per point they want
+//! the crew to walk through; ENTER commits the draft as a single
+//! FireLine command on the queue; ESC discards it.
 //!
-//! Cancelling the draft (toggling out via SECONDARY again before
-//! committing) discards the points without enqueueing — the draft
-//! never reached the queue, so it isn't a "cancellation" of any
-//! committed order.
+//! No "mode toggle": every K press is a point-drop, every ENTER is
+//! a commit. The HUD shows the in-progress draft count
+//! (`LN n/8`) so the player can see they're mid-draft; an idle
+//! line has count == 0.
+//!
+//! Each drafted point gets a Billboard marker plus a magenta
+//! preview line painted in the air above the terrain between
+//! consecutive points, so the player can see the polyline shape
+//! before committing.
+//!
+//! Discarding a draft pre-commit is fine — the points never reached
+//! the queue. Once committed, the order is non-cancellable per the
+//! cart's gameplay rules.
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::physics;
@@ -42,7 +48,6 @@ const MARKER_BITMAP: [[u8; MARKER_W as usize]; MARKER_H as usize] = [
 static mut MARKER_DENSE: [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
 
 pub(crate) struct LineMode {
-    pub active: bool,
     pub count:  u8,
     points:     [UVec3; LINE_CAP],
     markers:    [Option<ActorId>; LINE_CAP],
@@ -57,7 +62,6 @@ pub(crate) struct LineMode {
 impl LineMode {
     pub(crate) const fn new() -> Self {
         Self {
-            active:  false,
             count:   0,
             points:  [UVec3 { x: 0, y: 0, z: 0 }; LINE_CAP],
             markers: [None; LINE_CAP],
@@ -65,6 +69,10 @@ impl LineMode {
             preview_count: 0,
         }
     }
+
+    /// True when the player has drafted ≥ 1 point but hasn't yet
+    /// committed or cancelled — drives the HUD's `LN n/8` line.
+    pub(crate) fn is_drafting(&self) -> bool { self.count > 0 }
 
     /// Register the marker prefab + spawn the actor pool once at
     /// boot. Each marker starts hidden; `push_point` re-positions
