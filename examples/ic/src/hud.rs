@@ -227,10 +227,10 @@ impl Hud {
     fn paint_help(&mut self) {
         let actor = match self.actors[Section::Help as usize] { Some(a) => a, None => return };
         actor_clear(actor);
-        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "J DROP");
-        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, "K ADD");
-        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, "ENT GO");
-        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, "ESC X");
+        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "J ACT");
+        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, "K NEXT");
+        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, "ESC X");
+        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, "WSAD");
     }
 }
 

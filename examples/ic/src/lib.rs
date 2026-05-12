@@ -40,6 +40,7 @@
 
 use voxlconsl_sdk::*;
 
+mod action_wheel;
 mod camera;
 mod cursor;
 mod fire;
@@ -116,19 +117,34 @@ static mut ROSTER: Option<units::Roster> = None;
 static mut PAN_ACTION:    ActionHandle = ActionHandle(0);
 static mut AIM_ACTION:    ActionHandle = ActionHandle(0);
 static mut ZOOM_ACTION:   ActionHandle = ActionHandle(0);
-/// PRIMARY (J) — queue a water drop at the cursor cell.
+/// PRIMARY (J) — context-sensitive interact verb. Idle: open the
+/// action wheel. WheelOpen: confirm the highlighted option.
+/// LineDrafting: append the next fire-line point.
 static mut DROP_ACTION:   ActionHandle = ActionHandle(0);
-/// SECONDARY (K) — append a fire-line point at the cursor cell.
-/// Press repeatedly to draft up to LINE_CAP points.
+/// SECONDARY (K) — also context-sensitive. WheelOpen: cycle to the
+/// next option. LineDrafting: commit the draft to the queue.
+/// Idle: no-op.
 static mut LINE_ACTION:   ActionHandle = ActionHandle(0);
-/// CONFIRM (Enter) — commit the current fire-line draft into the
-/// queue. Empty drafts no-op.
-static mut COMMIT_ACTION: ActionHandle = ActionHandle(0);
-/// CANCEL (Esc) — discard the current fire-line draft.
+/// CANCEL (Esc) — closes the wheel or discards the current draft.
 static mut CANCEL_ACTION: ActionHandle = ActionHandle(0);
 
 static mut LINE_MODE: line_mode::LineMode = line_mode::LineMode::new();
 static mut QUEUE_MARKERS: queue_markers::QueueMarkers = queue_markers::QueueMarkers::new();
+static mut ACTION_WHEEL: action_wheel::ActionWheel = action_wheel::ActionWheel::new();
+static mut INTERACTION: InteractionMode = InteractionMode::Idle;
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum InteractionMode {
+    /// No order in progress. J opens the action wheel.
+    Idle,
+    /// Wheel open, anchored at a captured cursor cell. K cycles
+    /// options, J confirms, ESC closes.
+    WheelOpen,
+    /// Fire-line draft underway after picking LINE from the wheel.
+    /// J adds the next point at the current cursor cell, K commits,
+    /// ESC cancels.
+    LineDrafting,
+}
 
 // ── Boot ─────────────────────────────────────────────────────────
 
@@ -166,6 +182,7 @@ pub extern "C" fn init() {
         (&mut *(&raw mut CURSOR)).init();
         (&mut *(&raw mut LINE_MODE)).init();
         (&mut *(&raw mut QUEUE_MARKERS)).init();
+        (&mut *(&raw mut ACTION_WHEEL)).init();
     }
 
     // First fire — seed it now so the player sees smoke from the
@@ -183,10 +200,66 @@ fn register_actions() {
         PAN_ACTION    = input_declare_action(ActionKind::Axis2D, BindingHint::PrimaryMovement, "pan");
         AIM_ACTION    = input_declare_action(ActionKind::Axis2D, BindingHint::Aim, "cursor");
         ZOOM_ACTION   = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom, "zoom");
-        DROP_ACTION   = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "drop");
-        LINE_ACTION   = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "line_point");
-        COMMIT_ACTION = input_declare_action(ActionKind::Button, BindingHint::Confirm, "commit");
+        DROP_ACTION   = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "primary");
+        LINE_ACTION   = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "secondary");
         CANCEL_ACTION = input_declare_action(ActionKind::Button, BindingHint::Cancel, "cancel");
+    }
+}
+
+/// Dispatch J / K / ESC presses through the interaction state
+/// machine. Mode-specific behaviour is documented on
+/// `InteractionMode` and `action_wheel::ActionWheel`.
+unsafe fn handle_interaction(cursor_cell: UVec3, j: bool, k: bool, esc: bool) {
+    let mode = unsafe { INTERACTION };
+    let lm     = unsafe { &mut *(&raw mut LINE_MODE) };
+    let wheel  = unsafe { &mut *(&raw mut ACTION_WHEEL) };
+    let roster = unsafe { &mut *(&raw mut ROSTER) };
+
+    match mode {
+        InteractionMode::Idle => {
+            if j {
+                wheel.open_at(cursor_cell);
+                unsafe { INTERACTION = InteractionMode::WheelOpen; }
+            }
+        }
+        InteractionMode::WheelOpen => {
+            if esc {
+                wheel.close();
+                unsafe { INTERACTION = InteractionMode::Idle; }
+            } else if k {
+                wheel.cycle_next();
+            } else if j {
+                match wheel.current_choice() {
+                    action_wheel::WheelChoice::WaterDrop => {
+                        if let Some(r) = roster { r.dispatch_water_drop(wheel.anchor); }
+                        wheel.close();
+                        unsafe { INTERACTION = InteractionMode::Idle; }
+                    }
+                    action_wheel::WheelChoice::FireLine => {
+                        // First fire-line point is the wheel's anchor.
+                        lm.push_point(wheel.anchor);
+                        wheel.close();
+                        unsafe { INTERACTION = InteractionMode::LineDrafting; }
+                    }
+                }
+            }
+        }
+        InteractionMode::LineDrafting => {
+            if esc {
+                lm.clear();
+                unsafe { INTERACTION = InteractionMode::Idle; }
+            } else if k {
+                if lm.count > 0 {
+                    let mut buf = [UVec3::ZERO; line_mode::LINE_CAP];
+                    let n = lm.copy_points_into(&mut buf);
+                    if let Some(r) = roster { r.dispatch_fire_line(&buf[..n]); }
+                    lm.clear();
+                }
+                unsafe { INTERACTION = InteractionMode::Idle; }
+            } else if j {
+                lm.push_point(cursor_cell);
+            }
+        }
     }
 }
 
@@ -207,57 +280,19 @@ pub extern "C" fn update(dt_ms: u32) {
     cam.update(mx, my, zoom, dt);
     cur.pan(ax, ay, cam.cursor_speed());
 
-    // Input edges. Reading once per frame keeps the cart deterministic
-    // regardless of how many times `_pressed` would echo.
-    let pressed_drop   = input_action_pressed(unsafe { DROP_ACTION });
-    let pressed_line   = input_action_pressed(unsafe { LINE_ACTION });
-    let pressed_commit = input_action_pressed(unsafe { COMMIT_ACTION });
-    let pressed_cancel = input_action_pressed(unsafe { CANCEL_ACTION });
+    // Input edges. J / K become contextual via the InteractionMode
+    // state machine — see action_wheel.rs for the user-facing model.
+    let pressed_j   = input_action_pressed(unsafe { DROP_ACTION });
+    let pressed_k   = input_action_pressed(unsafe { LINE_ACTION });
+    let pressed_esc = input_action_pressed(unsafe { CANCEL_ACTION });
 
     let phase = unsafe { PHASE };
     if phase == Phase::Playing {
-        // PRIMARY (J) — queue a water drop at the cursor cell.
-        // Always: the heli's order queue is independent of any
-        // fire-line draft.
-        if pressed_drop {
+        let cursor_cell = {
             let (cx, cz) = cur.cell();
-            let cy = cur.marker_y();
-            if let Some(roster) = unsafe { &mut *(&raw mut ROSTER) } {
-                roster.dispatch_water_drop(UVec3::new(cx, cy, cz));
-            }
-        }
-
-        // SECONDARY (K) — append a fire-line point at the cursor cell.
-        // Each press adds one point; the player taps K repeatedly
-        // while panning the cursor to draft a polyline.
-        if pressed_line {
-            let (cx, cz) = cur.cell();
-            let cy = cur.marker_y();
-            unsafe {
-                (&mut *(&raw mut LINE_MODE)).push_point(UVec3::new(cx, cy, cz));
-            }
-        }
-
-        // CONFIRM (Enter) — commit the current fire-line draft.
-        // Empty drafts no-op.
-        if pressed_commit {
-            unsafe {
-                let lm = &mut *(&raw mut LINE_MODE);
-                if lm.count > 0 {
-                    let mut buf = [UVec3::ZERO; line_mode::LINE_CAP];
-                    let n = lm.copy_points_into(&mut buf);
-                    if let Some(roster) = &mut *(&raw mut ROSTER) {
-                        roster.dispatch_fire_line(&buf[..n]);
-                    }
-                    lm.clear();
-                }
-            }
-        }
-
-        // CANCEL (Esc) — discard the current draft without queueing.
-        if pressed_cancel {
-            unsafe { (&mut *(&raw mut LINE_MODE)).clear(); }
-        }
+            UVec3::new(cx, cur.marker_y(), cz)
+        };
+        unsafe { handle_interaction(cursor_cell, pressed_j, pressed_k, pressed_esc); }
 
         unsafe {
             let fire = &mut *(&raw mut FIRE_STATE);
@@ -279,6 +314,9 @@ pub extern "C" fn update(dt_ms: u32) {
     // Cursor render is last so it sits on top of any fresh
     // ember / water / firebreak voxels painted this frame.
     cur.render();
+    // Wheel render no-ops when the wheel is closed; otherwise
+    // repaints only on selection change.
+    unsafe { (&mut *(&raw mut ACTION_WHEEL)).render(); }
 
     // HUD paints regardless of phase so the player can see the
     // final timer + dot state on the end screen.
