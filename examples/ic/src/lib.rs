@@ -46,6 +46,7 @@ mod fire;
 mod hud;
 mod line_mode;
 mod mathlib;
+mod queue_markers;
 mod rng;
 mod scenario;
 mod terrain;
@@ -85,6 +86,11 @@ const WIN_STRUCTURE_THRESHOLD: u32 = 4;         // need 4 of 6 alive at expiry
 /// Future work: surface as a URL param / cart arg.
 const MISSION_SEED: u32 = 0xA1F0_5E57;
 
+/// Difficulty tier (1..). Tier 1 = crews only; tier 2 unlocks the
+/// helicopter; tier 3 doubles up. See `Scenario::budget_for_tier`
+/// for the full table.
+const MISSION_TIER: u8 = 2;
+
 // ── Game state ───────────────────────────────────────────────────
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -117,6 +123,7 @@ static mut MODE_ACTION:   ActionHandle = ActionHandle(0);
 static mut COMMIT_ACTION: ActionHandle = ActionHandle(0);
 
 static mut LINE_MODE: line_mode::LineMode = line_mode::LineMode::new();
+static mut QUEUE_MARKERS: queue_markers::QueueMarkers = queue_markers::QueueMarkers::new();
 
 // ── Boot ─────────────────────────────────────────────────────────
 
@@ -131,9 +138,9 @@ pub extern "C" fn init() {
     // give the terrain depth from the high overhead view.
     light_set_sun(Vec3::new(-0.5, -0.6, 0.6), 0, 0);
 
-    // Pick a scenario seed and lock it in before any world / fire
-    // state initialisation reads from it.
-    scenario::init(MISSION_SEED);
+    // Pick a scenario seed + tier and lock them in before any
+    // world / fire / roster initialisation reads from them.
+    scenario::init(MISSION_SEED, MISSION_TIER);
 
     // Reserve the left 36 pixels of the framebuffer for the
     // sidebar: the world ray-march skips that strip entirely.
@@ -147,11 +154,13 @@ pub extern "C" fn init() {
     unsafe {
         CAMERA = camera::Camera::new(focus_x, focus_z);
         CURSOR = cursor::Cursor::new(focus_x, focus_z - 8.0);
-        ROSTER = Some(units::Roster::init());
+        let s = scenario::get();
+        ROSTER = Some(units::Roster::init(s.heli_count, s.crew_count));
         register_actions();
         (&mut *(&raw mut HUD)).init();
         (&mut *(&raw mut CURSOR)).init();
         (&mut *(&raw mut LINE_MODE)).init();
+        (&mut *(&raw mut QUEUE_MARKERS)).init();
     }
 
     // First fire — seed it now so the player sees smoke from the
@@ -253,6 +262,8 @@ pub extern "C" fn update(dt_ms: u32) {
             FIRE_SITES_LAST = fire.burn_site_count();
             if let Some(roster) = &mut *(&raw mut ROSTER) {
                 roster.tick();
+                let markers = &mut *(&raw mut QUEUE_MARKERS);
+                markers.update(&roster.queue);
             }
         }
 
@@ -277,24 +288,19 @@ unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
     let roster_ref = unsafe { &*(&raw const ROSTER) };
     let fire_ref   = unsafe { &*(&raw const FIRE_STATE) };
     let line_ref   = unsafe { &*(&raw const LINE_MODE) };
+    let s          = scenario::get();
 
     let wind_dir = fire_ref.wind_direction_label();
     let wind_strength = fire_ref.wind_strength_digit();
 
-    let (heli_state, heli_bucket, crew_state, heli_target, crew_target,
-         queue_total, queue_water, queue_lines) =
+    let (heli_busy, heli_total, crew_busy, crew_total, queue_total) =
         match roster_ref {
             Some(r) => (
-                r.heli.state_label(),
-                r.heli.bucket_label(),
-                r.crew.state_label(),
-                r.heli.target_xz(),
-                r.crew.target_xz(),
+                r.heli_busy(), r.heli_total(),
+                r.crew_busy(), r.crew_total(),
                 r.queue.pending_total(),
-                r.queue.pending_water(),
-                r.queue.pending_lines(),
             ),
-            None => ("-", "-", "-", None, None, 0, 0, 0),
+            None => (0, 0, 0, 0, 0),
         };
 
     hud::HudCtx {
@@ -303,16 +309,14 @@ unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
         fire_sites:   unsafe { FIRE_SITES_LAST },
         wind_dir,
         wind_strength,
-        heli_state,
-        heli_bucket,
-        crew_state,
-        heli_target,
-        crew_target,
+        heli_busy,
+        heli_total,
+        crew_busy,
+        crew_total,
+        tier: s.tier as u32,
         line_mode_active: line_ref.active,
         line_mode_count:  line_ref.count as u32,
         queue_total,
-        queue_water,
-        queue_lines,
     }
 }
 

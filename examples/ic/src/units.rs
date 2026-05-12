@@ -72,13 +72,15 @@ pub(crate) struct Helicopter {
 }
 
 impl Helicopter {
-    pub(crate) fn init() -> Self {
+    /// Spawn at world cell `(pad_x, pad_z)`. The Roster spaces multiple
+    /// helis along +X so their volumes don't visually overlap.
+    pub(crate) fn init(pad_x: u32, pad_z: u32) -> Self {
         let actor = actor_spawn().expect("actor pool full");
-        let pad_y = terrain_height(HELI_PAD_X, HELI_PAD_Z) as f32 + HELI_ALT;
+        let pad_y = terrain_height(pad_x, pad_z) as f32 + HELI_ALT;
         let pos = Vec3::new(
-            HELI_PAD_X as f32 - HELI_SIZE_X as f32 * 0.5,
+            pad_x as f32 - HELI_SIZE_X as f32 * 0.5,
             pad_y,
-            HELI_PAD_Z as f32 - HELI_SIZE_Z as f32 * 0.5,
+            pad_z as f32 - HELI_SIZE_Z as f32 * 0.5,
         );
         actor_set_position(actor, pos);
         let h = Self {
@@ -541,42 +543,87 @@ impl CommandQueue {
     }
     pub(crate) fn pending_water(&self) -> u32 { self.water_count as u32 }
     pub(crate) fn pending_lines(&self) -> u32 { self.line_count as u32 }
+
+    /// Peek at the i'th queued water drop without removing it.
+    /// Used by the on-map badge renderer.
+    pub(crate) fn water_at(&self, i: usize) -> Option<UVec3> {
+        if i >= self.water_count as usize { return None; }
+        self.water[i]
+    }
+
+    /// Peek at the i'th queued fire line. Returns the line's first
+    /// waypoint as the "anchor cell" the on-map badge points at.
+    pub(crate) fn line_head_at(&self, i: usize) -> Option<UVec3> {
+        if i >= self.line_count as usize { return None; }
+        self.lines[i].as_ref().and_then(|l| l.points[0])
+    }
 }
 
 // ── Roster ────────────────────────────────────────────────────────
+//
+// Multi-unit pool: up to MAX_HELIS helicopters and MAX_CREWS ground
+// crews, each in an `Option` slot so the cart can spawn a per-scenario
+// count short of the cap. Idle units of either type pull from the
+// matching FIFO at the top of each tick — so the queue serialises
+// faster when more units are alive.
+
+pub(crate) const MAX_HELIS: usize = 4;
+pub(crate) const MAX_CREWS: usize = 6;
 
 pub(crate) struct Roster {
-    pub heli:  Helicopter,
-    pub crew:  GroundCrew,
+    pub helis: [Option<Helicopter>; MAX_HELIS],
+    pub crews: [Option<GroundCrew>; MAX_CREWS],
     pub queue: CommandQueue,
 }
 
 impl Roster {
-    pub(crate) fn init() -> Self {
-        let heli = Helicopter::init();
-        // Spawn the crew on the road just east of the heli pad.
-        let crew = GroundCrew::init(HELI_PAD_X + 8, HELI_PAD_Z);
-        Self { heli, crew, queue: CommandQueue::new() }
+    pub(crate) fn init(heli_count: u8, crew_count: u8) -> Self {
+        let mut helis: [Option<Helicopter>; MAX_HELIS] = [None, None, None, None];
+        let mut crews: [Option<GroundCrew>; MAX_CREWS] =
+            [None, None, None, None, None, None];
+
+        let helis_to_spawn = (heli_count as usize).min(MAX_HELIS);
+        for i in 0..helis_to_spawn {
+            // Stagger helis along +X from the pad so their volumes
+            // don't visually overlap. 6 cells spacing > 5-wide heli.
+            let pad_x = HELI_PAD_X + (i as u32) * 6;
+            helis[i] = Some(Helicopter::init(pad_x, HELI_PAD_Z));
+        }
+        let crews_to_spawn = (crew_count as usize).min(MAX_CREWS);
+        for i in 0..crews_to_spawn {
+            // Crews line up east of the pad along the road; 2-cell
+            // spacing matches the crew's 1-wide footprint.
+            let spawn_x = HELI_PAD_X + 8 + (i as u32) * 2;
+            crews[i] = Some(GroundCrew::init(spawn_x, HELI_PAD_Z));
+        }
+        Self { helis, crews, queue: CommandQueue::new() }
     }
 
-    /// Hand out queued orders to idle units, then tick both units.
-    /// Idle is the only state in which a unit picks up new work, so
-    /// in-flight orders run to completion regardless of what arrives
-    /// later in the queue — matches the no-cancel rule.
+    /// Hand out queued orders to *all* idle units this tick, then
+    /// tick every unit slot. In-flight orders run to completion
+    /// regardless of what arrives in the queue (no-cancel rule).
     pub(crate) fn tick(&mut self) {
-        if self.heli.is_idle() {
-            if let Some(cell) = self.queue.pop_water() {
-                self.heli.issue_drop(cell);
+        for slot in self.helis.iter_mut() {
+            if let Some(h) = slot {
+                if h.is_idle() {
+                    if let Some(cell) = self.queue.pop_water() {
+                        h.issue_drop(cell);
+                    }
+                }
             }
         }
-        if self.crew.is_idle() {
-            if let Some(line) = self.queue.pop_line() {
-                let path = line.as_slice();
-                self.crew.issue_path(&path[..line.count as usize]);
+        for slot in self.crews.iter_mut() {
+            if let Some(c) = slot {
+                if c.is_idle() {
+                    if let Some(line) = self.queue.pop_line() {
+                        let path = line.as_slice();
+                        c.issue_path(&path[..line.count as usize]);
+                    }
+                }
             }
         }
-        self.heli.tick();
-        self.crew.tick();
+        for slot in self.helis.iter_mut() { if let Some(h) = slot { h.tick(); } }
+        for slot in self.crews.iter_mut() { if let Some(c) = slot { c.tick(); } }
     }
 
     pub(crate) fn dispatch_water_drop(&mut self, cell: UVec3) {
@@ -586,6 +633,23 @@ impl Roster {
     pub(crate) fn dispatch_fire_line(&mut self, points: &[UVec3]) {
         if points.is_empty() { return; }
         self.queue.push_line(FireLinePath::from_slice(points));
+    }
+
+    // ── Pool-state accessors for HUD ─────────────────────────────
+
+    pub(crate) fn heli_total(&self) -> u32 {
+        self.helis.iter().filter(|s| s.is_some()).count() as u32
+    }
+    pub(crate) fn heli_busy(&self) -> u32 {
+        self.helis.iter().filter_map(|s| s.as_ref())
+            .filter(|h| !h.is_idle()).count() as u32
+    }
+    pub(crate) fn crew_total(&self) -> u32 {
+        self.crews.iter().filter(|s| s.is_some()).count() as u32
+    }
+    pub(crate) fn crew_busy(&self) -> u32 {
+        self.crews.iter().filter_map(|s| s.as_ref())
+            .filter(|c| !c.is_idle()).count() as u32
     }
 }
 

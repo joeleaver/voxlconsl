@@ -73,9 +73,10 @@ struct StatusKey {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct UnitKey {
-    heli_state:  [u8; 4],
-    heli_bucket: [u8; 4],
-    crew_state:  [u8; 4],
+    heli_busy:   u32,
+    heli_total:  u32,
+    crew_busy:   u32,
+    crew_total:  u32,
     line_active: bool,
     line_count:  u32,
     queue_total: u32,
@@ -83,12 +84,9 @@ struct UnitKey {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct OrdersKey {
-    heli_active: bool,
-    heli_x:      u16,
-    heli_z:      u16,
-    crew_active: bool,
-    crew_x:      u16,
-    crew_z:      u16,
+    tier:       u32,
+    heli_total: u32,
+    crew_total: u32,
 }
 
 // ── Hud state ─────────────────────────────────────────────────────
@@ -173,9 +171,10 @@ impl Hud {
 
     fn paint_unit(&mut self, ctx: &HudCtx<'_>) {
         let key = UnitKey {
-            heli_state:  pad4(ctx.heli_state),
-            heli_bucket: pad4(ctx.heli_bucket),
-            crew_state:  pad4(ctx.crew_state),
+            heli_busy:   ctx.heli_busy,
+            heli_total:  ctx.heli_total,
+            crew_busy:   ctx.crew_busy,
+            crew_total:  ctx.crew_total,
             line_active: ctx.line_mode_active,
             line_count:  ctx.line_mode_count,
             queue_total: ctx.queue_total,
@@ -186,17 +185,17 @@ impl Hud {
         actor_clear(actor);
 
         let mut buf = [b' '; SIDEBAR_LINE_MAX];
-        // Line 0: compact heli summary — "H " + state + " " + bucket.
-        let s = format_heli(&mut buf, ctx.heli_state, ctx.heli_bucket);
+        // Line 0: heli pool busy/total — "H 1/3".
+        let s = format_pool(&mut buf, b'H', ctx.heli_busy, ctx.heli_total);
         paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, s);
-        // Line 1: compact crew summary — "C " + state.
-        let s = format_crew(&mut buf, ctx.crew_state);
+        // Line 1: crew pool busy/total — "C 2/6".
+        let s = format_pool(&mut buf, b'C', ctx.crew_busy, ctx.crew_total);
         paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, s);
-        // Line 2: current command mode (always painted).
+        // Line 2: current command mode.
         let mode = if ctx.line_mode_active { "MD LINE" } else { "MD NORM" };
         paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, mode);
-        // Line 3: in line mode show point count of the draft;
-        // otherwise show total queued orders.
+        // Line 3: line draft size when drafting; total queue size
+        // otherwise. (Per-order map badges show the queue itself.)
         let s = if ctx.line_mode_active {
             format_line_count(&mut buf, ctx.line_mode_count)
         } else {
@@ -207,12 +206,9 @@ impl Hud {
 
     fn paint_orders(&mut self, ctx: &HudCtx<'_>) {
         let key = OrdersKey {
-            heli_active: ctx.heli_target.is_some(),
-            heli_x:      ctx.heli_target.map(|(x, _)| x as u16).unwrap_or(0),
-            heli_z:      ctx.heli_target.map(|(_, z)| z as u16).unwrap_or(0),
-            crew_active: ctx.crew_target.is_some(),
-            crew_x:      ctx.crew_target.map(|(x, _)| x as u16).unwrap_or(0),
-            crew_z:      ctx.crew_target.map(|(_, z)| z as u16).unwrap_or(0),
+            tier:       ctx.tier,
+            heli_total: ctx.heli_total,
+            crew_total: ctx.crew_total,
         };
         if self.orders_cache == Some(key) { return; }
         self.orders_cache = Some(key);
@@ -220,11 +216,12 @@ impl Hud {
         actor_clear(actor);
 
         let mut buf = [b' '; SIDEBAR_LINE_MAX];
-        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "ORDERS");
-        let line = format_order(&mut buf, b'H', ctx.heli_target);
-        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, line);
-        let line = format_order(&mut buf, b'C', ctx.crew_target);
-        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, line);
+        let s = format_tier(&mut buf, ctx.tier);
+        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, s);
+        let s = format_budget(&mut buf, b'H', ctx.heli_total);
+        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, s);
+        let s = format_budget(&mut buf, b'C', ctx.crew_total);
+        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
     }
 
     fn paint_help(&mut self) {
@@ -245,25 +242,16 @@ pub(crate) struct HudCtx<'a> {
     pub fire_sites:    u32,
     pub wind_dir:      &'a str,
     pub wind_strength: u32,
-    pub heli_state:    &'a str,
-    pub heli_bucket:   &'a str,
-    pub crew_state:    &'a str,
-    pub heli_target:   Option<(u32, u32)>,
-    pub crew_target:   Option<(u32, u32)>,
+    pub heli_busy:     u32,
+    pub heli_total:    u32,
+    pub crew_busy:     u32,
+    pub crew_total:    u32,
+    pub tier:          u32,
     pub line_mode_active: bool,
     pub line_mode_count:  u32,
     pub queue_total:   u32,
-    pub queue_water:   u32,
-    pub queue_lines:   u32,
 }
 
-fn pad4(s: &str) -> [u8; 4] {
-    let mut out = [b' '; 4];
-    let bytes = s.as_bytes();
-    let n = bytes.len().min(4);
-    out[..n].copy_from_slice(&bytes[..n]);
-    out
-}
 
 // ── Glyph painter ─────────────────────────────────────────────────
 
@@ -351,33 +339,30 @@ fn format_fire<'a>(buf: &'a mut [u8], sites: u32) -> &'a str {
     core::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 
-/// "H FLY  F"  /  "H IDLE F" — heli state + bucket on one line.
-/// `state` is ≤ 4 chars, bucket is a single letter ("F"/"E"/"-").
-fn format_heli<'a>(buf: &'a mut [u8], state: &str, bucket: &str) -> &'a str {
-    buf[..2].copy_from_slice(b"H ");
-    let mut len = 2;
-    for &b in state.as_bytes().iter().take(4) {
-        if len >= buf.len() { break; }
-        buf[len] = b;
-        len += 1;
-    }
-    if len < buf.len() { buf[len] = b' '; len += 1; }
-    if len < buf.len() {
-        if let Some(&b) = bucket.as_bytes().first() { buf[len] = b; len += 1; }
-    }
-    core::str::from_utf8(&buf[..len]).unwrap_or("")
+/// "H 1/3" — pool busy/total for a unit type.
+fn format_pool<'a>(buf: &'a mut [u8], kind: u8, busy: u32, total: u32) -> &'a str {
+    buf[0] = kind;
+    buf[1] = b' ';
+    buf[2] = b'0' + (busy.min(9)) as u8;
+    buf[3] = b'/';
+    buf[4] = b'0' + (total.min(9)) as u8;
+    core::str::from_utf8(&buf[..5]).unwrap_or("")
 }
 
-/// "C WALK" / "C IDLE".
-fn format_crew<'a>(buf: &'a mut [u8], state: &str) -> &'a str {
-    buf[..2].copy_from_slice(b"C ");
-    let mut len = 2;
-    for &b in state.as_bytes().iter().take(4) {
-        if len >= buf.len() { break; }
-        buf[len] = b;
-        len += 1;
-    }
-    core::str::from_utf8(&buf[..len]).unwrap_or("")
+/// "TIER N" — single line with the mission's tier number.
+fn format_tier<'a>(buf: &'a mut [u8], tier: u32) -> &'a str {
+    buf[..5].copy_from_slice(b"TIER ");
+    buf[5] = b'0' + (tier.min(9)) as u8;
+    core::str::from_utf8(&buf[..6]).unwrap_or("")
+}
+
+/// "H BUD 3" — unit-type budget for the mission.
+fn format_budget<'a>(buf: &'a mut [u8], kind: u8, total: u32) -> &'a str {
+    buf[0] = kind;
+    buf[..1].copy_from_slice(&[kind]);
+    buf[1..6].copy_from_slice(b" BUD ");
+    buf[6] = b'0' + (total.min(9)) as u8;
+    core::str::from_utf8(&buf[..7]).unwrap_or("")
 }
 
 /// "LN N/8" — current draft size, max LINE_CAP=8.
@@ -402,44 +387,3 @@ fn format_queue_total<'a>(buf: &'a mut [u8], n: u32) -> &'a str {
     core::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 
-/// "H>123,4" formatted into the 8-char line budget. `kind` is the
-/// unit's single-letter prefix; `target` is the order's destination
-/// cell. Idle units render as just "H -" / "C -".
-fn format_order<'a>(buf: &'a mut [u8], kind: u8, target: Option<(u32, u32)>) -> &'a str {
-    buf[0] = kind;
-    buf[1] = b' ';
-    match target {
-        None => {
-            buf[2] = b'-';
-            core::str::from_utf8(&buf[..3]).unwrap_or("")
-        }
-        Some((x, z)) => {
-            let mut len = 2;
-            len += write_u16_compact(&mut buf[len..], x as u16);
-            if len >= buf.len() { return core::str::from_utf8(&buf[..len]).unwrap_or(""); }
-            buf[len] = b',';
-            len += 1;
-            len += write_u16_compact(&mut buf[len..], z as u16);
-            core::str::from_utf8(&buf[..len]).unwrap_or("")
-        }
-    }
-}
-
-/// Write a u16 without leading zeros into `buf`. Returns bytes written.
-fn write_u16_compact(buf: &mut [u8], mut n: u16) -> usize {
-    if n == 0 {
-        if !buf.is_empty() { buf[0] = b'0'; return 1; } else { return 0; }
-    }
-    let mut tmp = [0u8; 5];
-    let mut t = 0;
-    while n > 0 && t < tmp.len() {
-        tmp[t] = b'0' + (n % 10) as u8;
-        n /= 10;
-        t += 1;
-    }
-    let written = t.min(buf.len());
-    for i in 0..written {
-        buf[i] = tmp[t - 1 - i];
-    }
-    written
-}

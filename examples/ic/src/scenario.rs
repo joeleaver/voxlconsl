@@ -15,13 +15,32 @@ use crate::rng::Rng;
 #[derive(Copy, Clone)]
 pub(crate) struct Scenario {
     pub seed:           u32,
+    pub tier:           u8,
+    pub heli_count:     u8,
+    pub crew_count:     u8,
     pub forest_rng:     u32,
     pub wind_angle_rad: f32,
     pub wind_strength:  f32,
 }
 
 impl Scenario {
-    pub(crate) fn from_seed(seed: u32) -> Self {
+    /// Map a difficulty tier (1.. arbitrary) to the unit budget the
+    /// player starts with. Each step roughly doubles capability.
+    /// Tier 1 is intentionally crews-only — the player has to walk
+    /// firebreaks without any air support and learn the spread
+    /// dynamics. Helis appear at tier 2; future tiers will add an
+    /// air tanker with retardant.
+    pub(crate) fn budget_for_tier(tier: u8) -> (u8, u8) {
+        match tier {
+            0 | 1 => (0, 2),
+            2     => (1, 2),
+            3     => (2, 3),
+            4     => (3, 4),
+            _     => (3, 4),   // ceiling at MAX_HELIS=4 / MAX_CREWS=6
+        }
+    }
+
+    pub(crate) fn from_seed_and_tier(seed: u32, tier: u8) -> Self {
         // Mix the seed before pulling streams from it so adjacent
         // seeds (0, 1, 2, ...) produce visibly different worlds.
         let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9).wrapping_add(0x6543_2109));
@@ -39,7 +58,17 @@ impl Scenario {
         while wind_angle_rad >= TAU_F32 { wind_angle_rad -= TAU_F32; }
         let wind_strength = 0.30 + rng.unit() * 0.30;
 
-        Self { seed, forest_rng, wind_angle_rad, wind_strength }
+        let (heli_count, crew_count) = Self::budget_for_tier(tier);
+
+        Self {
+            seed,
+            tier,
+            heli_count,
+            crew_count,
+            forest_rng,
+            wind_angle_rad,
+            wind_strength,
+        }
     }
 }
 
@@ -52,8 +81,8 @@ impl Scenario {
 
 static mut STATE: Option<Scenario> = None;
 
-pub(crate) fn init(seed: u32) {
-    unsafe { STATE = Some(Scenario::from_seed(seed)); }
+pub(crate) fn init(seed: u32, tier: u8) {
+    unsafe { STATE = Some(Scenario::from_seed_and_tier(seed, tier)); }
 }
 
 pub(crate) fn get() -> &'static Scenario {
