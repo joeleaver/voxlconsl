@@ -46,6 +46,7 @@ mod fire;
 mod hud;
 mod mathlib;
 mod rng;
+mod scenario;
 mod terrain;
 mod units;
 
@@ -77,6 +78,11 @@ pub(crate) const M_HUD_TEXT:         u8 = 21;
 
 const MISSION_DURATION_MS: u32 = 180_000;       // 3:00
 const WIN_STRUCTURE_THRESHOLD: u32 = 4;         // need 4 of 6 alive at expiry
+
+/// Scenario seed for this build. Change to roll a new map — same
+/// seed always reproduces the same forest pattern and starting wind.
+/// Future work: surface as a URL param / cart arg.
+const MISSION_SEED: u32 = 0xA1F0_5E57;
 
 // ── Game state ───────────────────────────────────────────────────
 
@@ -119,6 +125,10 @@ pub extern "C" fn init() {
     // give the terrain depth from the high overhead view.
     light_set_sun(Vec3::new(-0.5, -0.6, 0.6), 0, 0);
 
+    // Pick a scenario seed and lock it in before any world / fire
+    // state initialisation reads from it.
+    scenario::init(MISSION_SEED);
+
     terrain::paint_world();
 
     let focus_x = terrain::HELI_PAD_X as f32;
@@ -134,8 +144,12 @@ pub extern "C" fn init() {
 
     // First fire — seed it now so the player sees smoke from the
     // opening moment.
-    let seed = terrain::ignite_first_fire();
-    unsafe { (&mut *(&raw mut FIRE_STATE)).add_burn_site(seed); }
+    let fire_seed = terrain::ignite_first_fire();
+    unsafe {
+        let fire = &mut *(&raw mut FIRE_STATE);
+        fire.apply_scenario(scenario::get());
+        fire.add_burn_site(fire_seed);
+    }
 }
 
 fn register_actions() {

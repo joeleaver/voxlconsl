@@ -116,6 +116,15 @@ impl FireState {
         }
     }
 
+    /// Seed wind angle + strength from the active scenario. Called
+    /// once after `scenario::init()` so the cart boots with the
+    /// per-seed weather profile rather than the const default.
+    pub(crate) fn apply_scenario(&mut self, s: &crate::scenario::Scenario) {
+        self.wind_angle    = s.wind_angle_rad;
+        self.wind_strength = s.wind_strength.clamp(WIND_STRENGTH_MIN, WIND_STRENGTH_MAX);
+        self.refresh_wind_vec();
+    }
+
     /// Current wind in voxels/tick (XZ plane only). Embers sample
     /// this at launch.
     pub(crate) fn wind(&self) -> Vec3 { self.wind }

@@ -4,6 +4,8 @@
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
+pub(crate) const TAU_F32: f32 = TAU;
+
 pub(crate) fn sine(x: f32) -> f32 {
     let mut x = x % TAU;
     if x >  PI { x -= TAU; }

@@ -228,7 +228,7 @@ fn paint_cabins() {
 /// Drop ~250 pines on grass cells, weighted to the north half of the
 /// footprint (the fire side). Avoids the lake, town, and road.
 fn scatter_pines() {
-    let mut rng = Rng::new(PINE_RNG_SEED);
+    let mut rng = Rng::new(crate::scenario::get().forest_rng);
     let mut planted = 0u32;
     let mut tries = 0u32;
     while planted < 250 && tries < 5000 {
@@ -323,6 +323,3 @@ pub(crate) fn ignite_first_fire() -> UVec3 {
     p
 }
 
-// ── helpers ───────────────────────────────────────────────────────
-
-const PINE_RNG_SEED: u32 = 0xF0_5E_57_5D;
