@@ -1,0 +1,115 @@
+# voxdude material table — see SPEC.md §12.6.2.
+#
+# Slot 0 is reserved for air. The maze is built from a small fixed
+# set of slots — walls, two dot tiers, ghost colours, player.
+
+[[material]]
+slot     = 1
+name     = "wall"
+color    = "deep_blue:1"
+emission = 4               # cool glow so wall outlines read in the dark
+flags    = ["glossy"]
+
+[[material]]
+slot     = 2
+name     = "floor"
+color    = "warm_gray:0"   # very dark — barely visible, mostly silhouettes the dots
+emission = 0
+
+[[material]]
+slot     = 3
+name     = "dot"
+color    = "tan:3"         # bright pale tan — classic pacman dot
+emission = 10
+
+[[material]]
+slot     = 4
+name     = "power_pellet"
+color    = "yellow:3"
+emission = 15              # full glow — visually screams "eat me"
+
+[[material]]
+slot     = 5
+name     = "player"
+color    = "yellow:3"      # voxdude himself
+emission = 12
+
+[[material]]
+slot     = 6
+name     = "ghost_blinky"
+color    = "red:3"
+emission = 8
+
+[[material]]
+slot     = 7
+name     = "ghost_pinky"
+color    = "pink:3"
+emission = 8
+
+[[material]]
+slot     = 8
+name     = "ghost_inky"
+color    = "cyan:3"
+emission = 8
+
+[[material]]
+slot     = 9
+name     = "ghost_clyde"
+color    = "orange:3"
+emission = 8
+
+[[material]]
+slot     = 10
+name     = "ghost_frightened"
+color    = "deep_blue:3"
+emission = 14
+
+[[material]]
+slot     = 11
+name     = "particle_chomp"
+color    = "yellow:3"
+emission = 15              # full glow — dot-eat sparkle
+
+[[material]]
+slot     = 12
+name     = "ghost_eye"
+color    = "cool_gray:0"   # near-black so the eyes punch against the body
+emission = 0
+
+[[material]]
+slot     = 13
+name     = "ghost_flash"
+color    = "warm_gray:3"   # near-white frightened-end tell
+emission = 14
+
+[[material]]
+slot     = 14
+name     = "wall_outer"
+color    = "deep_blue:2"   # brighter than M_WALL — frames the maze as a "cabinet edge"
+emission = 6
+flags    = ["glossy"]
+
+[[material]]
+slot     = 15
+name     = "wall_cap"
+color    = "sky_blue:2"    # one shade brighter again — corner & T-junction pillars
+emission = 10
+flags    = ["glossy"]
+
+[[material]]
+slot     = 16
+name     = "wall_pip"
+color    = "magenta:3"     # vivid pink pop on top of large wall clusters
+emission = 15
+
+[[material]]
+slot     = 17
+name     = "hud_score"
+color    = "warm_gray:3"   # near-white score digits — high contrast on the purple sky
+emission = 15
+
+[[material]]
+slot     = 18
+name     = "hud_outline"
+color    = "cool_gray:0"   # near-black halo behind score digits so they pop on any background
+emission = 0

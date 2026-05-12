@@ -287,4 +287,51 @@ impl AudioEventLog {
         self.tag(EventTag::VoiceRelease);
         self.u32(voice);
     }
+
+    /// Emit the full per-field event sequence for a `Patch` — used at
+    /// cart load to replay an Audio-section patch through the worklet.
+    /// Mirrors what the cart-side `patch_set_*` imports would push if
+    /// the cart configured the patch field-by-field at runtime.
+    pub fn push_patch_full(&mut self, slot: u8, patch: &voxlconsl_audio::Patch) {
+        use voxlconsl_audio::{
+            filter_mode_code, lfo_shape_code, lfo_target_code, osc_mode_code,
+            patch_kind_code,
+        };
+        self.push_patch_set_kind(slot, patch_kind_code(patch.kind));
+        for (i, osc) in patch.osc.iter().enumerate() {
+            self.push_patch_set_osc(
+                slot, i as u8, osc_mode_code(osc.mode),
+                osc.detune_cents, osc.octave, osc.level,
+            );
+        }
+        self.push_patch_set_filter(
+            slot, filter_mode_code(patch.filter.mode),
+            patch.filter.cutoff_hz, patch.filter.resonance,
+        );
+        self.push_patch_set_amp_env(
+            slot, patch.amp_env.attack_ms, patch.amp_env.decay_ms,
+            patch.amp_env.sustain, patch.amp_env.release_ms,
+        );
+        self.push_patch_set_filter_env(
+            slot, patch.filter_env.attack_ms, patch.filter_env.decay_ms,
+            patch.filter_env.sustain, patch.filter_env.release_ms,
+            patch.filter_env_depth,
+        );
+        self.push_patch_set_lfo(
+            slot, patch.lfo.rate_centihz,
+            lfo_shape_code(patch.lfo.shape), lfo_target_code(patch.lfo.target),
+            patch.lfo.depth,
+        );
+        self.push_patch_set_glide(slot, patch.glide_ms);
+        self.push_patch_set_fm(slot, patch.fm_ratio, patch.fm_index);
+        for i in 0..(patch.zone_count as usize).min(patch.zones.len()) {
+            let z = &patch.zones[i];
+            self.push_patch_set_zone(
+                slot, i as u8, z.low_note, z.high_note, z.root_note,
+                z.sample_slot, z.volume_offset,
+                z.loop_start, z.loop_end, z.loop_enabled,
+            );
+        }
+        self.push_patch_set_zone_count(slot, patch.zone_count);
+    }
 }

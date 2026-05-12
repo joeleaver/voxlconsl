@@ -4,13 +4,16 @@
 # Usage:
 #   ./scripts/build-web.sh                          # release, hello-cube
 #   ./scripts/build-web.sh release big-world        # release, big-world cart
+#   ./scripts/build-web.sh release big-world,hello-cube
+#                                                   # release, picker with both
 #   ./scripts/build-web.sh debug                    # debug, hello-cube
 #   CART=big-world ./scripts/build-web.sh release   # env-var form
 #
 # Steps:
-#   1. Build the example cart (wasm32, release).
-#   2. Bundle it into a .voxl via `voxlconsl-cli bundle`, copying the
-#      result to a stable location for `include_bytes!`.
+#   1. Build each cart's wasm.
+#   2. Bundle each to a .voxl, copy to web/carts/<name>.voxl for the
+#      runtime picker, and the *first* cart in the list also lands in
+#      crates/host-browser/embedded-cart.voxl as the no-args fallback.
 #   3. Build the browser host (wasm32, release or debug).
 #   4. Run wasm-bindgen on the host's .wasm into web/pkg.
 
@@ -30,27 +33,66 @@ case "$PROFILE" in
         OUT_DIR="target/wasm32-unknown-unknown/debug"
         ;;
     *)
-        echo "usage: $0 [release|debug] [cart-name]" >&2
+        echo "usage: $0 [release|debug] [cart-name|cart-list]" >&2
         exit 1
         ;;
 esac
 
-# Cart name: positional second arg wins, then $CART env var, then default.
-CART="${2:-${CART:-hello-cube}}"
+# Cart spec: comma-separated list of cart names (e.g. "big-world,hello-cube").
+# Positional second arg wins, then $CART env var, then a sensible default
+# that ships both example carts in the picker.
+CART_SPEC="${2:-${CART:-big-world,voxdude,hello-cube}}"
+IFS=',' read -r -a CARTS <<< "$CART_SPEC"
+
 EMBEDDED_VOXL="crates/host-browser/embedded-cart.voxl"
+CARTS_DIR="web/carts"
 
-echo "[build-web] building cart: $CART ($PROFILE)..."
-cargo build --target wasm32-unknown-unknown -p "$CART" "${BUILD_FLAGS[@]}"
+mkdir -p "$CARTS_DIR"
+# Prune stale .voxl from previous builds so the picker only lists what
+# the current build actually produced.
+find "$CARTS_DIR" -maxdepth 1 -name '*.voxl' -delete
 
-# The bundler runs `cargo build --release` again from inside the cart
-# directory per cart.toml's `[code].build` line. That's redundant when
-# we just built above; the second invocation is a no-op rebuild that
-# costs only the build-graph walk (~50 ms). Worth it for the
-# spec-conformant pipeline.
-echo "[build-web] bundling cart -> .voxl..."
-cargo run --release -p voxlconsl-cli -- bundle "examples/$CART" \
-    --output "$EMBEDDED_VOXL"
-echo "[build-web] cart voxl: $(wc -c < "$EMBEDDED_VOXL") bytes -> $EMBEDDED_VOXL"
+for i in "${!CARTS[@]}"; do
+    CART="${CARTS[$i]}"
+    echo "[build-web] building cart: $CART ($PROFILE)..."
+    cargo build --target wasm32-unknown-unknown -p "$CART" "${BUILD_FLAGS[@]}"
+
+    # The bundler runs `cargo build --release` again from inside the cart
+    # directory per cart.toml's `[code].build` line. That's redundant when
+    # we just built above; the second invocation is a no-op rebuild that
+    # costs only the build-graph walk (~50 ms). Worth it for the
+    # spec-conformant pipeline.
+    OUT_VOXL="$CARTS_DIR/$CART.voxl"
+    echo "[build-web] bundling cart -> $OUT_VOXL..."
+    cargo run --release -p voxlconsl-cli -- bundle "examples/$CART" \
+        --output "$OUT_VOXL"
+    echo "[build-web] cart voxl: $(wc -c < "$OUT_VOXL") bytes -> $OUT_VOXL"
+
+    # First cart in the list is also the no-args / `include_bytes!`
+    # fallback. The JS picker fetches /carts/<name>.voxl at runtime,
+    # but anything that boots `BrowserHost::new()` with no args (CLI,
+    # tests, ad-hoc native runners) gets this one.
+    if [ "$i" -eq 0 ]; then
+        cp "$OUT_VOXL" "$EMBEDDED_VOXL"
+        echo "[build-web] embedded fallback -> $EMBEDDED_VOXL"
+    fi
+done
+
+# Write a JSON manifest the JS picker enumerates at boot. Simpler than
+# probing /carts/ via directory listing (which the dev server allows but
+# GitHub Pages does not).
+CARTS_JSON="$CARTS_DIR/index.json"
+{
+    echo "{"
+    echo "  \"carts\": ["
+    for i in "${!CARTS[@]}"; do
+        if [ "$i" -gt 0 ]; then echo "    ,"; fi
+        echo "    { \"name\": \"${CARTS[$i]}\", \"file\": \"${CARTS[$i]}.voxl\" }"
+    done
+    echo "  ]"
+    echo "}"
+} > "$CARTS_JSON"
+echo "[build-web] picker manifest -> $CARTS_JSON"
 
 echo "[build-web] building voxlconsl-host-browser ($PROFILE)..."
 cargo build --target wasm32-unknown-unknown -p voxlconsl-host-browser "${BUILD_FLAGS[@]}"

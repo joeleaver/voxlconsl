@@ -10,3 +10,11 @@ license      = "MIT OR Apache-2.0"
 [code]
 build  = "cargo build --release --target wasm32-unknown-unknown -p big-world"
 output = "../../target/wasm32-unknown-unknown/release/big_world.wasm"
+
+[materials]
+file = "materials.toml"
+
+[audio]
+patches = "audio/patches.toml"
+songs   = "audio/songs"
+samples = "audio/samples"

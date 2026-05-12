@@ -10,6 +10,8 @@ rust-version.workspace = true
 [dependencies]
 voxlconsl-types = { workspace = true, features = ["bytemuck"] }
 voxlconsl-svo = { workspace = true }
+voxlconsl-audio = { workspace = true }
+bytemuck = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

@@ -1,0 +1,129 @@
+# big-world synth + sampler patches — see SPEC.md §12.6.3.
+#
+# Slot 0: dual-saw lead bound to MIDI channel 0 (default routing).
+# Slot 2: FM2OP bell bound to channel 2 via cart-side program_change.
+# Slot 3: sampler pad bound to channel 3 via cart-side program_change.
+
+[[patch]]
+slot = 0
+name = "lead"
+kind = "synth"
+
+[patch.osc1]
+mode  = "saw"
+level = 110
+
+[patch.osc2]
+mode         = "saw"
+detune_cents = 7
+level        = 80
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 2500
+resonance = 30
+
+[patch.amp_env]
+attack_ms  = 5
+decay_ms   = 120
+sustain    = 90
+release_ms = 220
+
+[patch.filter_env]
+attack_ms  = 3
+decay_ms   = 240
+sustain    = 30
+release_ms = 200
+depth      = 64
+
+[patch.lfo]
+rate_hz = 6.0
+shape   = "sine"
+target  = "pitch"
+depth   = 4
+
+[patch.glide]
+ms = 0
+
+
+[[patch]]
+slot = 2
+name = "bell"
+kind = "synth"
+
+[patch.osc1]
+mode  = "fm2op"
+level = 127
+
+[patch.osc2]
+mode  = "sine"
+level = 127
+
+[patch.fm]
+ratio = 1.5
+index = 3.0
+
+[patch.filter]
+mode = "off"
+
+[patch.amp_env]
+attack_ms  = 1
+decay_ms   = 600
+sustain    = 0
+release_ms = 200
+
+[patch.filter_env]
+attack_ms  = 1
+decay_ms   = 200
+sustain    = 0
+release_ms = 100
+depth      = 0
+
+[patch.lfo]
+rate_centihz = 0
+shape        = "sine"
+target       = "pitch"
+depth        = 0
+
+[patch.glide]
+ms = 0
+
+
+[[patch]]
+slot = 3
+name = "sampler"
+kind = "sampler"
+
+[[patch.zone]]
+sample    = "beep"
+low_note  = 36
+high_note = 96
+root_note = 60
+loop      = true
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 3200
+resonance = 20
+
+[patch.amp_env]
+attack_ms  = 40
+decay_ms   = 120
+sustain    = 100
+release_ms = 220
+
+[patch.filter_env]
+attack_ms  = 60
+decay_ms   = 200
+sustain    = 80
+release_ms = 200
+depth      = 40
+
+[patch.lfo]
+rate_centihz = 400
+shape        = "sine"
+target       = "pitch"
+depth        = 2
+
+[patch.glide]
+ms = 0

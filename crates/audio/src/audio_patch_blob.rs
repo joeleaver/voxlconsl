@@ -166,14 +166,14 @@ pub fn load(src: &[u8]) -> Option<Patch> {
 
 // ── Code conversions (reverse of from_code()) ─────────────────────
 
-fn patch_kind_code(k: PatchKind) -> u8 {
+pub fn patch_kind_code(k: PatchKind) -> u8 {
     match k {
         PatchKind::Synth => 0,
         PatchKind::Sampler => 1,
     }
 }
 
-fn osc_mode_code(m: OscMode) -> u8 {
+pub fn osc_mode_code(m: OscMode) -> u8 {
     match m {
         OscMode::Sine => 0,
         OscMode::Saw => 1,
@@ -184,7 +184,7 @@ fn osc_mode_code(m: OscMode) -> u8 {
     }
 }
 
-fn filter_mode_code(m: FilterMode) -> u8 {
+pub fn filter_mode_code(m: FilterMode) -> u8 {
     match m {
         FilterMode::Off => 0,
         FilterMode::LowPass => 1,
@@ -193,7 +193,7 @@ fn filter_mode_code(m: FilterMode) -> u8 {
     }
 }
 
-fn lfo_shape_code(s: LfoShape) -> u8 {
+pub fn lfo_shape_code(s: LfoShape) -> u8 {
     match s {
         LfoShape::Sine => 0,
         LfoShape::Triangle => 1,
@@ -202,7 +202,7 @@ fn lfo_shape_code(s: LfoShape) -> u8 {
     }
 }
 
-fn lfo_target_code(t: LfoTarget) -> u8 {
+pub fn lfo_target_code(t: LfoTarget) -> u8 {
     match t {
         LfoTarget::Pitch => 0,
         LfoTarget::Filter => 1,

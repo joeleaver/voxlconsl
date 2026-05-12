@@ -23,7 +23,9 @@ const FB_BYTES: usize = (WIDTH as usize) * (HEIGHT as usize) * 4;
 
 /// Embedded cart `.voxl`, produced by `scripts/build-web.sh` (which runs
 /// `voxlconsl bundle` and copies the resulting blob here before this
-/// crate is compiled).
+/// crate is compiled). Used as the fallback when JS calls the no-args
+/// constructor; the runtime cart picker passes its own bytes via
+/// [`BrowserHost::new_with_cart`].
 const EMBEDDED_CART: &[u8] = include_bytes!("../embedded-cart.voxl");
 
 #[wasm_bindgen]
@@ -34,13 +36,23 @@ pub struct BrowserHost {
 
 #[wasm_bindgen]
 impl BrowserHost {
+    /// Boot with the compile-time embedded cart. Kept for tests, the
+    /// CLI flow, and any host that doesn't expose a runtime picker.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Result<BrowserHost, JsValue> {
+        Self::new_with_cart(EMBEDDED_CART)
+    }
+
+    /// Boot with cart bytes supplied at runtime (the JS picker fetches
+    /// a `.voxl` from `/carts/<name>.voxl` and passes the buffer in).
+    /// `bytes` may be either a `.voxl` cart binary or raw WASM —
+    /// `Cart::load` auto-detects via the `VOXLCONSL\0` magic.
+    pub fn new_with_cart(bytes: &[u8]) -> Result<BrowserHost, JsValue> {
         std::panic::set_hook(Box::new(|info| {
             web_sys::console::error_1(&format!("voxlconsl panic: {info}").into());
         }));
 
-        let cart = Cart::load(EMBEDDED_CART)
+        let cart = Cart::load(bytes)
             .map_err(|e| JsValue::from_str(&format!("cart load failed: {e:?}")))?;
 
         Ok(Self {
@@ -176,7 +188,8 @@ impl BrowserHost {
             materials: &world.materials,
             ca: &world.ca,
             sun_dir: world.sun_dir,
-            sky: world.sky_top,
+            sky_top: world.sky_top,
+            sky_horizon: world.sky_horizon,
         };
         render_frame(&scene, &world.camera, &mut self.framebuffer);
 

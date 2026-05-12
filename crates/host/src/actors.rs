@@ -318,10 +318,15 @@ impl Actor {
 
     /// World-space AABB of the actor's volume after yaw rotation.
     /// Position is the world location of the volume's local (0, 0, 0)
-    /// corner; yaw rotates around that corner about the world Y axis.
+    /// corner; yaw rotates around the volume's horizontal centre
+    /// (`position + size_xz/2`) about the world Y axis, so the actor
+    /// stays visually anchored when it turns instead of swinging out
+    /// to one side.
     pub fn world_aabb(&self) -> (Vec3, Vec3) {
         let s = self.volume_size();
         let (sx, sy, sz) = (s.x as f32, s.y as f32, s.z as f32);
+        let half_x = sx * 0.5;
+        let half_z = sz * 0.5;
         // 8 corners of [0, size] in actor-local coords.
         let corners_local = [
             Vec3::new(0.0, 0.0, 0.0),
@@ -339,10 +344,13 @@ impl Actor {
         let mut min = Vec3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut max = Vec3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
         for c in corners_local {
+            // Rotate around the volume centre, not the corner.
+            let cx = c.x - half_x;
+            let cz = c.z - half_z;
             let world = Vec3::new(
-                self.position.x + c.x * cosy - c.z * siny,
+                self.position.x + half_x + cx * cosy - cz * siny,
                 self.position.y + c.y,
-                self.position.z + c.x * siny + c.z * cosy,
+                self.position.z + half_z + cx * siny + cz * cosy,
             );
             min = min.min(world);
             max = max.max(world);
@@ -353,14 +361,24 @@ impl Actor {
     /// Transform a world-space ray into actor-local space (inverse yaw +
     /// translate). Returns (origin, dir). Direction is rotated but not
     /// scaled; ray-parameter `t` values are the same in both spaces.
+    /// Yaw pivots around the volume's horizontal centre — see
+    /// [`Actor::world_aabb`].
     pub fn world_to_local_ray(&self, origin: Vec3, dir: Vec3) -> (Vec3, Vec3) {
         let cosy = (-self.yaw).cos();
         let siny = (-self.yaw).sin();
+        let s = self.volume_size();
+        let half_x = s.x as f32 * 0.5;
+        let half_z = s.z as f32 * 0.5;
+        // Shift the ray origin into the centred local frame, rotate,
+        // then shift back so coords are in the corner-relative
+        // (`[0, size]`) local space the SVO traversal expects.
         let p = origin - self.position;
+        let px = p.x - half_x;
+        let pz = p.z - half_z;
         let local_origin = Vec3::new(
-            p.x * cosy - p.z * siny,
+            px * cosy - pz * siny + half_x,
             p.y,
-            p.x * siny + p.z * cosy,
+            px * siny + pz * cosy + half_z,
         );
         let local_dir = Vec3::new(
             dir.x * cosy - dir.z * siny,

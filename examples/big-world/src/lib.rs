@@ -20,10 +20,7 @@
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::animation::Flipbook;
-use voxlconsl_sdk::audio::{
-    self, EnvParams as AudioEnv, FilterMode, KeyZone, LfoShape, LfoTarget, OscMode, PatchKind,
-    SampleRate, CC_DELAY_SEND, CC_REVERB_SEND, DRUM_CHANNEL,
-};
+use voxlconsl_sdk::audio::{self, CC_DELAY_SEND, CC_REVERB_SEND, DRUM_CHANNEL};
 use voxlconsl_sdk::bodies;
 use voxlconsl_sdk::physics;
 use voxlconsl_sdk::text::{measure, paint_world, Axis, FONT_ANSI, FONT_DCP1};
@@ -128,12 +125,9 @@ static mut KICK_ACTION: ActionHandle = ActionHandle(0);
 //
 //   SPACE  → `note_on(0, A3, 110)`         (saw lead, hold to sustain)
 //   K      → `note_on(DRUM_CHANNEL, 36, …)` (acoustic-bass-drum kick)
-const SYNTH_PATCH:   u8 = 0;
 const SYNTH_NOTE:    u8 = 57; // A3 — comfortable lead-line pitch
-const BELL_PATCH:    u8 = 2;  // Stage 6a FM2OP — bound to channel 2 in init().
-const SAMPLER_PATCH: u8 = 3;  // Stage 6b sampler patch — bound to channel 3.
-const SAMPLER_SLOT:  u8 = 0;  // Cart sample bank slot for the pitched tone.
-const SAMPLER_SAMPLE_LEN: usize = 4096;
+const BELL_PATCH:    u8 = 2;  // FM2OP — bound to channel 2 in init().
+const SAMPLER_PATCH: u8 = 3;  // sampler patch — bound to channel 3.
 
 // ── Embers ────────────────────────────────────────────────────────────────
 // The §10.3 CA only spreads fire cell-by-cell to cardinal neighbors.
@@ -208,75 +202,9 @@ static mut CRATES_SPAWNED: bool = false;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn init() {
-    // ── Materials ─────────────────────────────────────────────
-    material_define(M_STONE, Material::pack_color(14, 1), 0, MaterialFlags::empty());
-    material_define(M_DIRT,  Material::pack_color( 0, 1), 0, MaterialFlags::empty());
-    material_define(M_GRASS, Material::pack_color( 3, 2), 0, MaterialFlags::empty());
-    // Wood + leaves are flammable; they ignite into M_FIRE. Wood holds
-    // out a bit longer than leaves (higher heat threshold) so the
-    // trunk doesn't immediately collapse the moment a leaf catches.
-    material_define(
-        M_WOOD,
-        Material::pack_color( 0, 0), 0,
-        MaterialFlags::empty().with(MaterialFlags::FLAMMABLE),
-    );
-    material_set_ca(M_WOOD, /*threshold*/90, 0, 0, /*ignites_to*/M_FIRE);
-    material_define(
-        M_LEAF,
-        Material::pack_color( 2, 2), 0,
-        MaterialFlags::empty().with(MaterialFlags::FLAMMABLE),
-    );
-    material_set_ca(M_LEAF, /*threshold*/60, 0, 0, /*ignites_to*/M_FIRE);
-    material_define(M_SKIN,  Material::pack_color( 1, 3), 0, MaterialFlags::empty());
-    material_define(M_SHIRT, Material::pack_color( 7, 2), 0, MaterialFlags::empty());
-    // Sign body = warm dark wood; face = bright emissive accent so the
-    // letters glow off the front of the slab.
-    material_define(M_SIGN_BODY, Material::pack_color( 0, 0), 0, MaterialFlags::empty());
-    material_define(M_SIGN_FACE, Material::pack_color(13, 3), 12, MaterialFlags::empty());
-    // Bright red glowing reticle voxel — painted each frame at the
-    // player's look-at point via the new physics::raycast import.
-    material_define(M_RETICLE,   Material::pack_color(10, 3), 14, MaterialFlags::empty());
-    // Sand: granular CA flag drives the pile-into-angle-of-repose
-    // behavior in §10.3. Color is a warm tan in the Yellow ramp.
-    material_define(
-        M_SAND,
-        Material::pack_color(12, 2),
-        0,
-        MaterialFlags::empty().with(MaterialFlags::GRANULAR),
-    );
-    // Water: LIQUID flag drives the lateral-spread CA rule. Color is
-    // a saturated cyan so the contrast with the dirt below reads.
-    material_define(
-        M_WATER,
-        Material::pack_color(5, 2),
-        0,
-        MaterialFlags::empty().with(MaterialFlags::LIQUID),
-    );
-    // Fire: bright orange + strong emission so it reads against the
-    // green forest. ca_lifetime=12 keeps each fire cell short-lived,
-    // matching the §10.3 4-bit cap and giving the cascade through a
-    // tree a snappy feel.
-    material_define(
-        M_FIRE,
-        Material::pack_color(11, 3),
-        14,
-        MaterialFlags::empty().with(MaterialFlags::FIRE),
-    );
-    material_set_ca(M_FIRE, 0, /*lifetime*/15, 0, 0);
-    // Ember: bright yellow + max emission, no CA flags. The cart
-    // moves these voxels manually each tick (write at new pos, clear
-    // at last pos), so they read as little glowing dots arcing
-    // through the air without ever entering the §10.3 active set.
-    material_define(
-        M_EMBER,
-        Material::pack_color(12, 3),
-        15,
-        MaterialFlags::empty(),
-    );
-    // Crate: warm bright orange. Painted into per-body owned actors
-    // for the §10.2 rigid-body demo; the actors follow the host's
-    // integrated body positions each frame (sync done in bodies::step).
-    material_define(M_CRATE, Material::pack_color(11, 2), 0, MaterialFlags::empty());
+    // Materials live in materials.toml — the bundler emits them into
+    // the cart's Materials section and the host pre-populates the
+    // table before this function runs (SPEC.md §7).
 
     sky_set_gradient(Material::pack_color(7, 0), Material::pack_color(6, 0));
     light_set_sun(Vec3::new(-0.6, 0.8, 0.4), 0, 0);
@@ -439,295 +367,29 @@ pub extern "C" fn init() {
         KICK_ACTION = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "kick");
     }
 
-    // ── Audio: configure patch 0 as a dual-saw lead ──
-    // Osc A: clean saw at root pitch. Osc B: saw detuned +7 cents
-    // for a fat unison-detune feel. LP filter at ~2.5 kHz that opens
-    // when the filter envelope rises. Snappy amp env so the note
-    // speaks immediately; release a touch long so taps don't click
-    // off. Gentle 6 Hz pitch vibrato keeps held notes alive.
-    audio::patch_set_osc(SYNTH_PATCH, 0, OscMode::Saw, /*detune*/0,   /*octave*/0, /*level*/110);
-    audio::patch_set_osc(SYNTH_PATCH, 1, OscMode::Saw, /*detune*/7,   /*octave*/0, /*level*/80);
-    audio::patch_set_filter(SYNTH_PATCH, FilterMode::LowPass, /*cutoff_hz*/2500, /*resonance*/30);
-    audio::patch_set_amp_env(SYNTH_PATCH, AudioEnv {
-        attack_ms: 5, decay_ms: 120, sustain: 90, release_ms: 220,
-    });
-    audio::patch_set_filter_env(SYNTH_PATCH, AudioEnv {
-        attack_ms: 3, decay_ms: 240, sustain: 30, release_ms: 200,
-    }, /*depth*/64);
-    audio::patch_set_lfo(SYNTH_PATCH,
-        /*rate_centihz*/600, LfoShape::Sine, LfoTarget::Pitch, /*depth*/4);
-    audio::patch_set_glide(SYNTH_PATCH, 0);
+    // Patches, sample bank, and songs live in audio/patches.toml +
+    // audio/samples/ + audio/songs/. The bundler packs them into the
+    // cart's Audio section and the host replays them into the audio
+    // state before `init` runs (SPEC.md §5, §7).
 
-    // ── Audio: configure patch 1 as an FM2OP bell (Stage 6a) ──
-    // osc A is the carrier; osc B's level (127) sets the modulator
-    // amplitude. `fm_ratio = 1.5` (Q8.8 = 384) gives the major-fifth
-    // ratio that produces classic inharmonic bell partials;
-    // `fm_index = 3.0` (Q8.8 = 768) is bright but not noisy. Filter
-    // envelope drives the modulator's amplitude over time — a fast
-    // exponential-ish decay (decay 200 ms, sustain 0) gives the
-    // characteristic struck-bell "strike, then fade" timbre.
-    audio::patch_set_osc(BELL_PATCH, 0, OscMode::Fm2Op, 0, /*octave*/0, /*level*/127);
-    audio::patch_set_osc(BELL_PATCH, 1, OscMode::Sine,  0, 0, /*level*/127);
-    audio::patch_set_fm(BELL_PATCH, /*ratio*/384, /*index*/768);
-    audio::patch_set_filter(BELL_PATCH, FilterMode::Off, 0, 0);
-    audio::patch_set_amp_env(BELL_PATCH, AudioEnv {
-        attack_ms: 1, decay_ms: 600, sustain: 0, release_ms: 200,
-    });
-    audio::patch_set_filter_env(BELL_PATCH, AudioEnv {
-        attack_ms: 1, decay_ms: 200, sustain: 0, release_ms: 100,
-    }, /*depth*/0);
-    audio::patch_set_lfo(BELL_PATCH,
-        /*rate_centihz*/0, LfoShape::Sine, LfoTarget::Pitch, /*depth*/0);
-    audio::patch_set_glide(BELL_PATCH, 0);
-    // Channel 2 → bell patch. The default identity map is ch2→patch2,
-    // so this is technically redundant, but spell it out for the demo.
+    // Channel routing + FX bus tuning is still game logic — these
+    // calls configure how the cart's runtime traffic flows through
+    // the assets above.
     audio::program_change(/*channel*/2, BELL_PATCH);
-    // Wet send for the bell — long reverb tail completes the chime feel.
     audio::cc(/*channel*/2, CC_REVERB_SEND, 90);
-
-    // ── Audio: register a pitched-tone sample + sampler patch (Stage 6b) ──
-    // 4096-frame sample at 22.05 kHz of a sine-plus-3rd-harmonic
-    // sawtooth-ish wave, with a short fade-in/out so the loop point
-    // doesn't click. Played at root note 60 (C4) the underlying pitch
-    // is `22050 / 4096 * 2 = ~10.7 Hz × N harmonics`, so we'll set the
-    // loop region tight to make it a periodic chord-ish tone. The
-    // sampler patch shapes it with a soft amp env so the cart's
-    // melodic line on channel 3 reads as a sustained pad.
-    {
-        // Stack-local buffer — host copies bytes during sample_register.
-        // We build the waveform without transcendentals so the cart
-        // stays no_std-clean (no libm dependency). A triangle + saw
-        // mix gives a "reedy" timbre that pitch-shifts cleanly when
-        // the sampler resamples it per-note.
-        let mut buf = [128u8; SAMPLER_SAMPLE_LEN];
-        let freq_at_root_hz: f32 = 261.63; // C4 — root note 60
-        let period_samples = (22050.0 / freq_at_root_hz) as usize; // ~84 frames
-        for i in 0..SAMPLER_SAMPLE_LEN {
-            let phase = (i % period_samples) as f32 / period_samples as f32;
-            // Triangle in [-1, 1]: 1 - 2|phase - 0.5| folded × 2.
-            let tri = 1.0 - 4.0 * (phase - 0.5).abs();
-            // Saw in [-1, 1].
-            let saw = 2.0 * phase - 1.0;
-            // Triangle-dominant blend: woody + reedy without sounding harsh.
-            let s = 0.75 * tri + 0.25 * saw;
-            // Edge taper so the start + end of the loop don't click.
-            let edge_taper = if i < 64 {
-                i as f32 / 64.0
-            } else if i > SAMPLER_SAMPLE_LEN - 64 {
-                (SAMPLER_SAMPLE_LEN - i) as f32 / 64.0
-            } else {
-                1.0
-            };
-            let sample = (s * 100.0 * edge_taper) + 128.0;
-            buf[i] = sample.clamp(0.0, 255.0) as u8;
-        }
-        // Loop the central periodic region — 4 full periods past the
-        // attack tail, ending 4 periods before the release tail.
-        let lp_start = 64u32;
-        let lp_end = (SAMPLER_SAMPLE_LEN as u32 - 64).max(lp_start + 1);
-        audio::sample_register(SAMPLER_SLOT, &buf, SampleRate::Khz22_05, Some((lp_start, lp_end)));
-    }
-
-    audio::patch_set_kind(SAMPLER_PATCH, PatchKind::Sampler);
-    audio::patch_set_zone(SAMPLER_PATCH, 0, KeyZone {
-        low_note: 36, high_note: 96,
-        root_note: 60,            // C4 plays at the encoded pitch
-        sample_slot: SAMPLER_SLOT,
-        volume_offset: 0,
-        loop_points: Some((64, (SAMPLER_SAMPLE_LEN as u32 - 64).max(65))),
-    });
-    audio::patch_set_zone_count(SAMPLER_PATCH, 1);
-    audio::patch_set_filter(SAMPLER_PATCH, FilterMode::LowPass, /*cutoff*/3200, /*res*/20);
-    audio::patch_set_amp_env(SAMPLER_PATCH, AudioEnv {
-        attack_ms: 40, decay_ms: 120, sustain: 100, release_ms: 220,
-    });
-    audio::patch_set_filter_env(SAMPLER_PATCH, AudioEnv {
-        attack_ms: 60, decay_ms: 200, sustain: 80, release_ms: 200,
-    }, /*depth*/40);
-    audio::patch_set_lfo(SAMPLER_PATCH,
-        /*rate_centihz*/400, LfoShape::Sine, LfoTarget::Pitch, /*depth*/2);
     audio::program_change(/*channel*/3, SAMPLER_PATCH);
-    // Pad-like wash: reverb high, delay light.
     audio::cc(/*channel*/3, CC_REVERB_SEND, 80);
     audio::cc(/*channel*/3, CC_DELAY_SEND,  20);
-
-    // Stage-5 effects bus tuning. Bigger room with mild damping gives
-    // the lead a sense of space; a snappy 180 ms ping-pong delay with
-    // moderate feedback puts the drums in their own little echo
-    // chamber. CC 91 / 93 below set the per-channel send amounts.
     audio::reverb_set(/*room_size*/80, /*damping*/40);
     audio::delay_set(/*time_ms*/180, /*feedback*/55);
-    // Lead channel: a touch of reverb so it sits in a space.
     audio::cc(/*channel*/0, CC_REVERB_SEND, 60);
-    // Drum channel: just delay (reverb on percussion smears the
-    // groove). Light send so the kick/snare get a tiny tail.
-    audio::cc(DRUM_CHANNEL,    CC_DELAY_SEND,  35);
-
-    // Stage-4a music demo: build a tiny SMF in-place and hand it to
-    // the host. The bytes get parsed, copied into song slot 0, and
-    // the local buffer goes out of scope cleanly. `music_play(0,
-    // true)` later (on FIRE) loops the bar for as long as the game
-    // scene is active.
-    build_and_load_demo_song();
+    audio::cc(DRUM_CHANNEL, CC_DELAY_SEND,  35);
 
     // Boot into the title screen. The world is now fully built; the
     // first fire gets dropped *after* the player presses FIRE and the
     // game scene becomes active (so the burn doesn't tick down
     // invisibly behind the title).
     scene_set_active(SCENE_TITLE);
-}
-
-// ── SMF demo song (§5.3) ──────────────────────────────────────────
-//
-// One-bar groove at 120 BPM, PPQ 96. Drums on channel 9 use the
-// host's boot-synthesized drum kit (kick 36, snare 38, closed hat
-// 42). Lead on channel 0 uses the patch we built above (dual saw,
-// LP filter, slight vibrato) playing an A-minor-pentatonic 8th-note
-// figure that ascends and descends across the bar.
-//
-// Absolute-tick event table — `(tick, status, data1, data2)`. For
-// 1-data-byte channel events (PC, ChPress) we don't use any here.
-// All entries are 2-data-byte NoteOn (0x9_) or NoteOff (0x8_).
-const DEMO_EVENTS: &[(u32, u8, u8, u8)] = &[
-    // tick 0: kick + hat + lead A3 on + bell A5 on (FM2OP, Stage 6a)
-    //         + sampler pad A3 (Stage 6b sustained chord tone)
-    (0,   0x99, 36, 110),
-    (0,   0x99, 42, 70),
-    (0,   0x90, 57, 100),
-    (0,   0x92, 81, 90),    // ch2 bell A5 — strike + long ring
-    (0,   0x93, 57, 80),    // ch3 sampler pad A3
-    (40,  0x80, 57, 0),     // A3 off
-    // tick 48: hat + lead C4 on
-    (48,  0x99, 42, 70),
-    (48,  0x90, 60, 100),
-    (88,  0x80, 60, 0),
-    // tick 96: snare + hat + lead D4 on
-    (96,  0x99, 38, 100),
-    (96,  0x99, 42, 70),
-    (96,  0x90, 62, 100),
-    (136, 0x80, 62, 0),
-    // tick 144: hat + lead E4 on
-    (144, 0x99, 42, 70),
-    (144, 0x90, 64, 100),
-    (184, 0x80, 64, 0),
-    // tick 188: bell A5 off + sampler pad A3 off — both fall back
-    // into release on the beat-3 transition.
-    (188, 0x82, 81, 0),
-    (188, 0x83, 57, 0),
-    // tick 192 (beat 3): kick + hat + lead G4 on + bell E5 on
-    //                    + sampler pad E3 (a fifth below)
-    (192, 0x99, 36, 110),
-    (192, 0x99, 42, 70),
-    (192, 0x90, 67, 100),
-    (192, 0x92, 76, 90),    // ch2 bell E5
-    (192, 0x93, 52, 80),    // ch3 sampler pad E3
-    (232, 0x80, 67, 0),
-    // tick 240: hat + lead E4 on
-    (240, 0x99, 42, 70),
-    (240, 0x90, 64, 100),
-    (280, 0x80, 64, 0),
-    // tick 288: snare + hat + lead D4 on
-    (288, 0x99, 38, 100),
-    (288, 0x99, 42, 70),
-    (288, 0x90, 62, 100),
-    (328, 0x80, 62, 0),
-    // tick 336: hat + lead C4 on
-    (336, 0x99, 42, 70),
-    (336, 0x90, 60, 100),
-    (376, 0x80, 60, 0),
-    // tick 380: bell E5 off + sampler pad E3 off just before the bar wrap
-    (380, 0x82, 76, 0),
-    (380, 0x83, 52, 0),
-];
-
-/// PPQ for the demo song. 96 ticks per quarter is a common DAW
-/// default that keeps deltas small (1-byte VLQs throughout).
-const DEMO_PPQ: u16 = 96;
-
-fn build_and_load_demo_song() {
-    // 512 bytes is comfortably more than the ~150 we need for this
-    // 28-event bar; lives on the wasm stack (default 64 KB) and is
-    // freed when the function returns. The host has already copied
-    // the parsed event list by then.
-    let mut buf = [0u8; 512];
-    let mut pos = 0usize;
-
-    // MThd
-    buf[pos..pos + 4].copy_from_slice(b"MThd");
-    pos += 4;
-    write_u32_be(&mut buf, &mut pos, 6);
-    write_u16_be(&mut buf, &mut pos, 0);          // format 0
-    write_u16_be(&mut buf, &mut pos, 1);          // ntrk = 1
-    write_u16_be(&mut buf, &mut pos, DEMO_PPQ);
-
-    // MTrk — length is patched up after we know the body size.
-    buf[pos..pos + 4].copy_from_slice(b"MTrk");
-    pos += 4;
-    let len_pos = pos;
-    write_u32_be(&mut buf, &mut pos, 0);          // placeholder
-    let body_start = pos;
-
-    // Body: every event encodes (delta_ticks VLQ, status, data1, data2).
-    let mut prev_tick: u32 = 0;
-    for &(tick, status, d1, d2) in DEMO_EVENTS {
-        let delta = tick - prev_tick;
-        write_vlq(&mut buf, &mut pos, delta);
-        buf[pos] = status; pos += 1;
-        buf[pos] = d1;     pos += 1;
-        buf[pos] = d2;     pos += 1;
-        prev_tick = tick;
-    }
-    // End-of-track at the bar boundary (tick 384). EOT meta event is
-    // mandatory and tells the parser this track has no more events.
-    let trailing = 384u32 - prev_tick;
-    write_vlq(&mut buf, &mut pos, trailing);
-    buf[pos]     = 0xFF;
-    buf[pos + 1] = 0x2F;
-    buf[pos + 2] = 0x00;
-    pos += 3;
-
-    // Patch in the MTrk length.
-    let body_len = (pos - body_start) as u32;
-    let mut lp = len_pos;
-    write_u32_be(&mut buf, &mut lp, body_len);
-
-    let ok = audio::music_load(0, &buf[..pos]);
-    debug_assert!(ok, "demo SMF failed to parse");
-}
-
-fn write_u16_be(buf: &mut [u8], pos: &mut usize, v: u16) {
-    buf[*pos]     = (v >> 8) as u8;
-    buf[*pos + 1] = (v & 0xFF) as u8;
-    *pos += 2;
-}
-
-fn write_u32_be(buf: &mut [u8], pos: &mut usize, v: u32) {
-    buf[*pos]     = ((v >> 24) & 0xFF) as u8;
-    buf[*pos + 1] = ((v >> 16) & 0xFF) as u8;
-    buf[*pos + 2] = ((v >> 8) & 0xFF) as u8;
-    buf[*pos + 3] = (v & 0xFF) as u8;
-    *pos += 4;
-}
-
-fn write_vlq(buf: &mut [u8], pos: &mut usize, mut v: u32) {
-    // VLQ is little-endian 7-bit groups *written* in big-endian byte
-    // order with MSB-set on all but the last byte. Bounded at 4 bytes
-    // (max 0x0FFF_FFFF) per the MIDI spec.
-    let mut tmp = [0u8; 4];
-    let mut n = 0;
-    tmp[n] = (v & 0x7F) as u8;
-    n += 1;
-    v >>= 7;
-    while v > 0 {
-        tmp[n] = ((v & 0x7F) as u8) | 0x80;
-        n += 1;
-        v >>= 7;
-    }
-    // Write in reverse: continuation bytes first, last byte (no MSB) last.
-    for i in (0..n).rev() {
-        buf[*pos] = tmp[i];
-        *pos += 1;
-    }
 }
 
 // ── Embers + RNG helpers ──────────────────────────────────────────────────

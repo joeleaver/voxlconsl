@@ -1,19 +1,24 @@
 //! Bundler: turn a cart project directory into a `.voxl` cart.
 //!
-//! v1 ships a deliberately minimal pipeline:
+//! Pipeline:
 //!
-//!   1. Parse `cart.toml` (only the `[cart]` and `[code]` blocks are
-//!      required in v1; everything else — materials, world, audio,
-//!      save — is parking-lotted to later sessions).
+//!   1. Parse `cart.toml` (`[cart]` + `[code]` required; `[materials]`
+//!      and `[audio]` optional and emitted as their own sections when
+//!      present).
 //!   2. Either invoke `cargo build` for the cart's WASM crate, or use
 //!      a pre-built `.wasm` path — whichever the manifest specifies.
-//!   3. Wrap the WASM bytes in a `.voxl` carrying a Metadata section
-//!      (the `[cart]` block as TOML) plus the Code section.
+//!   3. Pack the resulting sections (Metadata, Code, optionally
+//!      Materials and Audio) into a `.voxl` with header + section
+//!      table + payload area.
 //!   4. Compute the CRC and emit.
 //!
-//! Materials, world, audio, save schema sections are not yet emitted;
-//! they'll be wired in as the corresponding host subsystems land. A v1
-//! cart is fully valid with just metadata + code.
+//! World and SaveSchema sections are not yet emitted; the World section
+//! needs a `.vxv` reader (priority 5 in the roadmap) and SaveSchema is
+//! documentation-only per spec.
+
+mod audio;
+mod materials;
+mod wav;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,12 +44,22 @@ pub enum BundleError {
     CartTooLarge(u64),
     #[error("cargo build failed (exit status {0:?})")]
     BuildFailed(Option<i32>),
+    #[error("{0}")]
+    Asset(String),
+    #[error("asset io: {0}")]
+    AssetIo(String),
+    #[error("asset parse: {0}")]
+    AssetParse(String),
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct ManifestRoot {
     cart: CartTable,
     code: CodeTable,
+    #[serde(default)]
+    materials: Option<MaterialsTable>,
+    #[serde(default)]
+    audio: Option<audio::AudioManifest>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
@@ -74,6 +89,13 @@ struct CodeTable {
     output: Option<PathBuf>,
     #[serde(default)]
     wasm: Option<PathBuf>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MaterialsTable {
+    /// Path (relative to project_dir) of the `materials.toml` declaring
+    /// the 256-entry material table.
+    file: PathBuf,
 }
 
 /// Build a cart in `project_dir`. Returns the bundled `.voxl` bytes.
@@ -127,22 +149,51 @@ pub fn bundle_cart(project_dir: &Path) -> Result<Vec<u8>, BundleError> {
         );
     }
 
-    write_voxl(&manifest.cart, &wasm)
+    let materials_bytes = match &manifest.materials {
+        Some(m) => Some(materials::build_materials_section(&project_dir.join(&m.file))?),
+        None => None,
+    };
+
+    let audio_bytes = match &manifest.audio {
+        Some(a) => audio::build_audio_section(project_dir, a)?,
+        None => None,
+    };
+
+    let metadata_toml = toml::to_string(&manifest.cart)
+        .expect("CartTable serialization is infallible");
+
+    let mut sections: Vec<(SectionId, Vec<u8>)> = Vec::new();
+    sections.push((SectionId::Metadata, metadata_toml.into_bytes()));
+    sections.push((SectionId::Code, wasm));
+    if let Some(bytes) = materials_bytes {
+        sections.push((SectionId::Materials, bytes));
+    }
+    if let Some(bytes) = audio_bytes {
+        sections.push((SectionId::Audio, bytes));
+    }
+
+    assemble_voxl(&sections)
 }
 
-/// Write a `.voxl` blob from a metadata table + code bytes.
-pub fn write_voxl(cart_table: &CartTable, code: &[u8]) -> Result<Vec<u8>, BundleError> {
-    let metadata_toml = toml::to_string(cart_table)
-        .expect("CartTable serialization is infallible");
-    let metadata_bytes = metadata_toml.as_bytes();
+/// Pack a list of `(SectionId, payload)` into a `.voxl` blob: header +
+/// section table + payloads, with CRC computed last. Section ids must
+/// be unique; the order of the list controls on-disk layout.
+fn assemble_voxl(sections: &[(SectionId, Vec<u8>)]) -> Result<Vec<u8>, BundleError> {
+    let section_count = sections.len();
+    if section_count > u8::MAX as usize {
+        return Err(BundleError::ManifestInvalid("too many sections"));
+    }
+    let table_size = section_count * SECTION_ENTRY_SIZE;
+    let payload_start = HEADER_SIZE + table_size;
 
-    // 2 sections in v1: Metadata then Code.
-    let section_count = 2u8;
-    let table_size = section_count as usize * SECTION_ENTRY_SIZE;
-    let metadata_offset = HEADER_SIZE + table_size;
-    let code_offset = metadata_offset + metadata_bytes.len();
-    let total = code_offset + code.len();
-
+    // Layout payloads back-to-back after the table.
+    let mut offsets = Vec::with_capacity(section_count);
+    let mut cursor = payload_start;
+    for (_id, payload) in sections {
+        offsets.push(cursor);
+        cursor += payload.len();
+    }
+    let total = cursor;
     if total as u64 > MAX_TOTAL_SIZE as u64 {
         return Err(BundleError::CartTooLarge(total as u64));
     }
@@ -153,30 +204,37 @@ pub fn write_voxl(cart_table: &CartTable, code: &[u8]) -> Result<Vec<u8>, Bundle
     buf[..10].copy_from_slice(&MAGIC);
     buf[10..12].copy_from_slice(&VERSION.to_le_bytes());
     // flags = 0 (already zero-init)
-    buf[14] = section_count;
+    buf[14] = section_count as u8;
     buf[16..20].copy_from_slice(&(total as u32).to_le_bytes());
-    // CRC patched after the rest of the file is laid out.
 
     // Section table
-    write_section_entry(
-        &mut buf, HEADER_SIZE,
-        SectionId::Metadata, metadata_offset, metadata_bytes.len(),
-    );
-    write_section_entry(
-        &mut buf, HEADER_SIZE + SECTION_ENTRY_SIZE,
-        SectionId::Code, code_offset, code.len(),
-    );
+    for (i, ((id, payload), offset)) in sections.iter().zip(&offsets).enumerate() {
+        let at = HEADER_SIZE + i * SECTION_ENTRY_SIZE;
+        write_section_entry(&mut buf, at, *id, *offset, payload.len());
+    }
 
-    // Section payloads
-    buf[metadata_offset..metadata_offset + metadata_bytes.len()]
-        .copy_from_slice(metadata_bytes);
-    buf[code_offset..code_offset + code.len()].copy_from_slice(code);
+    // Payloads
+    for ((_id, payload), offset) in sections.iter().zip(&offsets) {
+        buf[*offset..*offset + payload.len()].copy_from_slice(payload);
+    }
 
     // CRC last.
     let crc = crc32_with_zeroed_field(&buf, CRC_FIELD_OFFSET);
     buf[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
 
     Ok(buf)
+}
+
+/// Convenience: pack the legacy 2-section minimum (Metadata + Code).
+/// Used by tests and any caller that doesn't go through `bundle_cart`.
+pub fn write_voxl(cart_table: &CartTable, code: &[u8]) -> Result<Vec<u8>, BundleError> {
+    let metadata_toml = toml::to_string(cart_table)
+        .expect("CartTable serialization is infallible");
+    let sections = vec![
+        (SectionId::Metadata, metadata_toml.into_bytes()),
+        (SectionId::Code, code.to_vec()),
+    ];
+    assemble_voxl(&sections)
 }
 
 fn write_section_entry(buf: &mut [u8], at: usize, id: SectionId, offset: usize, size: usize) {

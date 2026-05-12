@@ -10,8 +10,9 @@
     <main>
         <div class="screen-frame">
             <canvas id="screen" width="256" height="144"></canvas>
+            <div id="status">loading…</div>
         </div>
-        <div id="status">loading…</div>
+        <section id="cart-library" aria-label="Cart library"></section>
     </main>
     <!-- Register the COOP/COEP service worker BEFORE main.js so the
          Stage-4b AudioWorklet path has SharedArrayBuffer available.
@@ -51,7 +52,7 @@
             // gracefully), load the main app.
             const s = document.createElement("script");
             s.type = "module";
-            s.src = "main.js?v=worklet5";
+            s.src = "main.js?v=cartlibrary1";
             document.body.appendChild(s);
         })();
     </script>

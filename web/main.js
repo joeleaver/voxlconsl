@@ -34,13 +34,44 @@ async function start() {
         return;
     }
 
+    // Cart picker: enumerate /carts/index.json (built by
+    // scripts/build-web.sh), pick the one named by ?cart=NAME, fall
+    // back to the first listed cart, and hand its bytes to
+    // BrowserHost::new_with_cart. If the manifest fetch fails for any
+    // reason (offline, GH Pages glitch, hand-rolled deploy), we fall
+    // back to the embedded cart via the no-args constructor.
     let host;
+    const params = new URLSearchParams(window.location.search);
+    let manifest = null;
+    let chosenCart = null;
     try {
-        host = new BrowserHost();
-    } catch (err) {
-        status.textContent = `cart load failed: ${err}`;
-        console.error(err);
-        return;
+        const r = await fetch("carts/index.json", { cache: "no-store" });
+        if (r.ok) manifest = await r.json();
+    } catch (_) { /* fall through to embedded */ }
+
+    if (manifest && manifest.carts && manifest.carts.length > 0) {
+        const want = params.get("cart");
+        chosenCart = manifest.carts.find((c) => c.name === want) || manifest.carts[0];
+        try {
+            const r = await fetch(`carts/${chosenCart.file}`, { cache: "no-store" });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const bytes = new Uint8Array(await r.arrayBuffer());
+            host = BrowserHost.new_with_cart(bytes);
+            populateCartPicker(manifest.carts, chosenCart.name);
+            status.textContent = `loaded ${chosenCart.name} (${bytes.length} bytes)`;
+        } catch (err) {
+            console.warn(`fetching ${chosenCart.file} failed, falling back to embedded cart:`, err);
+            chosenCart = null;
+        }
+    }
+    if (!host) {
+        try {
+            host = new BrowserHost();
+        } catch (err) {
+            status.textContent = `cart load failed: ${err}`;
+            console.error(err);
+            return;
+        }
     }
 
     const canvas = document.getElementById("screen");
@@ -519,6 +550,31 @@ async function start() {
         requestAnimationFrame(frame);
     }
     requestAnimationFrame(frame);
+}
+
+/// Populate the `<section id="cart-library">` element (if present in
+/// the page) with one tile per cart in the manifest. Clicking a tile
+/// navigates to `?cart=NAME` and reloads — page reload is the simplest
+/// teardown for the host + AudioContext + worklet, and gives a clean
+/// starting state every time.
+function populateCartPicker(carts, currentName) {
+    const library = document.getElementById("cart-library");
+    if (!library) return;
+    library.innerHTML = "";
+    for (const c of carts) {
+        const tile = document.createElement("button");
+        tile.type = "button";
+        tile.className = "cart-tile";
+        if (c.name === currentName) tile.classList.add("active");
+        tile.textContent = c.name;
+        tile.addEventListener("click", () => {
+            if (c.name === currentName) return;
+            const url = new URL(window.location.href);
+            url.searchParams.set("cart", c.name);
+            window.location.href = url.toString();
+        });
+        library.appendChild(tile);
+    }
 }
 
 start();

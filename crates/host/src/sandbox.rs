@@ -20,7 +20,7 @@ use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
 use voxlconsl_types::{
     ActionKind, ActorId, BindingHint, BodyId, BodyKind, Material, MaterialFlags, Orientation,
     PrefabId, Shape, ShapeTag, U8Vec3, Vec3,
-    cart_format::{Cart as VoxlCart, CartError as VoxlError, MAGIC as VOXL_MAGIC},
+    cart_format::{Cart as VoxlCart, CartError as VoxlError, MAGIC as VOXL_MAGIC, SectionId},
 };
 
 use crate::renderer::Camera;
@@ -60,16 +60,27 @@ impl Cart {
         // Auto-detect: try the .voxl path when the magic matches; fall
         // back to raw WASM otherwise. Lets us flip browser-host /
         // CLI / tests at our own pace.
-        let wasm_bytes: &[u8] = if bytes.len() >= VOXL_MAGIC.len() && bytes[..VOXL_MAGIC.len()] == VOXL_MAGIC {
-            let cart = VoxlCart::parse(bytes)?;
-            cart.code()
-        } else {
-            bytes
-        };
+        let (wasm_bytes, materials_bytes, audio_bytes): (&[u8], Option<&[u8]>, Option<&[u8]>) =
+            if bytes.len() >= VOXL_MAGIC.len() && bytes[..VOXL_MAGIC.len()] == VOXL_MAGIC {
+                let cart = VoxlCart::parse(bytes)?;
+                let code = cart.code();
+                let materials = cart.section_bytes(SectionId::Materials);
+                let audio = cart.section_bytes(SectionId::Audio);
+                (code, materials, audio)
+            } else {
+                (bytes, None, None)
+            };
 
         let engine = Engine::default();
         let module = Module::new(&engine, wasm_bytes)?;
-        let mut store = Store::new(&engine, WorldState::new());
+        let mut world = WorldState::new();
+        if let Some(mb) = materials_bytes {
+            apply_materials_section(&mut world, mb);
+        }
+        if let Some(ab) = audio_bytes {
+            apply_audio_section(&mut world, ab);
+        }
+        let mut store = Store::new(&engine, world);
 
         let mut linker = Linker::new(&engine);
         register_host_imports(&mut linker)?;
@@ -106,6 +117,72 @@ impl Cart {
     pub fn world(&mut self) -> &mut WorldState {
         self.store.data_mut()
     }
+}
+
+/// Copy a `.voxl` Materials section payload into `world.materials`.
+/// Silently ignores a malformed-size section (parser already validates
+/// the section bounds; we just need the right multiple of 16 bytes).
+///
+/// We cast the *destination* slice to bytes rather than the source —
+/// the .voxl byte slice is borrowed from `include_bytes!`/file memory
+/// at u8 alignment, but `Material` has u16 fields so the cast direction
+/// `&[u8] → &[Material]` can fail an alignment check. The destination
+/// is heap-allocated and properly aligned, so `&mut [Material] → &mut
+/// [u8]` always works.
+fn apply_materials_section(world: &mut WorldState, bytes: &[u8]) {
+    const EXPECTED: usize = 256 * core::mem::size_of::<Material>();
+    if bytes.len() != EXPECTED {
+        return;
+    }
+    let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut world.materials[..]);
+    dst.copy_from_slice(bytes);
+}
+
+/// Parse a `.voxl` Audio section payload and replay its entries into
+/// the world's audio state + event log. Patches update the main-thread
+/// shadow via `audio.patch_load` AND emit per-field events the worklet
+/// will consume on the first drain. Samples + songs are event-only
+/// (the shadow no longer stores either; the worklet is authoritative).
+fn apply_audio_section(world: &mut WorldState, section: &[u8]) {
+    use voxlconsl_audio::audio_section::{
+        entries as iter_entries, KIND_PATCH, KIND_SAMPLE, KIND_SONG,
+    };
+    for entry in iter_entries(section) {
+        match entry.kind {
+            KIND_PATCH => apply_patch_entry(world, entry),
+            KIND_SAMPLE => apply_sample_entry(world, entry),
+            KIND_SONG => {
+                world.audio_events.push_music_load(entry.slot, entry.data);
+            }
+            _ => {} // tolerate unknown kinds
+        }
+    }
+}
+
+fn apply_patch_entry(world: &mut WorldState, entry: voxlconsl_audio::audio_section::Entry<'_>) {
+    // Update the main-thread shadow so `patch_save` reads the loaded
+    // values; ignore failure (e.g. bad VPCH magic) — the shadow keeps
+    // its default. Either way, replay events so the worklet stays in
+    // sync with whatever the cart authored.
+    let _ = world.audio.patch_load(entry.slot, entry.data);
+    if let Some(patch) = voxlconsl_audio::patch_blob_load(entry.data) {
+        world.audio_events.push_patch_full(entry.slot, &patch);
+    }
+}
+
+fn apply_sample_entry(world: &mut WorldState, entry: voxlconsl_audio::audio_section::Entry<'_>) {
+    let Some(view) = entry.as_sample() else { return };
+    // Map the source rate to the engine's two-bucket SampleRate enum.
+    // sample_load events use the same `rate_code` the cart-side
+    // `SampleRate` enum encodes: 0 = 11.025 kHz, 1 = 22.05 kHz.
+    let rate_code: u8 = if view.sample_rate_hz <= 11_025 { 0 } else { 1 };
+    let (loop_start, loop_end, flags) = match view.loop_points {
+        Some((s, e)) => (s, e, 1u8),
+        None => (0, 0, 0),
+    };
+    world.audio_events.push_sample_load(
+        entry.slot, rate_code, flags, loop_start, loop_end, view.pcm,
+    );
 }
 
 /// Bring the active scene's chunk SVOs and the actor macro-grid back
@@ -1269,4 +1346,110 @@ fn web_sys_log(_msg: &str) {
     // The `voxlconsl-host` crate avoids depending on web-sys; the browser
     // host crate sets this up. For now, drop the message — TODO: thread
     // through via a host-provided log callback.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_materials_section_overwrites_world_materials() {
+        let mut world = WorldState::new();
+        // Build a 256 × 16 Material array with slot 3 carrying a known
+        // signature so we can confirm the copy went through.
+        let mut table = vec![Material::AIR; 256];
+        table[3] = Material {
+            color: Material::pack_color(11, 2),
+            emission: 7,
+            flags: MaterialFlags::empty().with(MaterialFlags::FLAMMABLE),
+            ca_threshold: 90,
+            ca_lifetime: 0,
+            ca_viscosity: 0,
+            ignites_to: 13,
+            _reserved: [0; 8],
+        };
+        // table is already a Vec<Material> with proper alignment.
+        let bytes: &[u8] = bytemuck::cast_slice(&table[..]);
+        apply_materials_section(&mut world, bytes);
+        assert_eq!(world.materials[3].color, Material::pack_color(11, 2));
+        assert_eq!(world.materials[3].emission, 7);
+        assert!(world.materials[3].flags.contains(MaterialFlags::FLAMMABLE));
+        assert_eq!(world.materials[3].ca_threshold, 90);
+        assert_eq!(world.materials[3].ignites_to, 13);
+    }
+
+    #[test]
+    fn apply_audio_section_replays_patches_and_assets() {
+        use voxlconsl_audio::audio_section::{
+            ENTRY_SIZE, HEADER_SIZE, KIND_PATCH, KIND_SAMPLE, KIND_SONG,
+            MAGIC as AUDIO_MAGIC, NO_LOOP, SAMPLE_PREAMBLE_SIZE, VERSION as AUDIO_VERSION,
+        };
+
+        // Hand-built minimal section with one patch + one sample + one
+        // song. The patch payload is a VPCH blob with patch_load=true
+        // semantics so the shadow gets a known osc[0].mode.
+        let mut patch = voxlconsl_audio::Patch::default_synth();
+        patch.osc[0].mode = voxlconsl_audio::OscMode::Saw;
+        patch.osc[0].level = 99;
+        let mut patch_blob = [0u8; voxlconsl_audio::PATCH_BLOB_MAX];
+        let n = voxlconsl_audio::patch_blob_save(&patch, &mut patch_blob) as usize;
+        let patch_bytes = patch_blob[..n].to_vec();
+
+        let mut sample_payload = Vec::with_capacity(SAMPLE_PREAMBLE_SIZE + 4);
+        sample_payload.extend_from_slice(&22_050u32.to_le_bytes());
+        sample_payload.extend_from_slice(&NO_LOOP.to_le_bytes());
+        sample_payload.extend_from_slice(&0u32.to_le_bytes());
+        sample_payload.extend_from_slice(&[100u8, 110, 120, 130]);
+
+        let song_payload = b"MThd-stub".to_vec();
+
+        let payloads: [&[u8]; 3] = [&patch_bytes, &sample_payload, &song_payload];
+        let kinds = [KIND_PATCH, KIND_SAMPLE, KIND_SONG];
+        let slots = [7u8, 3, 1];
+        let mut section =
+            vec![0u8; HEADER_SIZE + payloads.len() * ENTRY_SIZE];
+        section[0..4].copy_from_slice(&AUDIO_MAGIC);
+        section[4] = AUDIO_VERSION;
+        section[6..8].copy_from_slice(&(payloads.len() as u16).to_le_bytes());
+        let mut offsets = Vec::with_capacity(3);
+        for p in &payloads {
+            offsets.push(section.len());
+            section.extend_from_slice(p);
+        }
+        for i in 0..3 {
+            let at = HEADER_SIZE + i * ENTRY_SIZE;
+            section[at] = kinds[i];
+            section[at + 1] = slots[i];
+            section[at + 4..at + 8]
+                .copy_from_slice(&(offsets[i] as u32).to_le_bytes());
+            section[at + 8..at + 12]
+                .copy_from_slice(&(payloads[i].len() as u32).to_le_bytes());
+        }
+
+        let mut world = WorldState::new();
+        apply_audio_section(&mut world, &section);
+
+        // Shadow received the patch (so `patch_save` would read it back).
+        let mut readback = [0u8; voxlconsl_audio::PATCH_BLOB_MAX];
+        let n2 = world.audio.patch_save(7, &mut readback);
+        assert!(n2 > 0);
+        let parsed = voxlconsl_audio::patch_blob_load(&readback[..n2 as usize]).unwrap();
+        assert_eq!(parsed.osc[0].mode, voxlconsl_audio::OscMode::Saw);
+        assert_eq!(parsed.osc[0].level, 99);
+
+        // Event log received a sample_load + music_load + patch field events.
+        assert!(!world.audio_events.buf.is_empty());
+    }
+
+    #[test]
+    fn apply_materials_section_ignores_wrong_length() {
+        let mut world = WorldState::new();
+        // Seed slot 5 with a value that should survive the ignored apply.
+        world.materials[5] = Material {
+            color: 42,
+            ..Material::AIR
+        };
+        apply_materials_section(&mut world, &[0u8; 10]); // way too short
+        assert_eq!(world.materials[5].color, 42);
+    }
 }

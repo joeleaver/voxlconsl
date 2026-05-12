@@ -384,6 +384,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
+name = "voxdude"
+version = "0.0.1"
+dependencies = [
+ "voxlconsl-sdk",
+]
+
+[[package]]
 name = "voxlconsl-audio"
 version = "0.0.1"
 
@@ -398,9 +405,11 @@ dependencies = [
 name = "voxlconsl-bundler"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "serde",
  "thiserror",
  "toml",
+ "voxlconsl-audio",
  "voxlconsl-svo",
  "voxlconsl-types",
 ]
@@ -419,6 +428,7 @@ dependencies = [
 name = "voxlconsl-host"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "voxlconsl-audio",
  "voxlconsl-svo",
  "voxlconsl-types",

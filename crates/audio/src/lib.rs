@@ -8,12 +8,14 @@
 mod audio;
 mod audio_fx;
 mod audio_patch_blob;
+pub mod audio_section;
 mod smf;
 
 pub use audio::*;
 pub use audio_fx::{DelayState, ReverbState};
 pub use audio_patch_blob::{
-    load as patch_blob_load, save as patch_blob_save, PATCH_BLOB_MAX, PATCH_HEADER_BYTES,
-    PATCH_ZONE_BYTES,
+    filter_mode_code, lfo_shape_code, lfo_target_code, load as patch_blob_load,
+    osc_mode_code, patch_kind_code, save as patch_blob_save, PATCH_BLOB_MAX,
+    PATCH_HEADER_BYTES, PATCH_ZONE_BYTES,
 };
 pub use smf::{parse as parse_smf, MidiEvent, SmfError, Song, TimedMidiEvent};

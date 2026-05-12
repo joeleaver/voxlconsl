@@ -1,0 +1,100 @@
+# big-world material table — see SPEC.md §12.6.2.
+#
+# Slot 0 is reserved for air. Every other slot the cart references in
+# code lives here. Adjust colour / emission / CA tuning here without
+# rebuilding the WASM; only the .voxl needs to be re-bundled.
+
+[[material]]
+slot  = 1
+name  = "stone"
+color = "cool_gray:1"
+
+[[material]]
+slot  = 2
+name  = "dirt"
+color = "brown:1"
+
+[[material]]
+slot  = 3
+name  = "grass"
+color = "grass_green:2"
+
+# Wood + leaves are flammable; both ignite into M_FIRE (slot 13). Wood
+# holds out longer than leaves so the trunk doesn't immediately collapse
+# the moment a leaf catches.
+[[material]]
+slot         = 4
+name         = "wood"
+color        = "brown:0"
+flags        = ["flammable"]
+ca_threshold = 90
+ignites_to   = 13
+
+[[material]]
+slot         = 5
+name         = "leaf"
+color        = "forest_green:2"
+flags        = ["flammable"]
+ca_threshold = 60
+ignites_to   = 13
+
+[[material]]
+slot  = 6
+name  = "skin"
+color = "tan:3"
+
+[[material]]
+slot  = 7
+name  = "shirt"
+color = "deep_blue:2"
+
+[[material]]
+slot  = 8
+name  = "sign_body"
+color = "brown:0"
+
+[[material]]
+slot     = 9
+name     = "sign_face"
+color    = "magenta:3"
+emission = 12
+
+# Reticle dot painted at the player's look-at point each frame.
+[[material]]
+slot     = 10
+name     = "reticle"
+color    = "red:3"
+emission = 14
+
+[[material]]
+slot  = 11
+name  = "sand"
+color = "yellow:2"
+flags = ["granular"]
+
+[[material]]
+slot  = 12
+name  = "water"
+color = "cyan:2"
+flags = ["liquid"]
+
+# Fire: cap lifetime at 15 ticks so the cascade through a tree is snappy.
+[[material]]
+slot        = 13
+name        = "fire"
+color       = "orange:3"
+emission    = 14
+flags       = ["fire"]
+ca_lifetime = 15
+
+# Embers carry no CA flags — the cart manually moves them each tick.
+[[material]]
+slot     = 14
+name     = "ember"
+color    = "yellow:3"
+emission = 15
+
+[[material]]
+slot  = 15
+name  = "crate"
+color = "orange:2"

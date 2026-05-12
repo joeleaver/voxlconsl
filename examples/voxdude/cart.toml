@@ -1,0 +1,18 @@
+[cart]
+name         = "voxdude"
+title        = "Voxdude"
+version      = "0.1.0"
+spec_version = "0.1"
+author       = "voxlconsl"
+description  = "Voxel pacman — eat dots, dodge ghosts, grab power pellets."
+license      = "MIT OR Apache-2.0"
+
+[code]
+build  = "cargo build --release --target wasm32-unknown-unknown -p voxdude"
+output = "../../target/wasm32-unknown-unknown/release/voxdude.wasm"
+
+[materials]
+file = "materials.toml"
+
+[audio]
+patches = "audio/patches.toml"

@@ -52,8 +52,12 @@ pub struct Scene<'a> {
     /// outside the active set default to full level.
     pub ca: &'a CaState,
     pub sun_dir: Vec3,
-    /// Sky color shown when a ray misses everything. Palette index.
-    pub sky: u8,
+    /// Sky gradient — palette indices for the zenith colour (looking
+    /// straight up) and the horizon colour. Rays that miss every voxel
+    /// sample this gradient based on their vertical direction. Setting
+    /// both to the same index gives a flat-colour sky.
+    pub sky_top: u8,
+    pub sky_horizon: u8,
 }
 
 /// Render one frame into `framebuffer`. Buffer is RGBA8 row-major,
@@ -71,7 +75,8 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
     let half_w = half_h * aspect;
 
     let sun_dir = scene.sun_dir.normalize();
-    let sky_rgb = SYSTEM_PALETTE[scene.sky.min(63) as usize];
+    let sky_top_rgb = SYSTEM_PALETTE[scene.sky_top.min(63) as usize];
+    let sky_horizon_rgb = SYSTEM_PALETTE[scene.sky_horizon.min(63) as usize];
 
     // Pre-compute world AABBs for every visible actor so the per-ray
     // pass doesn't redo the corner transforms. The actor index is the
@@ -211,7 +216,7 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
 
             let color = match closest {
                 Some(hit) => shade(hit, scene, sun_dir),
-                None => sky_rgb,
+                None => sample_sky(dir.y, sky_top_rgb, sky_horizon_rgb),
             };
 
             let i = ((py * WIDTH + px) * 4) as usize;
@@ -260,6 +265,35 @@ fn ray_aabb_hit(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3, max_t: f32) -> bo
     let t_enter = t1.0.min(t2.0).max(t1.1.min(t2.1)).max(t1.2.min(t2.2));
     let t_exit  = t1.0.max(t2.0).min(t1.1.max(t2.1)).min(t1.2.max(t2.2));
     t_enter <= t_exit && t_exit >= 0.0 && t_enter <= max_t
+}
+
+/// Sample the sky gradient for a ray's vertical direction.
+///
+/// `dir_y == 1.0` (zenith) returns `top`; `dir_y == 0.0` (horizon)
+/// returns `horizon`; rays below the horizon clamp to `horizon` since
+/// the host doesn't render a separate ground colour. The cubic
+/// smoothstep keeps the horizon band wide and the top band narrow,
+/// which reads more like a real sky than a straight linear lerp —
+/// most of the framebuffer near the horizon stays close to the
+/// horizon colour.
+fn sample_sky(
+    dir_y: f32,
+    top: voxlconsl_types::PaletteColor,
+    horizon: voxlconsl_types::PaletteColor,
+) -> voxlconsl_types::PaletteColor {
+    let t = dir_y.max(0.0).min(1.0);
+    let t = t * t * (3.0 - 2.0 * t); // smoothstep(0, 1, t)
+    voxlconsl_types::PaletteColor {
+        r: lerp_u8(horizon.r, top.r, t),
+        g: lerp_u8(horizon.g, top.g, t),
+        b: lerp_u8(horizon.b, top.b, t),
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let af = a as f32;
+    let bf = b as f32;
+    (af + (bf - af) * t).round().clamp(0.0, 255.0) as u8
 }
 
 /// Translate a hit + lighting into a final palette color.

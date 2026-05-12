@@ -1,0 +1,69 @@
+# voxdude audio patches — see SPEC.md §12.6.3.
+#
+# Two simple synth voices drive every sound effect: a bright square
+# stab for chomps and a rounded saw + filter ping for the bigger
+# events (power pellet, ghost eaten, win).
+
+[[patch]]
+slot = 0
+name = "chomp"
+kind = "synth"
+
+[patch.osc1]
+mode  = "square"
+level = 120
+
+[patch.osc2]
+mode  = "square"
+detune_cents = 12
+level = 60
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 6000
+resonance = 20
+
+[patch.amp_env]
+attack_ms  = 2
+decay_ms   = 120
+sustain    = 0
+release_ms = 50
+
+
+[[patch]]
+slot = 1
+name = "ping"
+kind = "synth"
+
+[patch.osc1]
+mode  = "saw"
+level = 110
+
+[patch.osc2]
+mode  = "saw"
+detune_cents = -7
+level = 90
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 4500
+resonance = 35
+
+[patch.amp_env]
+attack_ms  = 4
+decay_ms   = 280
+sustain    = 0
+release_ms = 200
+
+[patch.filter_env]
+attack_ms  = 4
+decay_ms   = 300
+sustain    = 30
+release_ms = 200
+depth      = 60
+
+[patch.lfo]
+rate_hz = 5
+shape   = "sine"
+target  = "pitch"
+depth   = 3

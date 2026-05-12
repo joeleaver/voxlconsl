@@ -21,6 +21,10 @@ Cargo.lock.bak
 # trees that pre-date the cart-format landing.)
 /crates/host-browser/embedded-cart.*
 
+# Cart picker artifacts (cart .voxl files + index.json manifest)
+# written by scripts/build-web.sh.
+/web/carts/
+
 # Diagnostic screenshots from playwright runs
 /*.png
 /.playwright-mcp/
