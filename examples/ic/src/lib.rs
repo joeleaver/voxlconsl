@@ -44,6 +44,7 @@ mod action_wheel;
 mod camera;
 mod cursor;
 mod fire;
+mod hotshot;
 mod hud;
 mod line_mode;
 mod mathlib;
@@ -85,6 +86,11 @@ pub(crate) const M_TANKER_BODY:      u8 = 29;
 pub(crate) const M_TANKER_WING:      u8 = 30;
 pub(crate) const M_TANKER_WATER_STRIPE: u8 = 31;
 pub(crate) const M_TANKER_RETARDANT_STRIPE: u8 = 32;
+pub(crate) const M_PARACHUTE:        u8 = 33;
+pub(crate) const M_HOTSHOT_STRIPE:   u8 = 34;
+pub(crate) const M_HOTSHOT_BODY:     u8 = 35;
+pub(crate) const M_HOTSHOT_HELMET:   u8 = 36;
+pub(crate) const M_PLANNED_HOTSHOT:  u8 = 37;
 
 // ── Mission tuning ────────────────────────────────────────────────
 
@@ -153,6 +159,14 @@ static mut PAN_PREV: (f32, f32) = (0.0, 0.0);
 const NAV_THRESHOLD: f32 = 0.5;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
+enum Drafter {
+    /// Line will be dispatched to the firetruck queue.
+    Truck,
+    /// Line will be dispatched to the hot-shot queue (parachute deploy).
+    HotShot,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
 enum InteractionMode {
     /// No order in progress. Primary opens the action wheel.
     Idle,
@@ -160,10 +174,11 @@ enum InteractionMode {
     /// nav-down move the highlight, Confirm or Primary commits the
     /// pick, Cancel closes.
     WheelOpen,
-    /// Fire-line draft underway after picking LINE from the wheel.
-    /// Primary appends the next point at the current cursor cell,
-    /// Confirm commits, Cancel discards.
-    LineDrafting,
+    /// Fire-line / hot-shot draft underway. Primary appends the next
+    /// point at the current cursor cell, Confirm commits, Cancel
+    /// discards. The `Drafter` distinguishes truck-laid vs hot-shot
+    /// deploys; the UI shares the line_mode preview either way.
+    LineDrafting(Drafter),
     /// Retardant aim mode after picking RETARDANT from the wheel.
     /// Only the direction is player-controlled — the strip is a
     /// fixed length from the wheel anchor toward the cursor.
@@ -201,7 +216,7 @@ pub extern "C" fn init() {
         CAMERA = camera::Camera::new(focus_x, focus_z);
         CURSOR = cursor::Cursor::new(focus_x, focus_z - 8.0);
         let s = scenario::get();
-        ROSTER = Some(units::Roster::init(s.heli_count, s.crew_count));
+        ROSTER = Some(units::Roster::init(s.heli_count, s.crew_count, s.hotshot_count));
         register_actions();
         (&mut *(&raw mut HUD)).init();
         (&mut *(&raw mut CURSOR)).init();
@@ -209,6 +224,8 @@ pub extern "C" fn init() {
         (&mut *(&raw mut QUEUE_MARKERS)).init();
         (&mut *(&raw mut ACTION_WHEEL)).init();
         units::init_tanker_prefabs();
+        hotshot::init_drop_plane_prefab();
+        hotshot::init_scatter_rng(s.seed);
     }
 
     // First fire — seed it now so the player sees smoke from the
@@ -294,12 +311,18 @@ unsafe fn handle_interaction(
                         // First fire-line point is the wheel's anchor.
                         lm.push_point(wheel.anchor);
                         wheel.close();
-                        unsafe { INTERACTION = InteractionMode::LineDrafting; }
+                        unsafe { INTERACTION = InteractionMode::LineDrafting(Drafter::Truck); }
+                    }
+                    action_wheel::WheelChoice::HotShot => {
+                        // First hot-shot waypoint is the wheel's anchor.
+                        lm.push_point(wheel.anchor);
+                        wheel.close();
+                        unsafe { INTERACTION = InteractionMode::LineDrafting(Drafter::HotShot); }
                     }
                 }
             }
         }
-        InteractionMode::LineDrafting => {
+        InteractionMode::LineDrafting(drafter) => {
             if cancel {
                 lm.discard();
                 unsafe { INTERACTION = InteractionMode::Idle; }
@@ -307,7 +330,12 @@ unsafe fn handle_interaction(
                 if lm.count > 0 {
                     let mut buf = [UVec3::ZERO; line_mode::LINE_CAP];
                     let n = lm.copy_points_into(&mut buf);
-                    if let Some(r) = roster { r.dispatch_fire_line(&buf[..n]); }
+                    if let Some(r) = roster {
+                        match drafter {
+                            Drafter::Truck   => { r.dispatch_fire_line(&buf[..n]); }
+                            Drafter::HotShot => { r.dispatch_hotshot_line(&buf[..n]); }
+                        }
+                    }
                     // Commit (not discard) — keep the preview voxels
                     // painted as the queued line's in-world marker.
                     lm.commit();
@@ -468,14 +496,15 @@ unsafe fn build_hud_ctx<'a>(
     let wind_dir = fire_ref.wind_direction_label();
     let wind_strength = fire_ref.wind_strength_digit();
 
-    let (heli_busy, heli_total, crew_busy, crew_total, queue_total) =
+    let (heli_busy, heli_total, crew_busy, crew_total, hotshot_busy, hotshot_total, queue_total) =
         match roster_ref {
             Some(r) => (
                 r.heli_busy(), r.heli_total(),
                 r.crew_busy(), r.crew_total(),
+                r.hotshot_busy(), r.hotshot_total(),
                 r.queue.pending_total(),
             ),
-            None => (0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0),
         };
 
     hud::HudCtx {
@@ -488,6 +517,8 @@ unsafe fn build_hud_ctx<'a>(
         heli_total,
         crew_busy,
         crew_total,
+        hotshot_busy,
+        hotshot_total,
         tier: s.tier as u32,
         line_mode_active: line_ref.is_drafting(),
         line_mode_count:  line_ref.count as u32,

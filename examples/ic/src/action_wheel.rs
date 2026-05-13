@@ -6,9 +6,17 @@
 //! LINE starts a fire-line draft whose first point IS the anchor
 //! cell.
 //!
+//! The wheel is painted across **two stacked 32×32 panels** (the
+//! engine caps prefab dimensions at CHUNK_SIZE=32, and a single panel
+//! can't fit ACTION + 5 options at FONT_TINY line spacing). Top
+//! panel: ACTION header + WATER / TANKER / RETARD. Bottom panel:
+//! LINE / HOTSHOT. The selection cursor moves across both panels as
+//! one continuous list — bottom-panel rows just start at index
+//! `TOP_OPTIONS`.
+//!
 //! While the wheel is open, the cursor still moves with the
 //! mouse — but the wheel's *anchor* doesn't move. The player can
-//! pan the camera, change their mind, or hit Esc to bail without
+//! pan the camera, change their mind, or hit Cancel to bail without
 //! consequence.
 
 use voxlconsl_sdk::*;
@@ -22,42 +30,47 @@ pub(crate) enum WheelChoice {
     Tanker,
     Retardant,
     FireLine,
+    HotShot,
 }
 
-const OPTIONS: [(WheelChoice, &str); 4] = [
+const OPTIONS: [(WheelChoice, &str); 5] = [
     (WheelChoice::WaterDrop, "WATER"),
     (WheelChoice::Tanker,    "TANKER"),
     (WheelChoice::Retardant, "RETARD"),
     (WheelChoice::FireLine,  "LINE"),
+    (WheelChoice::HotShot,   "HOTSHO"),
 ];
 
+/// Number of OPTIONS painted onto the top panel (after ACTION header).
+/// Indices `[0..TOP_OPTIONS)` render on top; `[TOP_OPTIONS..)` on the
+/// bottom panel.
+const TOP_OPTIONS: usize = 3;
+
 const PANEL_W: u32 = 32;
-/// 32 — engine caps prefab dimensions at CHUNK_SIZE = 32, so the
-/// wheel has to live inside a single 32³ volume. Anything taller is
-/// silently rejected by `prefabs::define`.
 const PANEL_H: u32 = 32;
 const PANEL_VOL_BYTES: usize = (PANEL_W * PANEL_H) as usize;
-const PANEL_PREFAB: PrefabId = PrefabId(70);
+const PANEL_PREFAB_TOP:    PrefabId = PrefabId(70);
+const PANEL_PREFAB_BOTTOM: PrefabId = PrefabId(74);
 
-/// Screen-space position of the wheel's upper-left corner. Sits to
-/// the right of the sidebar in the empty-world strip so it doesn't
-/// occlude anything meaningful when open.
-const WHEEL_SCREEN_X: f32 = 110.0;
-const WHEEL_SCREEN_Y: f32 = 52.0;
+/// Screen-space position of the wheel. Two panels stacked vertically:
+/// the bottom one sits 32 + GAP below the top.
+const WHEEL_SCREEN_X:        f32 = 110.0;
+const WHEEL_SCREEN_Y_TOP:    f32 = 28.0;
+const WHEEL_PANEL_GAP:       f32 = 4.0;
+const WHEEL_SCREEN_Y_BOTTOM: f32 = WHEEL_SCREEN_Y_TOP + PANEL_H as f32 + WHEEL_PANEL_GAP;
 /// Above the sidebar (PANEL_LAYER = 100) so the wheel always paints
 /// on top.
 const WHEEL_LAYER:    f32 = 200.0;
 
 /// 6 (= FONT_TINY cell height) makes adjacent rows touch with no gap.
-/// Tight, but lets us fit ACTION + 4 options inside the 32-px panel.
-/// Drop the hint row entirely — the cart's HUD HELP sidebar shows
-/// the same confirm-key reminder.
 const LINE_SPACING: u32 = 6;
 
-static mut PANEL_DENSE: [u8; PANEL_VOL_BYTES] = [0; PANEL_VOL_BYTES];
+static mut PANEL_DENSE_TOP:    [u8; PANEL_VOL_BYTES] = [0; PANEL_VOL_BYTES];
+static mut PANEL_DENSE_BOTTOM: [u8; PANEL_VOL_BYTES] = [0; PANEL_VOL_BYTES];
 
 pub(crate) struct ActionWheel {
-    actor:    Option<ActorId>,
+    actor_top:    Option<ActorId>,
+    actor_bottom: Option<ActorId>,
     pub open: bool,
     /// 0..OPTIONS.len() — which row is currently highlighted.
     pub selected: u8,
@@ -65,60 +78,74 @@ pub(crate) struct ActionWheel {
     /// applies to this cell (drop target, or first fire-line
     /// point) regardless of where the cursor has roamed since.
     pub anchor:   UVec3,
-    /// Cache so the wheel only repaints when the highlighted option
-    /// or the host-provided confirm-binding label changes.
-    cache: Option<u16>,
+    /// Per-panel cache key. None when the highlight is on the
+    /// *other* panel (so the row prefix on this panel is always ' ').
+    /// Concretely we cache the highlighted row index inside the panel.
+    cache_top:    Option<i8>,
+    cache_bottom: Option<i8>,
 }
 
 impl ActionWheel {
     pub(crate) const fn new() -> Self {
         Self {
-            actor: None,
+            actor_top:    None,
+            actor_bottom: None,
             open:  false,
             selected: 0,
             anchor: UVec3 { x: 0, y: 0, z: 0 },
-            cache: None,
+            cache_top:    None,
+            cache_bottom: None,
         }
     }
 
     pub(crate) fn init(&mut self) {
         unsafe {
             prefab_define(
-                PANEL_PREFAB,
-                &*(&raw const PANEL_DENSE),
+                PANEL_PREFAB_TOP,
+                &*(&raw const PANEL_DENSE_TOP),
+                U8Vec3::new(PANEL_W as u8, PANEL_H as u8, 1),
+            );
+            prefab_define(
+                PANEL_PREFAB_BOTTOM,
+                &*(&raw const PANEL_DENSE_BOTTOM),
                 U8Vec3::new(PANEL_W as u8, PANEL_H as u8, 1),
             );
         }
-        let id = actor_spawn_from(PANEL_PREFAB, Orientation::Up)
-            .expect("ic action-wheel spawn");
-        actor_set_render_mode(id, ActorRenderMode::Screen);
-        actor_set_position(id, Vec3::new(WHEEL_SCREEN_X, WHEEL_SCREEN_Y, WHEEL_LAYER));
-        actor_set_visible(id, false);
-        self.actor = Some(id);
+        let top = actor_spawn_from(PANEL_PREFAB_TOP, Orientation::Up)
+            .expect("ic action-wheel top spawn");
+        actor_set_render_mode(top, ActorRenderMode::Screen);
+        actor_set_position(top, Vec3::new(WHEEL_SCREEN_X, WHEEL_SCREEN_Y_TOP, WHEEL_LAYER));
+        actor_set_visible(top, false);
+        self.actor_top = Some(top);
+
+        let bot = actor_spawn_from(PANEL_PREFAB_BOTTOM, Orientation::Up)
+            .expect("ic action-wheel bottom spawn");
+        actor_set_render_mode(bot, ActorRenderMode::Screen);
+        actor_set_position(bot, Vec3::new(WHEEL_SCREEN_X, WHEEL_SCREEN_Y_BOTTOM, WHEEL_LAYER));
+        actor_set_visible(bot, false);
+        self.actor_bottom = Some(bot);
     }
 
     pub(crate) fn open_at(&mut self, cell: UVec3) {
         self.anchor = cell;
         self.selected = 0;
         self.open = true;
-        self.cache = None;
-        if let Some(id) = self.actor { actor_set_visible(id, true); }
+        self.cache_top = None;
+        self.cache_bottom = None;
+        if let Some(id) = self.actor_top    { actor_set_visible(id, true); }
+        if let Some(id) = self.actor_bottom { actor_set_visible(id, true); }
     }
 
     pub(crate) fn close(&mut self) {
         self.open = false;
-        if let Some(id) = self.actor { actor_set_visible(id, false); }
+        if let Some(id) = self.actor_top    { actor_set_visible(id, false); }
+        if let Some(id) = self.actor_bottom { actor_set_visible(id, false); }
     }
 
-    /// Move highlight one step toward the top of the list. Clamps
-    /// at index 0 so holding the nav-up direction doesn't wrap past
-    /// the player.
     pub(crate) fn select_prev(&mut self) {
         if self.selected > 0 { self.selected -= 1; }
     }
 
-    /// Move highlight one step toward the bottom of the list,
-    /// clamped at the last option.
     pub(crate) fn select_next(&mut self) {
         let last = (OPTIONS.len() as u8).saturating_sub(1);
         if self.selected < last { self.selected += 1; }
@@ -128,34 +155,68 @@ impl ActionWheel {
         OPTIONS[self.selected as usize % OPTIONS.len()].0
     }
 
-    /// Repaint when the highlighted option changes. The bottom hint
-    /// was dropped to fit ACTION + 4 options inside the 32-px panel —
-    /// the cart's HUD HELP sidebar shows the same confirm/cancel keys.
-    /// `_confirm_label` is left in the signature so the cart's frame
-    /// loop can keep handing the label down once we have room again.
+    /// Repaint each panel only when its highlight changed. The two
+    /// panels share a single index space; an entry's local row inside
+    /// its panel is `selected - TOP_OPTIONS` for the bottom panel and
+    /// `selected + 1` (ACTION header sits on row 0) for the top.
     pub(crate) fn render(&mut self, _confirm_label: &str) {
         if !self.open { return; }
-        if self.cache == Some(self.selected as u16) { return; }
-        self.cache = Some(self.selected as u16);
-        let actor = match self.actor { Some(a) => a, None => return };
-        actor_clear(actor);
 
-        paint_line(actor, 0, "ACTION");
-        for (i, (_choice, label)) in OPTIONS.iter().enumerate() {
-            let prefix = if i == self.selected as usize { '>' } else { ' ' };
-            let mut buf = [b' '; 8];
-            let mut len = 0;
-            buf[len] = prefix as u8; len += 1;
-            buf[len] = b' '; len += 1;
-            for &b in label.as_bytes().iter().take(6) {
-                if len >= buf.len() { break; }
-                buf[len] = b;
-                len += 1;
+        // Top panel highlight: which option index, or -1 if the
+        // cursor is on the bottom panel.
+        let top_hl: i8 = if (self.selected as usize) < TOP_OPTIONS {
+            self.selected as i8
+        } else {
+            -1
+        };
+        if self.cache_top != Some(top_hl) {
+            self.cache_top = Some(top_hl);
+            if let Some(actor) = self.actor_top {
+                actor_clear(actor);
+                paint_line(actor, 0, "ACTION");
+                for i in 0..TOP_OPTIONS {
+                    let (_, label) = OPTIONS[i];
+                    let prefix = if top_hl == i as i8 { '>' } else { ' ' };
+                    paint_prefixed(actor, (i + 1) as u32, prefix, label);
+                }
             }
-            let s = core::str::from_utf8(&buf[..len]).unwrap_or("");
-            paint_line(actor, (i + 1) as u32, s);
+        }
+
+        // Bottom panel highlight: index relative to TOP_OPTIONS, or
+        // -1 if cursor is on the top panel.
+        let bot_hl: i8 = if (self.selected as usize) >= TOP_OPTIONS {
+            (self.selected as usize - TOP_OPTIONS) as i8
+        } else {
+            -1
+        };
+        if self.cache_bottom != Some(bot_hl) {
+            self.cache_bottom = Some(bot_hl);
+            if let Some(actor) = self.actor_bottom {
+                actor_clear(actor);
+                let bot_count = OPTIONS.len() - TOP_OPTIONS;
+                for j in 0..bot_count {
+                    let (_, label) = OPTIONS[TOP_OPTIONS + j];
+                    let prefix = if bot_hl == j as i8 { '>' } else { ' ' };
+                    paint_prefixed(actor, j as u32, prefix, label);
+                }
+            }
         }
     }
+}
+
+/// Paint `"{prefix} {label}"` on row `line_idx` of a 32×32 panel.
+fn paint_prefixed(actor: ActorId, line_idx: u32, prefix: char, label: &str) {
+    let mut buf = [b' '; 8];
+    let mut len = 0;
+    buf[len] = prefix as u8; len += 1;
+    buf[len] = b' ';        len += 1;
+    for &b in label.as_bytes().iter().take(6) {
+        if len >= buf.len() { break; }
+        buf[len] = b;
+        len += 1;
+    }
+    let s = core::str::from_utf8(&buf[..len]).unwrap_or("");
+    paint_line(actor, line_idx, s);
 }
 
 /// Paint a string onto a horizontal line of the 32×32 panel actor.

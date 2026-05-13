@@ -72,6 +72,14 @@ enum HeliState {
     Dropping(u8),
     FlyToWater,
     Refilling(u8),
+    /// Flying to extract a waiting hot-shot crew. `hotshot_slot` is
+    /// the index into `Roster.hotshots` so the outer sweep can match
+    /// the heli to its passenger when it arrives. The target XZ is
+    /// the crew's cell (set when the order is issued).
+    FlyToPickup { hotshot_slot: u8 },
+    /// Returning to the helipad after an extraction. Doesn't refill —
+    /// the bucket isn't drained on pickups. Lands as Idle.
+    FlyHome,
 }
 
 pub(crate) struct Helicopter {
@@ -82,6 +90,10 @@ pub(crate) struct Helicopter {
     state:        HeliState,
     bucket_full:  bool,
     rotor_phase:  u8,   // for rotor flipbook
+    /// Latched to Some(hotshot_slot) the frame the heli arrives at
+    /// a pickup target. The Roster's outer sweep reads this, despawns
+    /// the corresponding crew, and clears the flag.
+    pickup_arrived: Option<u8>,
 }
 
 impl Helicopter {
@@ -104,6 +116,7 @@ impl Helicopter {
             state: HeliState::Idle,
             bucket_full: true,
             rotor_phase: 0,
+            pickup_arrived: None,
         };
         h.paint_body();
         h
@@ -172,11 +185,13 @@ impl Helicopter {
     /// sidebar at 4 px / glyph.
     pub(crate) fn state_label(&self) -> &'static str {
         match self.state {
-            HeliState::Idle           => "IDLE",
-            HeliState::FlyToTarget    => "FLY",
-            HeliState::Dropping(_)    => "DROP",
-            HeliState::FlyToWater     => "RTRN",
-            HeliState::Refilling(_)   => "FILL",
+            HeliState::Idle             => "IDLE",
+            HeliState::FlyToTarget      => "FLY",
+            HeliState::Dropping(_)      => "DROP",
+            HeliState::FlyToWater       => "RTRN",
+            HeliState::Refilling(_)     => "FILL",
+            HeliState::FlyToPickup { .. } => "PKUP",
+            HeliState::FlyHome          => "HOME",
         }
     }
 
@@ -217,6 +232,27 @@ impl Helicopter {
         } else {
             HeliState::FlyToWater
         };
+    }
+
+    /// Dispatch this heli to pick up a waiting hot-shot crew at
+    /// `(cx, cz)`. Bucket state is preserved; the heli flies straight
+    /// to the cell, hovers briefly while the roster despawns the
+    /// crew, then flies home without refilling.
+    pub(crate) fn issue_pickup(&mut self, slot: u8, cell: (f32, f32)) {
+        self.target_xz = cell;
+        self.state = HeliState::FlyToPickup { hotshot_slot: slot };
+        self.pickup_arrived = None;
+    }
+
+    /// Latched the frame the heli reaches a pickup target. The
+    /// Roster reads this to despawn the corresponding hot-shot crew,
+    /// then calls `clear_pickup_arrived` to acknowledge the handoff.
+    pub(crate) fn pickup_arrived_slot(&self) -> Option<u8> {
+        self.pickup_arrived
+    }
+
+    pub(crate) fn clear_pickup_arrived(&mut self) {
+        self.pickup_arrived = None;
     }
 
     /// One simulation tick.
@@ -270,6 +306,23 @@ impl Helicopter {
                     self.target_xz = self.home_xz;
                 } else {
                     self.state = HeliState::Refilling(next);
+                }
+            }
+            HeliState::FlyToPickup { hotshot_slot } => {
+                let arrived = self.fly_toward(self.target_xz);
+                if arrived {
+                    // Latch the slot for the Roster's sweep; transition
+                    // directly to FlyHome so the heli starts heading
+                    // back next tick. The crew despawns this same tick
+                    // when the roster sweeps `pickup_arrived`.
+                    self.pickup_arrived = Some(hotshot_slot);
+                    self.state = HeliState::FlyHome;
+                }
+            }
+            HeliState::FlyHome => {
+                if self.fly_toward(self.home_xz) {
+                    self.state = HeliState::Idle;
+                    self.target_xz = self.home_xz;
                 }
             }
         }
@@ -1077,6 +1130,7 @@ impl GroundCrew {
 
 pub(crate) const WATER_DROP_QUEUE_CAP: usize = 16;
 pub(crate) const FIRE_LINE_QUEUE_CAP:  usize = 8;
+pub(crate) const HOTSHOT_QUEUE_CAP:    usize = 4;
 
 #[derive(Copy, Clone, Default)]
 pub(crate) struct FireLinePath {
@@ -1107,6 +1161,8 @@ pub(crate) struct CommandQueue {
     water_count: u8,
     lines:       [Option<FireLinePath>; FIRE_LINE_QUEUE_CAP],
     line_count:  u8,
+    hotshots:       [Option<FireLinePath>; HOTSHOT_QUEUE_CAP],
+    hotshot_count:  u8,
 }
 
 impl CommandQueue {
@@ -1116,6 +1172,8 @@ impl CommandQueue {
             water_count: 0,
             lines:       [None; FIRE_LINE_QUEUE_CAP],
             line_count:  0,
+            hotshots:       [None; HOTSHOT_QUEUE_CAP],
+            hotshot_count:  0,
         }
     }
 
@@ -1134,6 +1192,13 @@ impl CommandQueue {
         if (self.line_count as usize) >= FIRE_LINE_QUEUE_CAP { return false; }
         self.lines[self.line_count as usize] = Some(line);
         self.line_count += 1;
+        true
+    }
+
+    pub(crate) fn push_hotshot(&mut self, line: FireLinePath) -> bool {
+        if (self.hotshot_count as usize) >= HOTSHOT_QUEUE_CAP { return false; }
+        self.hotshots[self.hotshot_count as usize] = Some(line);
+        self.hotshot_count += 1;
         true
     }
 
@@ -1158,11 +1223,22 @@ impl CommandQueue {
         head
     }
 
+    fn pop_hotshot(&mut self) -> Option<FireLinePath> {
+        if self.hotshot_count == 0 { return None; }
+        let head = self.hotshots[0].take();
+        for i in 1..self.hotshot_count as usize {
+            self.hotshots[i - 1] = self.hotshots[i].take();
+        }
+        self.hotshot_count -= 1;
+        head
+    }
+
     pub(crate) fn pending_total(&self) -> u32 {
-        self.water_count as u32 + self.line_count as u32
+        self.water_count as u32 + self.line_count as u32 + self.hotshot_count as u32
     }
     pub(crate) fn pending_water(&self) -> u32 { self.water_count as u32 }
     pub(crate) fn pending_lines(&self) -> u32 { self.line_count as u32 }
+    pub(crate) fn pending_hotshots(&self) -> u32 { self.hotshot_count as u32 }
 
     /// Peek at the i'th queued water drop without removing it.
     /// Used by the on-map badge renderer.
@@ -1176,6 +1252,12 @@ impl CommandQueue {
     pub(crate) fn line_head_at(&self, i: usize) -> Option<UVec3> {
         if i >= self.line_count as usize { return None; }
         self.lines[i].as_ref().and_then(|l| l.points[0])
+    }
+
+    /// Peek at the i'th queued hotshot order's first waypoint.
+    pub(crate) fn hotshot_head_at(&self, i: usize) -> Option<UVec3> {
+        if i >= self.hotshot_count as usize { return None; }
+        self.hotshots[i].as_ref().and_then(|l| l.points[0])
     }
 }
 
@@ -1197,6 +1279,16 @@ pub(crate) const MAX_TANKERS: usize = 4;
 /// Cap on queued tanker sorties waiting to spawn. Shared between
 /// water-tanker and retardant-tanker dispatches.
 pub(crate) const TANKER_REQUEST_CAP: usize = 8;
+/// Hard cap on concurrent hot-shot crews on the ground. Sized to
+/// hold two full squads at SQUAD_SIZE=4. The scenario tier sets the
+/// *usable* crew count via `Roster::hotshot_cap` ≤ this.
+pub(crate) const MAX_HOTSHOTS:    usize = 8;
+/// Hard cap on in-flight drop planes (each ferries a full squad).
+pub(crate) const MAX_DROP_PLANES: usize = 2;
+/// Hard cap on parachutes mid-descent — one squad's worth, since
+/// the chutes are released ~5 ticks apart and the first ones land
+/// before the last ones are even released for a second sortie.
+pub(crate) const MAX_PARACHUTES:  usize = 4;
 /// Frames of "call sign" delay after a tanker order is committed
 /// before the plane spawns off-map. Gives the player a beat to see
 /// the badge (and preview, for retardant) before the plane appears.
@@ -1238,11 +1330,20 @@ pub(crate) struct Roster {
     pub crews:   [Option<GroundCrew>; MAX_CREWS],
     pub tankers: [Option<Tanker>;     MAX_TANKERS],
     pub tanker_requests: [Option<TankerRequest>; TANKER_REQUEST_CAP],
+    pub hotshots:    [Option<crate::hotshot::HotShot>;    MAX_HOTSHOTS],
+    pub drop_planes: [Option<crate::hotshot::DropPlane>;  MAX_DROP_PLANES],
+    pub parachutes:  [Option<crate::hotshot::Parachute>;  MAX_PARACHUTES],
+    /// Maximum live hot-shot crews permitted by the current scenario
+    /// tier. The queue only drains while `alive_hotshots() < hotshot_cap`.
+    pub hotshot_cap: u8,
+    /// Cell hot-shots walk back to when they time out the pickup
+    /// wait. Captured from the helipad on init.
+    pub hotshot_home: (u32, u32),
     pub queue:   CommandQueue,
 }
 
 impl Roster {
-    pub(crate) fn init(heli_count: u8, crew_count: u8) -> Self {
+    pub(crate) fn init(heli_count: u8, crew_count: u8, hotshot_count: u8) -> Self {
         let mut helis: [Option<Helicopter>; MAX_HELIS] = [None, None, None, None];
         let mut crews: [Option<GroundCrew>; MAX_CREWS] =
             [None, None, None, None, None, None];
@@ -1266,6 +1367,11 @@ impl Roster {
             crews,
             tankers: [None, None, None, None],
             tanker_requests: [None; TANKER_REQUEST_CAP],
+            hotshots:    [None, None, None, None, None, None, None, None],
+            drop_planes: [None, None],
+            parachutes:  [None, None, None, None],
+            hotshot_cap: (hotshot_count as usize).min(MAX_HOTSHOTS) as u8,
+            hotshot_home: (HELI_PAD_X, HELI_PAD_Z),
             queue: CommandQueue::new(),
         }
     }
@@ -1304,6 +1410,10 @@ impl Roster {
         // sortie can pop into a slot freed earlier this tick.
         self.process_tanker_queue();
 
+        // Drain hotshot queue while there's capacity AND a free
+        // drop-plane slot. Each order takes a full drop-plane sortie.
+        self.process_hotshot_queue();
+
         for slot in self.helis.iter_mut() { if let Some(h) = slot { h.tick(); } }
         for slot in self.crews.iter_mut() { if let Some(c) = slot { c.tick(); } }
         for slot in self.tankers.iter_mut() {
@@ -1313,6 +1423,180 @@ impl Roster {
             };
             if despawn {
                 if let Some(t) = slot.take() { t.despawn_actor(); }
+            }
+        }
+
+        // Drop planes — tick, spawn parachute on drop, despawn off-map.
+        self.tick_drop_planes();
+        // Parachutes — tick, spawn hot-shot on landing.
+        self.tick_parachutes();
+        // Hot-shots — tick, despawn any in Done state.
+        self.tick_hotshots();
+
+        // Pickup arrival sweep — any heli that latched a
+        // `pickup_arrived_slot` this frame has reached its target
+        // cell; despawn the matching hot-shot crew (or just clear
+        // the flag if the crew already died).
+        self.process_pickup_arrivals();
+
+        // Pickup assignment — for each idle heli, find the first
+        // hot-shot in AwaitingPickup and dispatch the heli to extract.
+        self.process_pickup_dispatch();
+    }
+
+    fn process_hotshot_queue(&mut self) {
+        loop {
+            let squad = crate::hotshot::SQUAD_SIZE as usize;
+            // Need SQUAD_SIZE free crew slots (the whole squad has
+            // to fit) AND the tier-permitted crew cap has to leave
+            // room for another full squad after the drops land.
+            let in_flight = self.alive_hotshots()
+                + self.parachutes.iter().filter(|s| s.is_some()).count();
+            if in_flight + squad > self.hotshot_cap as usize { break; }
+            if MAX_HOTSHOTS - self.alive_hotshots() < squad { break; }
+            let Some(plane_slot) = self.first_free_drop_plane() else { break; };
+            let Some(order) = self.queue.pop_hotshot() else { break; };
+            let target = match order.points[0] {
+                Some(p) => p,
+                None    => continue,
+            };
+            // Convert FireLinePath → Option-array for each crew's
+            // walking path. (Extra slots stay None.)
+            let mut path: [Option<(u32, u32)>; CREW_PATH_CAP] = [None; CREW_PATH_CAP];
+            for i in 0..(order.count as usize).min(CREW_PATH_CAP) {
+                if let Some(p) = order.points[i] {
+                    path[i] = Some((p.x, p.z));
+                }
+            }
+            let plane = crate::hotshot::DropPlane::spawn(target, path, self.hotshot_home);
+            self.drop_planes[plane_slot] = Some(plane);
+        }
+    }
+
+    fn first_free_drop_plane(&self) -> Option<usize> {
+        for i in 0..MAX_DROP_PLANES {
+            if self.drop_planes[i].is_none() { return Some(i); }
+        }
+        None
+    }
+
+    fn first_free_parachute(&self) -> Option<usize> {
+        for i in 0..MAX_PARACHUTES {
+            if self.parachutes[i].is_none() { return Some(i); }
+        }
+        None
+    }
+
+    fn first_free_hotshot(&self) -> Option<usize> {
+        for i in 0..MAX_HOTSHOTS {
+            if self.hotshots[i].is_none() { return Some(i); }
+        }
+        None
+    }
+
+    fn alive_hotshots(&self) -> usize {
+        self.hotshots.iter().filter(|s| s.is_some()).count()
+    }
+
+    fn tick_drop_planes(&mut self) {
+        for i in 0..MAX_DROP_PLANES {
+            // Tick + capture drop event in one shot.
+            let (alive, drop_cell, drop_alt, path, home) = match self.drop_planes[i].as_mut() {
+                Some(p) => {
+                    let (alive, drop_cell) = p.tick();
+                    (alive, drop_cell, p.drop_altitude(), p.path, p.home)
+                }
+                None => continue,
+            };
+            if let Some(target) = drop_cell {
+                let landing = crate::hotshot::scattered_landing(target);
+                if let Some(slot) = self.first_free_parachute() {
+                    self.parachutes[slot] = Some(crate::hotshot::Parachute::spawn(
+                        landing, drop_alt, path, home,
+                    ));
+                }
+                // If no parachute slot is free, the plane still drops
+                // (the moment passes) but no crew lands. Should be
+                // rare given MAX_PARACHUTES == MAX_DROP_PLANES.
+            }
+            if !alive {
+                if let Some(p) = self.drop_planes[i].take() { p.despawn_actor(); }
+            }
+        }
+    }
+
+    fn tick_parachutes(&mut self) {
+        for i in 0..MAX_PARACHUTES {
+            let landed = match self.parachutes[i].as_mut() {
+                Some(p) => p.tick(),
+                None => continue,
+            };
+            let Some(landing_cell) = landed else { continue; };
+            let (path, home) = {
+                let p = self.parachutes[i].as_ref().unwrap();
+                (p.path, p.home)
+            };
+            if let Some(p) = self.parachutes[i].take() { p.despawn_actor(); }
+            if let Some(slot) = self.first_free_hotshot() {
+                self.hotshots[slot] = Some(crate::hotshot::HotShot::spawn(
+                    landing_cell, home, path,
+                ));
+            }
+        }
+    }
+
+    fn tick_hotshots(&mut self) {
+        for slot in self.hotshots.iter_mut() {
+            if let Some(h) = slot { h.tick(); }
+        }
+        // Sweep Done crews.
+        for slot in self.hotshots.iter_mut() {
+            let drop = match slot.as_ref() {
+                Some(h) => h.is_done(),
+                None => false,
+            };
+            if drop {
+                if let Some(h) = slot.take() { h.despawn_actor(); }
+            }
+        }
+    }
+
+    fn process_pickup_arrivals(&mut self) {
+        for hi in 0..MAX_HELIS {
+            let pickup_slot = self.helis[hi].as_ref().and_then(|h| h.pickup_arrived_slot());
+            let Some(hs_slot) = pickup_slot else { continue; };
+            if let Some(h) = self.helis[hi].as_mut() {
+                h.clear_pickup_arrived();
+            }
+            if let Some(hs) = self.hotshots[hs_slot as usize].as_mut() {
+                hs.mark_extracted();
+            }
+        }
+    }
+
+    fn process_pickup_dispatch(&mut self) {
+        for hi in 0..MAX_HELIS {
+            let idle = self.helis[hi].as_ref().map(|h| h.is_idle()).unwrap_or(false);
+            if !idle { continue; }
+            let mut chosen: Option<u8> = None;
+            for hs_i in 0..MAX_HOTSHOTS {
+                if let Some(hs) = self.hotshots[hs_i].as_ref() {
+                    if hs.is_awaiting_pickup() {
+                        chosen = Some(hs_i as u8);
+                        break;
+                    }
+                }
+            }
+            let Some(hs_slot) = chosen else { continue; };
+            let (cx, cz) = self.hotshots[hs_slot as usize]
+                .as_ref()
+                .unwrap()
+                .cell();
+            if let Some(h) = self.helis[hi].as_mut() {
+                h.issue_pickup(hs_slot, (cx as f32 + 0.5, cz as f32 + 0.5));
+            }
+            if let Some(hs) = self.hotshots[hs_slot as usize].as_mut() {
+                hs.mark_being_picked();
             }
         }
     }
@@ -1441,6 +1725,18 @@ impl Roster {
         self.queue.push_line(FireLinePath::from_slice(points));
     }
 
+    /// Queue a hot-shot deployment along `points`. The crew
+    /// parachutes in at the first waypoint, lays firebreak along
+    /// the polyline, then awaits a heli pickup. Returns `true` iff
+    /// the order was queued (the queue's HOTSHOT_QUEUE_CAP guards
+    /// the array; orders past that are silently dropped). Also a
+    /// no-op when the scenario tier provides 0 hot-shot capacity —
+    /// the cart can still draft, but the order won't deploy.
+    pub(crate) fn dispatch_hotshot_line(&mut self, points: &[UVec3]) -> bool {
+        if points.is_empty() || self.hotshot_cap == 0 { return false; }
+        self.queue.push_hotshot(FireLinePath::from_slice(points))
+    }
+
     // ── Pool-state accessors for HUD ─────────────────────────────
 
     pub(crate) fn heli_total(&self) -> u32 {
@@ -1456,6 +1752,10 @@ impl Roster {
     pub(crate) fn crew_busy(&self) -> u32 {
         self.crews.iter().filter_map(|s| s.as_ref())
             .filter(|c| !c.is_idle()).count() as u32
+    }
+    pub(crate) fn hotshot_total(&self) -> u32 { self.hotshot_cap as u32 }
+    pub(crate) fn hotshot_busy(&self) -> u32 {
+        self.hotshots.iter().filter(|s| s.is_some()).count() as u32
     }
 }
 

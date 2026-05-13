@@ -75,13 +75,15 @@ struct StatusKey {
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct UnitKey {
-    heli_busy:   u32,
-    heli_total:  u32,
-    crew_busy:   u32,
-    crew_total:  u32,
-    line_active: bool,
-    line_count:  u32,
-    queue_total: u32,
+    heli_busy:    u32,
+    heli_total:   u32,
+    crew_busy:    u32,
+    crew_total:   u32,
+    hotshot_busy: u32,
+    hotshot_total: u32,
+    line_active:  bool,
+    line_count:   u32,
+    queue_total:  u32,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -182,13 +184,15 @@ impl Hud {
 
     fn paint_unit(&mut self, ctx: &HudCtx<'_>) {
         let key = UnitKey {
-            heli_busy:   ctx.heli_busy,
-            heli_total:  ctx.heli_total,
-            crew_busy:   ctx.crew_busy,
-            crew_total:  ctx.crew_total,
-            line_active: ctx.line_mode_active,
-            line_count:  ctx.line_mode_count,
-            queue_total: ctx.queue_total,
+            heli_busy:    ctx.heli_busy,
+            heli_total:   ctx.heli_total,
+            crew_busy:    ctx.crew_busy,
+            crew_total:   ctx.crew_total,
+            hotshot_busy: ctx.hotshot_busy,
+            hotshot_total: ctx.hotshot_total,
+            line_active:  ctx.line_mode_active,
+            line_count:   ctx.line_mode_count,
+            queue_total:  ctx.queue_total,
         };
         if self.unit_cache == Some(key) { return; }
         self.unit_cache = Some(key);
@@ -202,9 +206,9 @@ impl Hud {
         // Line 1: crew pool busy/total — "C 2/6".
         let s = format_pool(&mut buf, b'C', ctx.crew_busy, ctx.crew_total);
         paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, s);
-        // Line 2: current command mode.
-        let mode = if ctx.line_mode_active { "MD LINE" } else { "MD NORM" };
-        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, mode);
+        // Line 2: hot-shot crew pool busy/total — "S 4/8".
+        let s = format_pool(&mut buf, b'S', ctx.hotshot_busy, ctx.hotshot_total);
+        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
         // Line 3: line draft size when drafting; total queue size
         // otherwise. (Per-order map badges show the queue itself.)
         let s = if ctx.line_mode_active {
@@ -300,6 +304,8 @@ pub(crate) struct HudCtx<'a> {
     pub heli_total:    u32,
     pub crew_busy:     u32,
     pub crew_total:    u32,
+    pub hotshot_busy:  u32,
+    pub hotshot_total: u32,
     pub tier:          u32,
     pub line_mode_active: bool,
     pub line_mode_count:  u32,

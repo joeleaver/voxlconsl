@@ -244,3 +244,42 @@ slot     = 32
 name     = "tanker_retardant_stripe"
 color    = "magenta:3"
 emission = 6
+
+# Hot-shot drop plane nose stripe + parachute fabric. The drop plane
+# shares the tanker body/wing pigments; the stripe identifies it as
+# the personnel carrier rather than a water/retardant bomber.
+[[material]]
+slot     = 33
+name     = "parachute"
+color    = "warm_gray:3"
+emission = 8
+
+[[material]]
+slot     = 34
+name     = "hotshot_stripe"
+color    = "yellow:3"
+emission = 6
+
+# Hot-shot crew pigments — distinct from the firetruck helmet so the
+# player can tell hand-laid (hotshot) from truck-laid (firebreak)
+# crews apart on the ground.
+[[material]]
+slot     = 35
+name     = "hotshot_body"
+color    = "red:2"
+emission = 4
+
+[[material]]
+slot     = 36
+name     = "hotshot_helmet"
+color    = "yellow:2"
+
+# Planned-hotshot preview voxel — same shape as planned_line / planned_water,
+# painted along the waypoints of a queued or in-progress hotshot order so the
+# player can see what's pending. Lemon-yellow to read distinctly from the
+# magenta firebreak preview.
+[[material]]
+slot     = 37
+name     = "planned_hotshot"
+color    = "yellow:3"
+emission = 12
