@@ -13,6 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 voxlconsl-bundler = { workspace = true }
-voxlconsl-host = { workspace = true }
+# CLI is desktop-only and the `balance` subcommand benchmarks +
+# sweeps need real speed. Opt into the wasmtime/Cranelift runtime
+# instead of the default wasmi interpreter — ~400× faster cart
+# execution on native (no-op-import benchmark). host-browser stays
+# on wasmi via its own dep config. Declared as a path dep (not
+# workspace = true) so we can override default-features.
+voxlconsl-host = { path = "../host", default-features = false, features = ["runtime-wasmtime"] }
 clap = { workspace = true }
 toml = { workspace = true }

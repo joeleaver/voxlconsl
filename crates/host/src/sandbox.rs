@@ -15,7 +15,18 @@
 //!
 //! v0.0.3 cart exports: `init`, `update(dt_ms)`, `render()`.
 
-use wasmi::{Caller, Engine, Linker, Module, Store, TypedFunc};
+// Runtime alias: voxlconsl-host can be built against either wasmi
+// (default, fully interpreted, MCU-portable) or wasmtime (Cranelift
+// JIT, ~400× faster on the cart execution path but desktop-only).
+// All the cart-side machinery — host import registration, Cart load
+// + tick — lives in this file and uses the alias so we don't carry
+// two parallel 1500-line implementations.
+#[cfg(feature = "runtime-wasmtime")]
+use wasmtime as runtime;
+#[cfg(all(feature = "runtime-wasmi", not(feature = "runtime-wasmtime")))]
+use wasmi as runtime;
+
+use runtime::{Caller, Engine, Linker, Module, Store, TypedFunc};
 
 use voxlconsl_types::{
     ActionKind, ActorId, ActorRenderMode, BindingHint, BodyId, BodyKind, Material, MaterialFlags,
@@ -38,13 +49,13 @@ pub struct Cart {
 
 #[derive(Debug)]
 pub enum CartError {
-    Wasm(wasmi::Error),
+    Wasm(runtime::Error),
     MissingExport(&'static str),
     Voxl(VoxlError),
 }
 
-impl From<wasmi::Error> for CartError {
-    fn from(e: wasmi::Error) -> Self { Self::Wasm(e) }
+impl From<runtime::Error> for CartError {
+    fn from(e: runtime::Error) -> Self { Self::Wasm(e) }
 }
 
 impl From<VoxlError> for CartError {
@@ -71,6 +82,19 @@ impl Cart {
                 (bytes, None, None)
             };
 
+        // wasmtime: explicit Cranelift Speed opt level + minimal config.
+        // Default Engine works but doesn't guarantee the fast tier;
+        // building Config explicitly lets us toggle bounds checks etc.
+        // in the future.
+        #[cfg(feature = "runtime-wasmtime")]
+        let engine = {
+            let mut config = runtime::Config::new();
+            config.cranelift_opt_level(runtime::OptLevel::SpeedAndSize);
+            Engine::new(&config).map_err(|e| {
+                CartError::Wasm(runtime::Error::msg(format!("engine config: {e}")))
+            })?
+        };
+        #[cfg(all(feature = "runtime-wasmi", not(feature = "runtime-wasmtime")))]
         let engine = Engine::default();
         let module = Module::new(&engine, wasm_bytes)?;
         let mut world = WorldState::new();
@@ -85,17 +109,25 @@ impl Cart {
         let mut linker = Linker::new(&engine);
         register_host_imports(&mut linker)?;
 
-        let pre = linker.instantiate(&mut store, &module)?;
-        let instance = pre.start(&mut store)?;
+        // wasmi returns `InstancePre` that you `.start(&mut store)` on;
+        // wasmtime's `instantiate` is one-shot and starts the module
+        // inline. Both produce the same `Instance` after.
+        #[cfg(all(feature = "runtime-wasmi", not(feature = "runtime-wasmtime")))]
+        let instance = linker.instantiate(&mut store, &module)?.start(&mut store)?;
+        #[cfg(feature = "runtime-wasmtime")]
+        let instance = linker.instantiate(&mut store, &module)?;
 
+        // `get_typed_func` wants `AsContextMut` under wasmtime. wasmi
+        // accepts both `&Store` and `&mut Store`, so the mutable form
+        // works for both runtimes.
         let init_fn = instance
-            .get_typed_func::<(), ()>(&store, "init")
+            .get_typed_func::<(), ()>(&mut store, "init")
             .map_err(|_| CartError::MissingExport("init"))?;
         let update_fn = instance
-            .get_typed_func::<u32, ()>(&store, "update")
+            .get_typed_func::<u32, ()>(&mut store, "update")
             .map_err(|_| CartError::MissingExport("update"))?;
         let render_fn = instance
-            .get_typed_func::<(), ()>(&store, "render")
+            .get_typed_func::<(), ()>(&mut store, "render")
             .map_err(|_| CartError::MissingExport("render"))?;
 
         // Run cart init() so it can populate the world.
@@ -223,7 +255,7 @@ fn write_sweep_hit(
     1
 }
 
-fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::Error> {
+fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), runtime::Error> {
     // World mutation (§3.6)
     linker.func_wrap(
         "env", "set_voxel",
@@ -1346,7 +1378,7 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
     // already-shipped cart wasm whose import name predates the rename;
     // wasmi silently ignores host-side imports that the module doesn't
     // declare, so the duplicate registration is harmless.
-    let log_handler = |caller: Caller<WorldState>, ptr: u32, len: u32| {
+    let log_handler = |mut caller: Caller<WorldState>, ptr: u32, len: u32| {
         let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
             Some(m) => m,
             None => return,

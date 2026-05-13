@@ -12,4 +12,20 @@ voxlconsl-types = { workspace = true, features = ["bytemuck"] }
 voxlconsl-svo = { workspace = true }
 voxlconsl-audio = { workspace = true }
 bytemuck = { workspace = true }
-wasmi = { version = "0.50", default-features = false, features = ["std"] }
+wasmi = { version = "0.50", default-features = false, features = ["std"], optional = true }
+
+# wasmtime is desktop-only (Cranelift JIT pulls in heavy native codegen
+# crates that don't make sense for the wasm32 / MCU ports). Gated to
+# non-wasm32 targets AND behind `runtime-wasmtime`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmtime = { version = "34", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }
+
+[features]
+default = ["runtime-wasmi"]
+# Default — interpreted wasmi runtime. Embeddable on MCUs, ~6 min per
+# full ic mission. Pick this for host-browser + portable use.
+runtime-wasmi = ["dep:wasmi"]
+# Cranelift JIT via wasmtime — ~400× faster than wasmi for cart
+# execution. Desktop-only; not buildable for wasm32 / MCU. Pick this
+# for the balance harness or any CLI that doesn't ship to embedded.
+runtime-wasmtime = ["dep:wasmtime"]

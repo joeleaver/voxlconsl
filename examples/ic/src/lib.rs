@@ -419,6 +419,9 @@ unsafe fn handle_interaction(
 #[unsafe(no_mangle)]
 pub extern "C" fn update(dt_ms: u32) {
     let dt = (dt_ms as f32) / 1000.0;
+    // Frame counter drives the surviving_mask cache TTL. Wraps every
+    // ~2 years at 60 fps — fine.
+    unsafe { FRAME_COUNTER = FRAME_COUNTER.wrapping_add(1); }
 
     // Read input axes once per frame — sandbox edge events
     // (`_pressed`) only return true the frame the press landed.
@@ -604,7 +607,37 @@ pub extern "C" fn render() {
 
 // ── Win / lose ───────────────────────────────────────────────────
 
+/// Cached `surviving_mask` result + the frame at which it was
+/// recomputed. Re-scanning every frame is 504 host-import crossings
+/// (6 cabins × 7×6×7 voxels × twice per frame for HUD + end check) —
+/// at ~80 µs per crossing that's ~40 ms/frame entirely on this one
+/// operation, dominating mission-sweep wall time. A 30-frame TTL
+/// (~0.5 s of mission) is well below player-perceptible HUD-update
+/// latency and below the 5 s BALANCE_MODE log cadence, so the cache
+/// is invisible in those contexts. End-of-mission detection is
+/// delayed by ≤ 30 frames worst case (≈ 0.5 s).
+static mut SURVIVING_MASK_CACHE: u32 = 63; // 6 alive cabins at boot
+static mut SURVIVING_MASK_LAST_FRAME: u32 = u32::MAX; // "never computed"
+static mut FRAME_COUNTER: u32 = 0;
+const SURVIVING_MASK_TTL_FRAMES: u32 = 30;
+
 fn surviving_mask() -> u32 {
+    unsafe {
+        let frame = FRAME_COUNTER;
+        let last = SURVIVING_MASK_LAST_FRAME;
+        // u32::MAX sentinel means "never computed yet" — always do a
+        // first scan. Subsequent scans honor the TTL.
+        if last != u32::MAX && frame.saturating_sub(last) < SURVIVING_MASK_TTL_FRAMES {
+            return SURVIVING_MASK_CACHE;
+        }
+        let mask = recompute_surviving_mask();
+        SURVIVING_MASK_CACHE = mask;
+        SURVIVING_MASK_LAST_FRAME = frame;
+        mask
+    }
+}
+
+fn recompute_surviving_mask() -> u32 {
     use voxlconsl_sdk::physics;
     // Re-scan each cabin. Same threshold as
     // `terrain::count_surviving_cabins`, but per-cabin so we can
