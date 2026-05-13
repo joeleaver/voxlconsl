@@ -4,9 +4,15 @@
 //! glance where their committed orders are heading and how deep the
 //! pipeline is on each side of the map.
 //!
-//! - Cyan badges = water drops (positioned at the drop cell)
-//! - Yellow badges = fire lines (positioned at the line's first
-//!   waypoint)
+//! - **Cyan**: heli water drops (positioned at the drop cell).
+//! - **Yellow (select-marker)**: firetruck fire-line orders
+//!   (positioned at the line's first waypoint).
+//! - **Cyan / pink** (tanker stripe): pending tanker sorties.
+//! - **Yellow (hotshot stripe)**: hot-shot squad orders (positioned
+//!   at the squad's line anchor — same cell while the drop plane is
+//!   in the air, while the chutes are falling, and while the crews
+//!   are on the ground).
+//! - **Red (engine body)**: fire-engine park orders.
 //!
 //! Badges include **active** orders (a unit is already executing
 //! them) followed by **queued** orders (waiting for an idle unit).
@@ -22,7 +28,10 @@ use voxlconsl_sdk::text::FONT_TINY;
 
 use crate::terrain::terrain_height;
 use crate::units::{Roster, TankerKind};
-use crate::{M_BUCKET_WATER, M_SELECT_MARKER, M_TANKER_RETARDANT_STRIPE, M_TANKER_WATER_STRIPE};
+use crate::{
+    M_BUCKET_WATER, M_ENGINE_BODY, M_HOTSHOT_STRIPE, M_SELECT_MARKER,
+    M_TANKER_RETARDANT_STRIPE, M_TANKER_WATER_STRIPE,
+};
 
 pub(crate) const MARKERS_PER_TYPE: usize = 9;
 const MARKER_W: u8 = 6;
@@ -32,10 +41,14 @@ const MARKER_VOL_BYTES: usize = (MARKER_W as usize) * (MARKER_H as usize);
 const WATER_PREFAB:        PrefabId = PrefabId(68);
 const LINE_PREFAB:         PrefabId = PrefabId(69);
 const TANKER_REQ_PREFAB:   PrefabId = PrefabId(71);
+const HOTSHOT_PREFAB:      PrefabId = PrefabId(76);
+const ENGINE_PREFAB:       PrefabId = PrefabId(77);
 
 static mut WATER_DENSE:      [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
 static mut LINE_DENSE:       [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
 static mut TANKER_REQ_DENSE: [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
+static mut HOTSHOT_DENSE:    [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
+static mut ENGINE_DENSE:     [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
 
 pub(crate) struct QueueMarkers {
     water_actors:        [Option<ActorId>; MARKERS_PER_TYPE],
@@ -45,9 +58,13 @@ pub(crate) struct QueueMarkers {
     /// change (rare — when a request slot recycles between
     /// different-kind requests) both trigger a repaint.
     tanker_req_actors:   [Option<ActorId>; MARKERS_PER_TYPE],
+    hotshot_actors:      [Option<ActorId>; MARKERS_PER_TYPE],
+    engine_actors:       [Option<ActorId>; MARKERS_PER_TYPE],
     water_cache:      [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
     line_cache:       [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
     tanker_req_cache: [Option<(u8, u32, u32, u8)>; MARKERS_PER_TYPE],
+    hotshot_cache:    [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
+    engine_cache:     [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
 }
 
 impl QueueMarkers {
@@ -56,9 +73,13 @@ impl QueueMarkers {
             water_actors:      [None; MARKERS_PER_TYPE],
             line_actors:       [None; MARKERS_PER_TYPE],
             tanker_req_actors: [None; MARKERS_PER_TYPE],
+            hotshot_actors:    [None; MARKERS_PER_TYPE],
+            engine_actors:     [None; MARKERS_PER_TYPE],
             water_cache:      [None; MARKERS_PER_TYPE],
             line_cache:       [None; MARKERS_PER_TYPE],
             tanker_req_cache: [None; MARKERS_PER_TYPE],
+            hotshot_cache:    [None; MARKERS_PER_TYPE],
+            engine_cache:     [None; MARKERS_PER_TYPE],
         }
     }
 
@@ -82,6 +103,16 @@ impl QueueMarkers {
                 &*(&raw const TANKER_REQ_DENSE),
                 U8Vec3::new(MARKER_W, MARKER_H, 1),
             );
+            prefab_define(
+                HOTSHOT_PREFAB,
+                &*(&raw const HOTSHOT_DENSE),
+                U8Vec3::new(MARKER_W, MARKER_H, 1),
+            );
+            prefab_define(
+                ENGINE_PREFAB,
+                &*(&raw const ENGINE_DENSE),
+                U8Vec3::new(MARKER_W, MARKER_H, 1),
+            );
         }
         for slot in &mut self.water_actors {
             let id = actor_spawn_from(WATER_PREFAB, Orientation::Up)
@@ -100,6 +131,20 @@ impl QueueMarkers {
         for slot in &mut self.tanker_req_actors {
             let id = actor_spawn_from(TANKER_REQ_PREFAB, Orientation::Up)
                 .expect("queue tanker-req marker spawn");
+            actor_set_render_mode(id, ActorRenderMode::Billboard);
+            actor_set_visible(id, false);
+            *slot = Some(id);
+        }
+        for slot in &mut self.hotshot_actors {
+            let id = actor_spawn_from(HOTSHOT_PREFAB, Orientation::Up)
+                .expect("queue hotshot marker spawn");
+            actor_set_render_mode(id, ActorRenderMode::Billboard);
+            actor_set_visible(id, false);
+            *slot = Some(id);
+        }
+        for slot in &mut self.engine_actors {
+            let id = actor_spawn_from(ENGINE_PREFAB, Orientation::Up)
+                .expect("queue engine marker spawn");
             actor_set_render_mode(id, ActorRenderMode::Billboard);
             actor_set_visible(id, false);
             *slot = Some(id);
@@ -184,7 +229,111 @@ impl QueueMarkers {
         for i in idx..MARKERS_PER_TYPE {
             hide_tanker_slot(self.tanker_req_actors[i], &mut self.tanker_req_cache[i]);
         }
+
+        // ── Hot-shot squads ──
+        // A single squad order spans a drop plane + ≤4 parachutes +
+        // ≤4 crews on the ground, all sharing the same path[0]
+        // anchor. We dedupe by (x, z) so the player sees ONE badge
+        // per squad regardless of phase. Active squads first, then
+        // queued orders.
+        let mut idx = 0usize;
+        let mut seen: [(u32, u32); MARKERS_PER_TYPE] = [(u32::MAX, u32::MAX); MARKERS_PER_TYPE];
+        for slot in roster.drop_planes.iter() {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let plane = match slot { Some(p) => p, None => continue };
+            let Some(anchor) = plane.path[0] else { continue };
+            if mark_seen(&mut seen, idx, anchor) {
+                refresh_slot(
+                    self.hotshot_actors[idx], &mut self.hotshot_cache[idx],
+                    idx, UVec3::new(anchor.0, terrain_height(anchor.0, anchor.1), anchor.1),
+                    M_HOTSHOT_STRIPE,
+                );
+                idx += 1;
+            }
+        }
+        for slot in roster.parachutes.iter() {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let chute = match slot { Some(p) => p, None => continue };
+            let Some(anchor) = chute.path[0] else { continue };
+            if mark_seen(&mut seen, idx, anchor) {
+                refresh_slot(
+                    self.hotshot_actors[idx], &mut self.hotshot_cache[idx],
+                    idx, UVec3::new(anchor.0, terrain_height(anchor.0, anchor.1), anchor.1),
+                    M_HOTSHOT_STRIPE,
+                );
+                idx += 1;
+            }
+        }
+        for slot in roster.hotshots.iter() {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let hs = match slot { Some(h) => h, None => continue };
+            let Some(anchor) = hs.active_line_head() else { continue };
+            if mark_seen(&mut seen, idx, anchor) {
+                refresh_slot(
+                    self.hotshot_actors[idx], &mut self.hotshot_cache[idx],
+                    idx, UVec3::new(anchor.0, terrain_height(anchor.0, anchor.1), anchor.1),
+                    M_HOTSHOT_STRIPE,
+                );
+                idx += 1;
+            }
+        }
+        for i in 0..(roster.queue.pending_hotshots() as usize) {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let target = match roster.queue.hotshot_head_at(i) { Some(t) => t, None => continue };
+            refresh_slot(
+                self.hotshot_actors[idx], &mut self.hotshot_cache[idx],
+                idx, target, M_HOTSHOT_STRIPE,
+            );
+            idx += 1;
+        }
+        for i in idx..MARKERS_PER_TYPE {
+            hide_slot(self.hotshot_actors[i], &mut self.hotshot_cache[i]);
+        }
+
+        // ── Fire engines ──
+        // One badge per active or queued engine order. Engines have
+        // at most one order each, so no dedupe required.
+        let mut idx = 0usize;
+        for slot in roster.engines.iter() {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let e = match slot { Some(e) => e, None => continue };
+            let (x, z) = match e.active_target() { Some(c) => c, None => continue };
+            let y = terrain_height(x, z);
+            refresh_slot(
+                self.engine_actors[idx], &mut self.engine_cache[idx],
+                idx, UVec3::new(x, y, z), M_ENGINE_BODY,
+            );
+            idx += 1;
+        }
+        for i in 0..(roster.queue.pending_engines() as usize) {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let target = match roster.queue.engine_at(i) { Some(t) => t, None => continue };
+            refresh_slot(
+                self.engine_actors[idx], &mut self.engine_cache[idx],
+                idx, target, M_ENGINE_BODY,
+            );
+            idx += 1;
+        }
+        for i in idx..MARKERS_PER_TYPE {
+            hide_slot(self.engine_actors[i], &mut self.engine_cache[i]);
+        }
     }
+}
+
+/// Push `cell` into the first `next` slots of `seen` if it isn't
+/// already present. Returns `true` iff `cell` was newly added.
+fn mark_seen(
+    seen: &mut [(u32, u32); MARKERS_PER_TYPE],
+    next: usize,
+    cell: (u32, u32),
+) -> bool {
+    for i in 0..next {
+        if seen[i] == cell { return false; }
+    }
+    if next < MARKERS_PER_TYPE {
+        seen[next] = cell;
+    }
+    true
 }
 
 /// Same shape as `refresh_slot` but with a 4-tuple cache key that
