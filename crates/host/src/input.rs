@@ -5,12 +5,11 @@
 //! browser-port key-and-mouse set per the §6.6 default tables.
 //!
 //! TODO:
-//!   - Pointer + Axis1D actions
 //!   - Reserved system actions (§6.3)
 //!   - Per-port binding tables for handheld + touch
-//!   - Rebind UI (§6.7)
-//!   - Stick deadzone tuning (§6.5)
-//!   - Rumble output (§6.8)
+//!   - Rebind UI (§6.8)
+//!   - Stick deadzone tuning (§6.6)
+//!   - Rumble output (§6.9)
 
 use std::collections::HashSet;
 
@@ -29,6 +28,7 @@ pub enum Key {
     Shift = 14, RShift = 15,
     Up = 16, Down = 17, Left = 18, Right = 19,
     F1 = 20,
+    U  = 21,
 }
 
 impl Key {
@@ -43,6 +43,7 @@ impl Key {
             16 => Some(Self::Up), 17 => Some(Self::Down),
             18 => Some(Self::Left), 19 => Some(Self::Right),
             20 => Some(Self::F1),
+            21 => Some(Self::U),
             _ => None,
         }
     }
@@ -134,6 +135,36 @@ impl InputState {
         self.get(h).map(|a| !matches!(a.binding, Binding::None)).unwrap_or(false)
     }
 
+    /// Short human-readable label for the input currently bound to `h`.
+    /// See SPEC §6.5. Returns `""` when the handle is unbound on this
+    /// port or refers to an unknown action.
+    ///
+    /// The browser port only ever binds keyboard + mouse, so the labels
+    /// are stable strings keyed off `Binding`. When gamepad / handheld
+    /// bindings land this needs to grow a case per device class.
+    pub fn label(&self, h: ActionHandle) -> &'static str {
+        // Reserved system handles aren't in `self.actions` — synthesise
+        // the label from the browser default for the corresponding key.
+        if h == ActionHandle::SYSTEM_PAUSE { return key_label(Key::Tab); }
+        if h == ActionHandle::SYSTEM_MENU  { return key_label(Key::F1); }
+        match self.get(h).map(|a| &a.binding) {
+            Some(Binding::Button { key }) => key_label(*key),
+            Some(Binding::Axis1DKey { pos }) => key_label(*pos),
+            Some(Binding::Axis2DKeyPair { neg_x, pos_x, neg_y, pos_y }) => {
+                // Recognise the canonical layouts so the cart can paint
+                // "WASD" / "Arrows" instead of leaking individual keys.
+                match (*neg_x, *pos_x, *neg_y, *pos_y) {
+                    (Key::A, Key::D, Key::S, Key::W) => "WASD",
+                    (Key::Left, Key::Right, Key::Down, Key::Up) => "Arrows",
+                    _ => "Keys",
+                }
+            }
+            Some(Binding::MouseDelta) => "Mouse",
+            Some(Binding::MouseWheel) => "Wheel",
+            Some(Binding::None) | None => "",
+        }
+    }
+
     // ── Button-style queries ────────────────────────────────────────────
 
     pub fn button(&self, h: ActionHandle) -> bool {
@@ -196,12 +227,19 @@ impl InputState {
 
     /// Called by the browser host whenever a tracked key changes state.
     /// `down` = true is a press, false is a release.
+    ///
+    /// The press edge fires unconditionally so we recover gracefully
+    /// from a missed `keyup` — a window-blur or alt-tab can swallow
+    /// the release, leaving the key in `keys_held` forever. Without
+    /// the unconditional insert, the next fresh press would see the
+    /// key "already held" and silently drop the edge, making the
+    /// input feel flaky. Browser auto-repeat is filtered out on the
+    /// JS side (`e.repeat`) so this only fires once per real tap.
     pub fn key_event(&mut self, key: Key, down: bool) {
         if down {
-            if self.keys_held.insert(key) {
-                self.keys_pressed_this_frame.insert(key);
-                self.keys_held_ms.insert(key, 0);
-            }
+            self.keys_pressed_this_frame.insert(key);
+            self.keys_held.insert(key);
+            self.keys_held_ms.insert(key, 0);
         } else if self.keys_held.remove(&key) {
             self.keys_released_this_frame.insert(key);
             self.keys_held_ms.remove(&key);
@@ -240,7 +278,23 @@ impl Default for InputState {
     fn default() -> Self { Self::new() }
 }
 
-/// Default browser-port bindings (subset of SPEC.md §6.6, no-gamepad column).
+/// Short display name for a browser keyboard key — see SPEC §6.5. Stable
+/// strings the cart prints into its HUD as "press [Esc] to cancel" etc.
+fn key_label(k: Key) -> &'static str {
+    match k {
+        Key::W => "W", Key::A => "A", Key::S => "S", Key::D => "D",
+        Key::I => "I", Key::J => "J", Key::K => "K", Key::L => "L",
+        Key::Q => "Q", Key::E => "E", Key::U => "U",
+        Key::Space => "Space", Key::Enter => "Enter",
+        Key::Tab => "Tab", Key::Escape => "Esc",
+        Key::Shift => "Shift", Key::RShift => "RShift",
+        Key::Up => "Up", Key::Down => "Down",
+        Key::Left => "Left", Key::Right => "Right",
+        Key::F1 => "F1",
+    }
+}
+
+/// Default browser-port bindings (subset of SPEC.md §6.7, no-gamepad column).
 fn browser_default_binding(kind: ActionKind, hint: BindingHint) -> Binding {
     use BindingHint::*;
     match (kind, hint) {
@@ -254,15 +308,18 @@ fn browser_default_binding(kind: ActionKind, hint: BindingHint) -> Binding {
             neg_x: Key::Left, pos_x: Key::Right,
             neg_y: Key::Down, pos_y: Key::Up,
         },
+        // Face-button surface for the browser port maps to the J/K/U/I
+        // diamond under the right hand. System buttons land on
+        // Enter/Escape since they're the most-reached-for "go" / "back"
+        // keys when right hand is on the surface row.
         (ActionKind::Button, PrimaryFire) => Binding::Button { key: Key::J },
         (ActionKind::Button, SecondaryFire) => Binding::Button { key: Key::K },
-        (ActionKind::Button, Confirm) => Binding::Button { key: Key::Enter },
-        (ActionKind::Button, Cancel) => Binding::Button { key: Key::Escape },
-        (ActionKind::Button, Pause) => Binding::Button { key: Key::Tab },
-        (ActionKind::Button, Menu) => Binding::Button { key: Key::F1 },
+        (ActionKind::Button, Confirm) => Binding::Button { key: Key::U },
+        (ActionKind::Button, Cancel) => Binding::Button { key: Key::I },
+        (ActionKind::Button, Pause) => Binding::Button { key: Key::Enter },
+        (ActionKind::Button, Menu) => Binding::Button { key: Key::Escape },
         (ActionKind::Button, _) => Binding::Button { key: Key::Space },
         (ActionKind::Axis1D, Zoom) => Binding::MouseWheel,
         (ActionKind::Axis1D, _) => Binding::Axis1DKey { pos: Key::Space },
-        (ActionKind::Pointer, _) => Binding::None,
     }
 }

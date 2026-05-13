@@ -9,8 +9,6 @@ pub enum ActionKind {
     Axis1D,
     /// `(f32, f32)` inside the unit disc — sticks or aim deltas.
     Axis2D,
-    /// `(i16, i16)` absolute, framebuffer pixel coords.
-    Pointer,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -35,8 +33,6 @@ pub enum BindingHint {
     /// System-flavored (Button).
     Menu,
     Pause,
-    /// Requires pointer; cart should degrade if absent.
-    PointerOnly,
 }
 
 /// Cart's declaration of one action.

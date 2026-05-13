@@ -86,6 +86,7 @@ mod host {
         pub fn input_action_axis1d(h: u32) -> f32;
         pub fn input_action_axis2d(h: u32, out_x: *mut f32, out_y: *mut f32);
         pub fn input_action_active(h: u32) -> u32;
+        pub fn input_action_label(h: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 
         pub fn log(ptr: *const u8, len: u32);
 
@@ -542,7 +543,31 @@ pub fn input_action_axis2d(h: ActionHandle) -> (f32, f32) {
 }
 
 /// True iff the action is bound to anything on the current port. Lets carts
-/// gracefully omit features (e.g., pointer-only UI) on stick-only devices.
+/// gracefully omit features on ports that can't bind a given action (e.g., a
+/// `Zoom` axis on a handheld variant with no wheel and no analog stick).
 pub fn input_action_active(h: ActionHandle) -> bool {
     unsafe { host::input_action_active(h.0) != 0 }
+}
+
+/// Short label for the physical input currently driving `h` — see SPEC §6.5.
+/// The host writes UTF-8 bytes for the active binding into `out` and the
+/// returned `&str` borrows that subslice. Returns `""` when the handle is
+/// unbound on this port.
+///
+/// Labels are short — 16 bytes is plenty for every v0.1 port. Longer labels
+/// are truncated without error.
+///
+/// ```no_run
+/// # use voxlconsl_sdk::*;
+/// # let primary = ActionHandle(0);
+/// let mut buf = [0u8; 16];
+/// let label = input_action_label(primary, &mut buf);   // e.g. "J"
+/// ```
+pub fn input_action_label<'a>(h: ActionHandle, out: &'a mut [u8]) -> &'a str {
+    let cap = out.len();
+    let n = unsafe {
+        host::input_action_label(h.0, out.as_mut_ptr(), cap as u32)
+    } as usize;
+    let n = n.min(cap);
+    core::str::from_utf8(&out[..n]).unwrap_or("")
 }

@@ -15,7 +15,7 @@ A fantasy console where the only graphics primitive is a voxel.
 | Output framebuffer | **256 × 144** (16:9), scaled to physical display by each port |
 | Refresh rate | 60 Hz |
 | Color | 64-color fixed system palette + 256-entry per-cart material table |
-| Audio | 16 MIDI channels, cart-defined synth patches, 16-voice polyphony, 22.05 kHz mix |
+| Audio | 16 MIDI channels, cart-defined synth patches, 32-voice polyphony, 22.05 kHz mix |
 | Input | Cart declares **actions** (gameplay verbs); the port maps physical inputs to actions. Same cart runs on browser, touch-only mobile, and physical handheld. See §6. |
 | Cart format | Single binary file, max **32 MB** |
 | Cart code | WASM (`wasm32-unknown-unknown`); Rust is the reference cart language |
@@ -349,7 +349,7 @@ sample (selected by note via key zones) ─► resampler ─► filter ─► VC
 
 Other CCs are ignored. The CC table is **fixed in v1** — there is no per-cart CC routing or remapping. Carts wanting custom modulation paths use the runtime patch-editing API (§5.7) directly. SysEx is reserved for future use.
 
-**Polyphony:** 16 voices total, shared across channels. Voice-stealing strategy: oldest released note first, then oldest held note.
+**Polyphony:** 32 voices total, shared across channels. Voice-stealing strategy: oldest released note first, then oldest held note. (Bumped from 16 once we audited per-voice DSP cost against the ESP32-P4 budget; ESP32-S3 ports may need to dynamically reduce this.)
 
 ### 5.3 Sequenced music
 
@@ -420,7 +420,7 @@ fn sfx_set_pitch(voice: VoiceId, pitch_cents: i16);
 - `pitch_cents`: 0 = original pitch; ±100 = ±1 semitone.
 - `loop_`: if true, sample plays its declared loop region indefinitely until stopped. The returned `VoiceId` lets the cart stop or modulate the voice; non-looped one-shots can ignore the return.
 
-SFX voices share the same 16-voice polyphony pool as MIDI notes — playing many SFX simultaneously will steal voices via the same oldest-released-first rule. Cart-side bookkeeping isn't required; voices are reaped automatically when their sample finishes (or when stopped).
+SFX voices share the same 32-voice polyphony pool as MIDI notes — playing many SFX simultaneously will steal voices via the same oldest-released-first rule. Cart-side bookkeeping isn't required; voices are reaped automatically when their sample finishes (or when stopped).
 
 ### 5.7 Runtime patch editing
 
@@ -492,18 +492,18 @@ pub enum ActionKind {
     Button,        // discrete: held / pressed / released / held_ms
     Axis1D,        // f32 in -1.0..1.0 (signed) or 0.0..1.0 (unsigned by binding)
     Axis2D,        // (f32, f32) inside the unit disc — sticks or aim deltas
-    Pointer,       // (f32, f32) absolute, framebuffer pixel coords
 }
 
 pub enum BindingHint {
     None,                // platform infers from kind alone
     PrimaryMovement,     // 2D ground/world movement (Axis2D)
     Aim,                 // 2D look/aim — accepts stick or pointer-delta (Axis2D)
+    Zoom,                // zoom in/out — mouse wheel or stick axis (Axis1D);
+                         // positive = closer, negative = farther
     PrimaryFire,         // main "do it" button (Button)
     SecondaryFire,       // alt fire / aim-down-sights / right click
     Confirm, Cancel,     // dialog / UI semantics (Button)
     Menu, Pause,         // system-flavored (Button)
-    PointerOnly,         // requires pointer; cart should degrade if absent
 }
 
 pub struct ActionDecl<'a> {
@@ -552,22 +552,71 @@ fn input_action_held_ms(h: ActionHandle) -> u32;           // 0 if not held
 
 fn input_action_axis1d(h: ActionHandle) -> f32;
 fn input_action_axis2d(h: ActionHandle) -> (f32, f32);
-fn input_action_pointer(h: ActionHandle) -> (i16, i16);    // (-1, -1) when unavailable
 
 fn input_action_active(h: ActionHandle) -> bool;           // true iff bound to anything on this port
 ```
 
-Querying a Button function on an Axis-kind action (or vice versa) returns the zero value silently — same shape, no panic. `input_action_active` is the polite check: a `PointerOnly` action on a stick-only handheld returns `false` and the cart can omit pointer-driven UI.
+Querying a Button function on an Axis-kind action (or vice versa) returns the zero value silently — same shape, no panic. `input_action_active` is the polite check: an action that the active port can't bind (e.g., a `Zoom` axis on a no-wheel-no-stick handheld variant) returns `false` and the cart can omit the dependent UI.
 
 Edges cover the entire previous frame; a press-and-release between two `update()` calls surfaces both edges.
 
-### 6.5 Deadzones
+### 6.5 Binding labels
+
+The host owns a read-only label table that maps every declared action handle to a short, human-readable glyph for the physical input currently driving it: `"J"`, `"LMB"`, `"Esc"`, `"A"` (gamepad face button), `"Start"`, `"RStick"`, `"Tap"`. Carts paint these into HUD prompts ("press [J] to act") so the displayed key tracks the active device instead of being hard-coded.
+
+```rust
+fn input_action_label(h: ActionHandle, out: &mut [u8]) -> &str;
+```
+
+The host writes UTF-8 bytes for the active binding into the cart-provided slice and returns the populated subslice. Labels are short — a 16-byte scratch is enough for every binding the v0.1 ports emit; longer labels are truncated without error.
+
+The label is live. Within one frame of the host switching input devices (gamepad plugged in mid-session, touch overlay tapped on a hybrid device) or the user rebinding via `SYSTEM_MENU`, the returned string updates. Returns `""` when `h` is unbound on the active port.
+
+Behavior:
+
+- For actions bound to multiple inputs on the same port (e.g., `PrimaryFire` = LMB *or* J on browser), the label is the glyph for the *most recently used* binding, falling back to the port's canonical default at session start.
+- Reserved system handles carry labels too: `SYSTEM_PAUSE` returns `"Start"` on a gamepad, `"Esc"` / `"Tab"` on the browser.
+- The label is opaque text — carts must not parse it. Future ports may return Unicode glyphs in the private-use area for gamepad face icons; carts should render whatever bytes they receive.
+- Carts that paint these labels should cache the previous string per handle and repaint only on change.
+
+The host must update the table proactively (no cart-side request needed) so that the next `input_action_label` call after a device switch already returns the new glyph.
+
+### 6.6 Deadzones
 
 The host applies a fixed ~3% radial deadzone on Axis2D actions bound to physical sticks (hardware-noise floor). On touch virtual sticks, the host applies a small per-touch filter. Carts apply their own gameplay deadzone (typically 15–25%) on top — there is no raw-value escape hatch.
 
-### 6.6 Port binding
+### 6.7 Port binding
 
-Each port's auto-binder produces default action → physical-input mappings from `kind + hint`. The user can override via the system rebind UI (§6.7).
+Each port's auto-binder produces default action → physical-input mappings from `kind + hint`. The user can override via the system rebind UI (§6.8).
+
+**Reference handheld profile.** voxlconsl's native target is a home-buildable handheld with a fixed, minimal input surface:
+
+- 4 face buttons — **A** (south), **B** (east), **X** (north), **Y** (west).
+- 2 system buttons — **Start**, **Select**.
+- 2 bumpers — **L**, **R** (digital, no analog travel).
+- 2 analog sticks — **LStick**, **RStick** (Axis2D each; stick-click state is a build-time option, so carts must not require it).
+- No triggers, no touchscreen on the handheld; touchscreen and pointer input live on the browser / mobile ports.
+
+Total: 8 digital buttons + 2 sticks. There is no analog trigger; carts that want a 1D analog input (`Zoom`, `Axis1D` + `None`) read a synthetic axis from the bumpers — **R held = +1.0, L held = -1.0**, neither = 0.0, both = 0.0. This keeps cart code identical between handheld (digital bumpers) and browser (mouse wheel) — both deliver `Axis1D`.
+
+**Physical handheld:**
+
+| Hint | Default |
+|---|---|
+| `PrimaryMovement` | Left stick |
+| `Aim` | Right stick |
+| `Zoom` | L/R bumpers (synthesised Axis1D: R = +1.0, L = -1.0) |
+| `PrimaryFire` | A |
+| `SecondaryFire` | B |
+| `Confirm` | X |
+| `Cancel` | Y |
+| `Pause` | Start |
+| `Menu` | Select |
+| `None` + `Button` | unbound (no spare buttons after the eight hint slots) |
+| `None` + `Axis1D` | unbound |
+| `None` + `Axis2D` | unbound |
+
+Every face button maps 1:1 to exactly one hint — there is no aliasing between `PrimaryFire` and `Confirm` (or `SecondaryFire` and `Cancel`). A cart that declares both gets two distinct buttons.
 
 **Browser (keyboard + mouse, optional gamepad):**
 
@@ -575,32 +624,27 @@ Each port's auto-binder produces default action → physical-input mappings from
 |---|---|---|
 | `PrimaryMovement` | WASD | Left stick |
 | `Aim` | Mouse delta (only when canvas has pointer lock) | Right stick |
-| `Zoom` | Mouse wheel | Right trigger axis |
-| `PrimaryFire` | Left mouse / J | A button |
-| `SecondaryFire` | Right mouse / K | B button |
-| `Confirm` | Enter / J | A |
-| `Cancel` | Escape / K | B |
-| `Pause` | Tab / Esc | Start |
-| `Menu` | F1 | Select |
-| `Pointer` / `PointerOnly` | Mouse position | Mouse position (always available) |
-| `None` + `Button` | Space, F, G, H… | X, Y, L, R… |
-| `None` + `Axis1D` | first available trigger key pair | first unbound trigger |
-| `None` + `Axis2D` | first available stick-equivalent | first unbound stick |
+| `Zoom` | Mouse wheel | L/R bumpers (synthesised); falls back to triggers if the pad has them |
+| `PrimaryFire` | Left mouse / J | A |
+| `SecondaryFire` | Right mouse / K | B |
+| `Confirm` | U | X |
+| `Cancel` | I | Y |
+| `Pause` | Enter | Start |
+| `Menu` | Escape | Select |
+| `None` + `Button` | Space, F, G, H… | unbound |
+| `None` + `Axis1D` | first available digit-key pair | unbound |
+| `None` + `Axis2D` | first available stick-equivalent | unbound |
 
-Mouse drives the right-stick equivalent *only when no gamepad is connected*; with a pad attached, mouse drives the pointer channel only.
+The four face-button hints (PrimaryFire / SecondaryFire / Confirm / Cancel) map to the **J K U I** diamond under the right hand:
 
-**Physical handheld (ESP32-P4 dev board):**
+```
+   U  I       <- Confirm, Cancel
+   J  K       <- PrimaryFire, SecondaryFire
+```
 
-| Hint | Default |
-|---|---|
-| `PrimaryMovement` | Left stick |
-| `Aim` | Right stick |
-| `Zoom` | Right trigger axis (LT/RT differential) |
-| `PrimaryFire` / `Confirm` | A |
-| `SecondaryFire` / `Cancel` | B |
-| `Pause` | Start |
-| `Menu` | Select |
-| `Pointer` / `PointerOnly` | Touchscreen if present, else `input_action_active` returns `false` |
+This keeps the right hand on the home row so the player can pan with WASD (left hand), aim with the mouse, and reach any of the four face buttons without a context switch. Enter and Escape — the two most-reached-for "go" and "back" keys when the right hand sits on the surface — become Pause (Start) and Menu (Select).
+
+Mouse drives the right-stick equivalent *only when no gamepad is connected*; with a pad attached, mouse motion is ignored — the cart only sees stick input.
 
 **Touch-only mobile (browser or app):**
 
@@ -611,20 +655,20 @@ Layout heuristics:
 - `PrimaryMovement` Axis2D → virtual analog stick, bottom-left thumb zone.
 - `Aim` Axis2D → free-drag zone over the right half of the screen, delta semantics (drag to look).
 - `PrimaryFire` Button → large tap target overlapping the aim area, so the right thumb can fire while aiming.
-- `SecondaryFire`, then other `Button` actions in declaration order → small button row, bottom-right.
+- `SecondaryFire` → tap target next to PrimaryFire in the right-thumb cluster.
+- `Confirm` / `Cancel` → tap targets in the right-thumb cluster, smaller than the fire buttons; `Confirm` placed near `PrimaryFire`, `Cancel` near a screen edge for "swipe-to-back" affordance.
+- `Zoom` Axis1D → pinch gesture on the world view (no dedicated tap target).
 - `Pause` / `Menu` → small icons, top-right corner; or a top-edge swipe for `Pause`.
-- `Pointer` / `PointerOnly` → the entire viewport is the pointer, single-touch.
-- `Axis1D` Button-style triggers → press-and-hold zones colocated with the button row.
 
 If the cart declares more Button actions than the overlay can fit (~6 visible without crowding), the extras spill into a pop-out drawer reachable from the button row.
 
-### 6.7 User rebinding
+### 6.8 User rebinding
 
 The platform provides a system rebind overlay reachable via `SYSTEM_MENU`. It lists each cart's declared actions by name and lets the user reassign physical inputs (or, on touch, reposition virtual elements). Bindings persist per-cart in platform storage, separate from the cart's save block.
 
-Carts never see or set bindings.
+Carts never set bindings programmatically; they can only *display* the current binding via the label table in §6.5.
 
-### 6.8 Rumble (best-effort output)
+### 6.9 Rumble (best-effort output)
 
 ```rust
 fn output_rumble(intensity: f32, duration_ms: u32);
@@ -724,8 +768,9 @@ The host calls these from the per-frame loop described in §10. Carts must expor
 | §5.3 | Sequenced music: `music_play`, `music_stop`, `music_set_tempo_scale`, `music_position_beats` |
 | §5.6 | Real-time audio: `note_on`, `note_off`, `pitch_bend`, `cc`, `program_change`, `all_notes_off`, `sfx_play`, `sfx_stop`, `sfx_set_volume`, `sfx_set_pitch` |
 | §5.7 | Patch editing: `patch_set_osc`, `patch_set_fm`, `patch_set_filter`, `patch_set_amp_env`, `patch_set_filter_env`, `patch_set_lfo`, `patch_set_glide`, `patch_load`, `patch_save`, `patch_copy`, `patch_reset` |
-| §6.2 | Input actions: `input_declare_actions`, `input_action_*` (button / pressed / released / held_ms / axis1d / axis2d / pointer / active) |
-| §6.8 | Output: `output_rumble` |
+| §6.2 | Input actions: `input_declare_actions`, `input_action_*` (button / pressed / released / held_ms / axis1d / axis2d / active) |
+| §6.5 | Binding labels: `input_action_label` |
+| §6.9 | Output: `output_rumble` |
 | §10.1 | Physics queries: `raycast`, `raycast_world_only`, `aabb_overlap_world`, `aabb_overlap_actors`, `sweep_aabb`, `material_at` |
 | §10.2 | Rigid bodies: `body_spawn`, `body_despawn`, `body_set_kind`, `body_set_position`, `body_set_velocity`, `body_get`, `body_apply_impulse`, `body_set_layer`, `body_set_sensor`, `world_set_gravity`, `drain_collision_events` |
 | §10.3 | CA control: `ca_set_budget`, `ca_get_budget`, `ca_mark_active`, `ca_active_count`, `ca_set_global_param` |

@@ -586,7 +586,6 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
                 0 => ActionKind::Button,
                 1 => ActionKind::Axis1D,
                 2 => ActionKind::Axis2D,
-                3 => ActionKind::Pointer,
                 _ => return u32::MAX,
             };
             // Must match the cart-side `BindingHint` discriminants in
@@ -608,7 +607,6 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
                 7 => BindingHint::Cancel,
                 8 => BindingHint::Menu,
                 9 => BindingHint::Pause,
-                10 => BindingHint::PointerOnly,
                 _ => BindingHint::None,
             };
             caller.data_mut().input.declare(name, kind, hint).0
@@ -660,6 +658,26 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         "env", "input_action_active",
         |caller: Caller<WorldState>, h: u32| -> u32 {
             caller.data().input.is_active(voxlconsl_types::ActionHandle(h)) as u32
+        },
+    )?;
+    // Writes the UTF-8 label for the binding currently driving `h`
+    // into the cart-provided buffer, returning the byte count written
+    // (capped at `cap`). See SPEC §6.5.
+    linker.func_wrap(
+        "env", "input_action_label",
+        |mut caller: Caller<WorldState>,
+         h: u32, out_ptr: u32, out_cap: u32| -> u32 {
+            let label = caller.data().input.label(voxlconsl_types::ActionHandle(h));
+            let bytes = label.as_bytes();
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            let n = bytes.len().min(out_cap as usize);
+            if n > 0 {
+                let _ = memory.write(&mut caller, out_ptr as usize, &bytes[..n]);
+            }
+            n as u32
         },
     )?;
 

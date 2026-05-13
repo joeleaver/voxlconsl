@@ -19,6 +19,7 @@ const KEY_IDS = {
     "ShiftLeft": 14, "ShiftRight": 15,
     "ArrowUp": 16, "ArrowDown": 17, "ArrowLeft": 18, "ArrowRight": 19,
     "F1": 20,
+    "KeyU": 21,
 };
 
 async function start() {
@@ -477,6 +478,11 @@ async function start() {
     // ── Input wiring ─────────────────────────────────────────────────
     // Keyboard events: capture press/release for keys we care about.
     window.addEventListener("keydown", (e) => {
+        // Ignore the browser's auto-repeat. The host treats every
+        // keydown as a fresh press edge (to recover from missed
+        // keyups), so without this filter holding a key would
+        // re-fire pressed_this_frame several times per second.
+        if (e.repeat) return;
         const id = KEY_IDS[e.code];
         if (id !== undefined) {
             host.set_key(id, true);
