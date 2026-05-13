@@ -297,7 +297,13 @@ fn format_help_line<'a>(buf: &'a mut [u8; SIDEBAR_LINE_MAX], label: &str, verb: 
 /// Per-frame inputs the cart hands to `Hud::paint`. Bundled into a
 /// struct so the call site doesn't drift if we add more fields.
 pub(crate) struct HudCtx<'a> {
+    /// Remaining time in the *current day* (ms). The HUD's TM:MM:SS
+    /// readout displays this; the season's overall progress is now
+    /// reflected by `day_num` / `day_total` instead.
     pub time_left_ms:  u32,
+    pub day_num:       u8,
+    pub day_total:     u8,
+    pub weather_glyph: &'a str,
     pub alive_mask:    u32,
     pub fire_sites:    u32,
     pub wind_dir:      &'a str,

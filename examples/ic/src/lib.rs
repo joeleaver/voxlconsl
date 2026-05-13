@@ -54,6 +54,7 @@ mod queue_markers;
 mod retardant_aim;
 mod rng;
 mod scenario;
+mod season;
 mod terrain;
 mod units;
 
@@ -96,13 +97,14 @@ pub(crate) const M_PLANNED_HOTSHOT:  u8 = 37;
 pub(crate) const M_ENGINE_BODY:      u8 = 38;
 pub(crate) const M_ENGINE_HOSE:      u8 = 39;
 
-// ── Mission tuning ────────────────────────────────────────────────
-
-const MISSION_DURATION_MS: u32 = 180_000;       // 3:00
-const WIN_STRUCTURE_THRESHOLD: u32 = 4;         // need 4 of 6 alive at expiry
+// ── Season tuning ────────────────────────────────────────────────
+//
+// A "season" is the top-level gameplay loop: `DAYS_PER_SEASON` days,
+// each `DAY_DURATION_MS` long, lightning strikes during each day.
+// See `season.rs` for the constants and state machine.
 
 /// Scenario seed for this build. Change to roll a new map — same
-/// seed always reproduces the same forest pattern and starting wind.
+/// seed always reproduces the same forest pattern and weather.
 /// Future work: surface as a URL param / cart arg.
 const MISSION_SEED: u32 = 0xA1F0_5E57;
 
@@ -125,17 +127,15 @@ fn balance_mode() -> bool { unsafe { BALANCE_MODE_FLAG } }
 
 // ── Game state ───────────────────────────────────────────────────
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Phase {
-    Playing,
-    Won,
-    Lost,
-}
+// `Phase` was the per-mission state machine — replaced by
+// `season::SeasonState` now that play runs across multiple days.
+// SEASON is initialised in init() once we know the seed; we use
+// MaybeUninit so the static can hold a real value without a const
+// constructor.
 
-static mut PHASE: Phase = Phase::Playing;
-static mut TIME_LEFT_MS: u32 = MISSION_DURATION_MS;
 static mut FIRE_SITES_LAST: u32 = 0;
 static mut BAL: balance::BalanceLog = balance::BalanceLog::new();
+static mut SEASON: Option<season::Season> = None;
 
 static mut CAMERA: camera::Camera = camera::Camera::new(0.0, 0.0);
 static mut CURSOR: cursor::Cursor = cursor::Cursor::new(0.0, 0.0);
@@ -257,13 +257,15 @@ pub extern "C" fn init() {
         hotshot::init_scatter_rng(s.seed);
     }
 
-    // First fire — seed it now so the player sees smoke from the
-    // opening moment.
-    let fire_seed = terrain::ignite_first_fire();
     unsafe {
+        // Season state machine — drives day timer + lightning strikes
+        // from now on. No initial fire seed; the first lightning of
+        // day 1 provides the first incident.
+        SEASON = Some(season::Season::new(mission_seed));
         let fire = &mut *(&raw mut FIRE_STATE);
-        fire.apply_scenario(scenario::get());
-        fire.add_burn_site(fire_seed);
+        if let Some(s) = &*(&raw const SEASON) {
+            fire.set_wind(s.weather.angle_rad, s.weather.strength);
+        }
     }
 
     if balance_mode() {
@@ -471,8 +473,16 @@ pub extern "C" fn update(dt_ms: u32) {
         )
     };
 
-    let phase = unsafe { PHASE };
-    if phase == Phase::Playing {
+    // Season state machine — only tick gameplay while the day is
+    // active. After SeasonWon / SeasonLost the world freezes (HUD
+    // still repaints with the final state).
+    let season_active = unsafe {
+        (&*(&raw const SEASON))
+            .as_ref()
+            .map(|s| s.state == season::SeasonState::DayActive)
+            .unwrap_or(false)
+    };
+    if season_active {
         let cursor_cell = {
             let (cx, cz) = cur.cell();
             UVec3::new(cx, cur.marker_y(), cz)
@@ -502,9 +512,55 @@ pub extern "C" fn update(dt_ms: u32) {
             }
         }
 
-        // Mission time — saturating so we don't underflow on a
-        // long renderer stall.
-        unsafe { TIME_LEFT_MS = TIME_LEFT_MS.saturating_sub(dt_ms); }
+        // Season tick: advance day clock, roll lightning. We define
+        // "incident active" loosely — if there's any tracked fire OR
+        // any pending order OR any unit doing work, suppress the next
+        // strike. Once the player has contained the fire and units
+        // are home, the next strike can fire.
+        unsafe {
+            let incident_active = {
+                let fire = &*(&raw const FIRE_STATE);
+                let roster = (&*(&raw const ROSTER)).as_ref();
+                fire.burn_site_count() > 0
+                    || roster.map(|r| {
+                        r.queue.pending_total() > 0
+                            || r.heli_busy() > 0
+                            || r.crew_busy() > 0
+                            || r.hotshot_busy() > 0
+                            || r.engine_busy() > 0
+                    }).unwrap_or(false)
+            };
+
+            let strike = (&mut *(&raw mut SEASON))
+                .as_mut()
+                .and_then(|s| s.tick(dt_ms, incident_active));
+
+            if let Some((sx, sz)) = strike {
+                log("ic: ⚡lightning");
+                if let Some(p) = terrain::strike_at(sx, sz) {
+                    let fire = &mut *(&raw mut FIRE_STATE);
+                    fire.add_burn_site(p);
+                    log("ic: ⚡strike ignited");
+                } else {
+                    log("ic: ⚡strike dud");
+                }
+            }
+
+            // Wind sync: SEASON owns the per-day weather. We push the
+            // current angle/strength to FireState every frame in case
+            // a day rolled over.
+            if let Some(s) = &*(&raw const SEASON) {
+                let fire = &mut *(&raw mut FIRE_STATE);
+                // Only update if the values actually changed — set_wind
+                // resets the drift tick so we don't want to do it every
+                // frame on the same value.
+                if (fire.wind_angle_rad() - s.weather.angle_rad).abs() > 1e-3
+                    || (fire.wind_strength() - s.weather.strength).abs() > 1e-3
+                {
+                    fire.set_wind(s.weather.angle_rad, s.weather.strength);
+                }
+            }
+        }
 
         if balance_mode() {
             unsafe {
@@ -573,8 +629,25 @@ unsafe fn build_hud_ctx<'a>(
             None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
 
+    // HUD's "TM" countdown becomes the day timer. Day counter +
+    // weather glyph are routed through additional fields below.
+    let (time_left_ms, day_num, day_total, weather_glyph) = unsafe {
+        match (&*(&raw const SEASON)).as_ref() {
+            Some(s) => (
+                season::DAY_DURATION_MS.saturating_sub(s.day_time_ms),
+                s.day + 1,
+                season::DAYS_PER_SEASON,
+                s.weather_glyph(),
+            ),
+            None => (0, 1, season::DAYS_PER_SEASON, "----"),
+        }
+    };
+
     hud::HudCtx {
-        time_left_ms: unsafe { TIME_LEFT_MS },
+        time_left_ms,
+        day_num,
+        day_total,
+        weather_glyph,
         alive_mask,
         fire_sites:   unsafe { FIRE_SITES_LAST },
         wind_dir,
@@ -666,22 +739,41 @@ fn recompute_surviving_mask() -> u32 {
 fn check_end_conditions() {
     let mask = surviving_mask();
     let alive = mask.count_ones();
-    let time_left = unsafe { TIME_LEFT_MS };
-    let new_phase = if alive == 0 {
-        Some(Phase::Lost)
-    } else if time_left == 0 {
-        Some(if alive >= WIN_STRUCTURE_THRESHOLD { Phase::Won } else { Phase::Lost })
-    } else {
-        None
-    };
-    if let Some(p) = new_phase {
-        unsafe { PHASE = p; }
-        if balance_mode() {
-            let outcome = match p { Phase::Won => "WON", _ => "LOST" };
+    // End-of-season win is decided inside Season::advance_day when the
+    // 7th day rolls over. Here we only need to catch the cabins-zero
+    // early-lose path, which can fire on any day.
+    if alive == 0 {
+        let still_active = unsafe {
+            (&*(&raw const SEASON))
+                .as_ref()
+                .map(|s| s.state == season::SeasonState::DayActive)
+                .unwrap_or(false)
+        };
+        if still_active {
             unsafe {
-                let m = build_balance_metrics(mask);
-                (&mut *(&raw mut BAL)).emit_end(outcome, &m);
+                if let Some(s) = (&mut *(&raw mut SEASON)).as_mut() {
+                    s.end_lost();
+                }
+                if balance_mode() {
+                    let m = build_balance_metrics(mask);
+                    (&mut *(&raw mut BAL)).emit_end("LOST", &m);
+                }
             }
+        }
+        return;
+    }
+    // Season-end win is fired by Season::advance_day; mirror the
+    // balance log here so the harness still captures the outcome.
+    let just_won = unsafe {
+        (&*(&raw const SEASON))
+            .as_ref()
+            .map(|s| s.state == season::SeasonState::SeasonWon)
+            .unwrap_or(false)
+    };
+    if just_won && balance_mode() {
+        unsafe {
+            let m = build_balance_metrics(mask);
+            (&mut *(&raw mut BAL)).emit_end("WON", &m);
         }
     }
 }
@@ -709,7 +801,15 @@ unsafe fn build_balance_metrics(alive_mask: u32) -> balance::BalanceMetrics {
         None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
     };
 
-    let elapsed_ms = MISSION_DURATION_MS.saturating_sub(unsafe { TIME_LEFT_MS });
+    // Total elapsed = (completed days × DAY_DURATION_MS) + day_time_ms.
+    // Lets the CSV row still expose a monotonic mission clock across
+    // all days of the season.
+    let elapsed_ms = unsafe {
+        (&*(&raw const SEASON))
+            .as_ref()
+            .map(|s| (s.day as u32) * season::DAY_DURATION_MS + s.day_time_ms)
+            .unwrap_or(0)
+    };
 
     balance::BalanceMetrics {
         elapsed_ms,

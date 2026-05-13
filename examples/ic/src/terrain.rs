@@ -298,31 +298,33 @@ fn forbidden_for_pine(x: u32, z: u32) -> bool {
 
 // ── Cabin survival check ──────────────────────────────────────────
 
-/// Convenience: seed the first fire voxel where the cart wants it.
-/// Called from `lib.rs` once the player has entered the gameplay
-/// state.
-pub(crate) fn ignite_first_fire() -> UVec3 {
-    // Find a leaf or wood cell within a small box of the fire seed
-    // anchor — terrain noise may have left no flammable column right
-    // at the anchor itself.
-    for dy in 0..30 {
-        for dz in -6i32..=6 {
-            for dx in -6i32..=6 {
-                let x = (FIRE_SEED_X as i32 + dx) as u32;
-                let z = (FIRE_SEED_Z as i32 + dz) as u32;
+/// Lightning strike: search for a flammable cell near the given XZ
+/// and ignite it. Returns the ignited cell on success, or `None`
+/// when the strike landed on bare grass / lake / road / town with
+/// no flammable column nearby — the strike is wasted, no fire
+/// starts. Caller (season.rs) accounts for the strike budget either
+/// way, so a "dud" still counts.
+pub(crate) fn strike_at(target_x: u32, target_z: u32) -> Option<UVec3> {
+    // Scan a 16-cell box around the target XZ for any flammable cell
+    // (canopy or trunk). The dy range only covers the realistic pine
+    // canopy zone (terrain_height + 1..10) — pines are 5-8 voxels
+    // tall, so anything above dy=10 is empty air, anything below is
+    // ground.
+    const RADIUS: i32 = 16;
+    for dy in 1..10 {
+        for dz in -RADIUS..=RADIUS {
+            for dx in -RADIUS..=RADIUS {
+                let x = (target_x as i32 + dx).clamp(0, 250) as u32;
+                let z = (target_z as i32 + dz).clamp(0, 250) as u32;
                 let y = (terrain_height(x, z) as i32 + dy).clamp(0, 250) as u32;
                 let m = physics::material_at(x, y, z);
                 if m == M_PINE_LEAVES || m == M_PINE_WOOD {
                     set_voxel(UVec3::new(x, y, z), M_FIRE);
-                    return UVec3::new(x, y, z);
+                    return Some(UVec3::new(x, y, z));
                 }
             }
         }
     }
-    // Fallback: paint at the anchor surface anyway.
-    let h = terrain_height(FIRE_SEED_X, FIRE_SEED_Z);
-    let p = UVec3::new(FIRE_SEED_X, h, FIRE_SEED_Z);
-    set_voxel(p, M_FIRE);
-    p
+    None
 }
 

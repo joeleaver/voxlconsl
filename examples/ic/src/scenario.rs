@@ -46,13 +46,18 @@ impl Scenario {
         let mut rng = Rng::new(seed.wrapping_mul(0x9E37_79B9).wrapping_add(0x6543_2109));
         let forest_rng = rng.next_u32();
 
-        // Initial wind direction in the eastern half of the compass
-        // — SW through SE through NE — so embers always head
-        // *roughly* toward the town in the south-east. Strength
-        // biased medium (0.30..0.60); the cart's drift logic will
-        // push it around from there.
-        let arc_start = core::f32::consts::FRAC_PI_4;     // NE (π/4)
-        let arc_span  = core::f32::consts::PI;             // sweeps to SW
+        // Initial wind direction narrowed to ENE..SSE (π/3..5π/6, a
+        // 90° arc). This is the half-compass of "embers head toward
+        // the town" — the town sits SE of the fire seed, so wind in
+        // [E, S] always pushes flame in a town-threatening direction.
+        // Previously the arc was a full 180° (NE..SW) which included
+        // SW (away from town) — BALANCE_MODE sweeps showed those
+        // seeds reliably ended WON because the fire never reached
+        // the cabins regardless of fire-spread tuning. Wind drift
+        // still wanders within ±WIND_ANGLE_JITTER per drift step but
+        // we no longer start in a hopeless direction.
+        let arc_start = core::f32::consts::PI / 3.0;       // ENE (60°)
+        let arc_span  = core::f32::consts::PI / 2.0;       // sweeps to SSE (150°)
         let mut wind_angle_rad = arc_start + rng.unit() * arc_span;
         while wind_angle_rad < 0.0      { wind_angle_rad += TAU_F32; }
         while wind_angle_rad >= TAU_F32 { wind_angle_rad -= TAU_F32; }

@@ -29,7 +29,10 @@ slot         = 4
 name         = "pine_wood"
 color        = "brown:0"
 flags        = ["flammable"]
-ca_threshold = 180
+# Was 180 (12 fire-neighbors — impossible; only 6 cardinals exist).
+# 30 = 2 fire neighbors per tick chain a tree's trunk so a single
+# burning leaf adjacent to wood reliably propagates.
+ca_threshold = 30
 ignites_to   = 7
 
 [[material]]
@@ -37,7 +40,12 @@ slot         = 5
 name         = "pine_leaves"
 color        = "forest_green:2"
 flags        = ["flammable"]
-ca_threshold = 80
+# Was 80 originally → 15 (too aggressive: caused total cabin loss
+# in 4-7 s, no time for player response). 45 splits: 3 fire neighbors
+# ignite leaves cleanly, single-neighbor accumulation still works
+# over a few ticks. With narrowed wind this gives ~30 s to first
+# cabin loss.
+ca_threshold = 45
 ignites_to   = 7
 
 # ── Liquids ───────────────────────────────────────────────────────

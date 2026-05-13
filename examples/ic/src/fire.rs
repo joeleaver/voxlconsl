@@ -23,33 +23,40 @@ use crate::{
 
 // ── Tuning ────────────────────────────────────────────────────────
 
-const BURN_SITES_CAP:  usize = 256;
+const BURN_SITES_CAP:  usize = 1024;
 const SITE_TTL_TICKS:  u32   = 480;
-/// 1-in-N chance per site per tick to launch an ember. Higher =
-/// rarer launches = slower long-distance jumps. Original 10 was a
-/// runaway. 30 starved the fire entirely once trees were sparse —
-/// each tree burnt out before chaining. 20 splits the difference:
-/// a tree's ~25 burn sites cumulatively roll ~1.2 launches/tick,
-/// enough to chain into the next tree most of the time without
-/// rocketing through the whole forest.
-const SITE_LAUNCH_MOD: u32   = 20;
+/// 1-in-N chance per site per tick to launch an ember. Lower = more
+/// launches = faster long-distance jumps. Tested values:
+///   - 20: fire self-extinguishes in ~10 s (broken baseline)
+///   - 8:  some seeds catastrophic total-loss in 6 s (too aggressive)
+///   - 15: first-loss around 30-60 s, leaves time for player response
+const SITE_LAUNCH_MOD: u32   = 15;
 
-const EMBERS_CAP:        usize = 96;
+/// Pool size for in-flight embers. Was 96; with `BURN_SITES_CAP` at
+/// 1024 and per-site launch odds of 1/8, sustained attempted
+/// launches exceed 96 by an order of magnitude — the pool would
+/// saturate and most launches would silently drop. 256 keeps every
+/// launch landing somewhere most of the time.
+const EMBERS_CAP:        usize = 256;
 /// How many ticks an ember stays in the air before snuffing itself
 /// out. 280 ticks ≈ 16 s of flight at the cart's tick rate — long
 /// enough to cross a gap between two trees on a still day, much
 /// longer on a strong wind.
 const EMBER_TTL_TICKS:   u32   = 280;
-const EMBER_VEL_XZ:      f32   = 0.40;
+// Ember motion controls per-hop range, which sets first-cabin-loss
+// time. Tested values:
+//   - 0.40 / 0.60 wind → fire reaches town in ~5 s (too fast)
+//   - 0.15 / 0.20 wind → fire never reaches town across 16 seeds (too slow)
+//   - 0.25 / 0.35 wind → in-between, target first-loss around 30-60 s
+const EMBER_VEL_XZ:      f32   = 0.25;
 const EMBER_VEL_Y_MIN:   f32   = 0.55;
 const EMBER_VEL_Y_MAX:   f32   = 1.20;
 const EMBER_GRAVITY:     f32   = 0.040;
 
 /// Max wind contribution to an ember's initial XZ velocity, at
-/// strength = 1.0. Tuned to dominate the random component
-/// (EMBER_VEL_XZ = 0.40) so a strong wind unmistakably pushes the
-/// fire front in one direction.
-const WIND_MAX_SPEED:    f32   = 0.60;
+/// strength = 1.0. 0.35 keeps strong wind meaningful (1.4× the base
+/// velocity bias) without making embers teleport.
+const WIND_MAX_SPEED:    f32   = 0.35;
 
 /// Wind drifts on a slow clock so the player has time to read the
 /// HUD between changes. ~3 s at the cart's ~17 fps tick rate.
@@ -60,12 +67,13 @@ const WIND_STRENGTH_MIN: f32   = 0.10;
 const WIND_STRENGTH_MAX: f32   = 0.95;
 
 /// Per-site, per-tick probability that a burn site directly ignites
-/// its downwind cardinal neighbour at max strength. Scales linearly
-/// with current wind strength so a calm wind is effectively a no-op.
-/// Layers on top of the §10.3 CA's omnidirectional heat spread and
-/// the ember-flight loop. Halved from the original 0.04 so the
-/// three vectors don't compound into a runaway.
-const WIND_SPREAD_RATE:  f32   = 0.02;
+/// its downwind cardinal neighbour at max strength. With BURN_SITES
+/// capped at 1024 and SE wind at strength 0.5 this previously gave
+/// ~10 new burns/tick → ~600 cells/sec spread → fire reached the
+/// 141-cell-away town in ~14 s no matter how slow the embers were.
+/// 0.005 pulls that down to ~150 cells/sec → ~60 s town-reach, which
+/// is what a passive player needs to have any time to think.
+const WIND_SPREAD_RATE:  f32   = 0.005;
 
 // World bound checks share this — borrows the host's 512³ scene size.
 const WORLD: u32 = 512;
@@ -132,6 +140,15 @@ impl FireState {
     pub(crate) fn apply_scenario(&mut self, s: &crate::scenario::Scenario) {
         self.wind_angle    = s.wind_angle_rad;
         self.wind_strength = s.wind_strength.clamp(WIND_STRENGTH_MIN, WIND_STRENGTH_MAX);
+        self.refresh_wind_vec();
+    }
+
+    /// Update wind to a new angle + strength. Called by the season
+    /// state machine when a new day starts and the weather rolls.
+    pub(crate) fn set_wind(&mut self, angle_rad: f32, strength: f32) {
+        self.wind_angle    = angle_rad;
+        self.wind_strength = strength.clamp(WIND_STRENGTH_MIN, WIND_STRENGTH_MAX);
+        self.wind_tick     = 0;
         self.refresh_wind_vec();
     }
 
