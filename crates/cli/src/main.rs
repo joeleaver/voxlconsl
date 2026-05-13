@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+mod balance;
+
 #[derive(Parser, Debug)]
 #[command(name = "voxlconsl", about = "voxlconsl fantasy console toolchain")]
 struct Cli {
@@ -46,6 +48,35 @@ enum Command {
         #[arg(long)]
         colors: Option<PathBuf>,
     },
+    /// Headless balance sweep — load a .voxl, run it with no player
+    /// input across a list of (tier, seed) pairs, dump the cart's
+    /// CSV-formatted log lines combined to stdout or a file.
+    ///
+    /// Example: `voxlconsl balance --cart web/carts/ic.voxl \
+    /// --tiers 1..5 --seeds 0..20 --out runs.csv`.
+    Balance {
+        /// Path to the cart .voxl to sweep.
+        #[arg(long)]
+        cart: PathBuf,
+        /// Comma list or `start..end` range of tier values to sweep.
+        /// Defaults to the cart's compile-time tier.
+        #[arg(long, default_value = "2")]
+        tiers: String,
+        /// Comma list or `start..end` range of seeds. Accepts decimal
+        /// or `0x`-prefixed hex. Defaults to a single small seed.
+        #[arg(long, default_value = "0xA1F05E57")]
+        seeds: String,
+        /// Optional output CSV path. Without it the combined CSV
+        /// prints to stdout (header once, rows from each run).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Cap on per-run frames before forcing termination. Default
+        /// 12_000 (≈ a full 3:00 mission at 16 ms / frame). Lower for
+        /// faster iteration when only the early phase matters — wasmi
+        /// is interpreted natively and a full mission is ~5-6 min wall.
+        #[arg(long, default_value_t = balance::DEFAULT_MAX_FRAMES)]
+        max_frames: u32,
+    },
 }
 
 fn main() {
@@ -77,7 +108,30 @@ fn main() {
                 colors,
             );
         }
+        Command::Balance { cart, tiers, seeds, out, max_frames } => {
+            if let Err(e) = run_balance(&cart, &tiers, &seeds, out.as_deref(), max_frames) {
+                eprintln!("voxlconsl balance: {e}");
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn run_balance(
+    cart: &Path,
+    tiers_spec: &str,
+    seeds_spec: &str,
+    out: Option<&Path>,
+    max_frames: u32,
+) -> Result<(), String> {
+    let tiers = balance::parse_u8_list(tiers_spec)
+        .map_err(|e| format!("--tiers {tiers_spec}: {e}"))?;
+    let seeds = balance::parse_u32_list(seeds_spec)
+        .map_err(|e| format!("--seeds {seeds_spec}: {e}"))?;
+    if tiers.is_empty() || seeds.is_empty() {
+        return Err("at least one tier and one seed required".into());
+    }
+    balance::run_sweep(cart, &tiers, &seeds, out, max_frames)
 }
 
 fn run_bundle(path: &Path, output: Option<&Path>) -> Result<(), String> {

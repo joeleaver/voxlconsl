@@ -97,6 +97,15 @@ mod host {
         #[link_name = "host_log"]
         pub fn log(ptr: *const u8, len: u32);
 
+        /// Read the harness-supplied scenario override (seed + tier).
+        /// Returns 1 if an override was set and writes the values into
+        /// the out pointers; 0 if the cart is being run normally. The
+        /// override is consumed on read so a second call returns 0.
+        pub fn balance_get_scenario_override(
+            out_seed: *mut u32,
+            out_tier: *mut u32,
+        ) -> u32;
+
         // Physics queries (§10.1)
         pub fn raycast(
             ox: f32, oy: f32, oz: f32,
@@ -332,6 +341,21 @@ pub fn sky_set_gradient(top: u8, horizon: u8) {
 /// hardware ports without a serial console).
 pub fn log(msg: &str) {
     unsafe { host::log(msg.as_ptr(), msg.len() as u32) }
+}
+
+/// Returns `Some((seed, tier))` when an external harness has supplied
+/// a scenario override (used by `voxlconsl balance` and similar tools).
+/// Returns `None` for normal cart boots. Carts should call this once
+/// in `init()` and use the override in place of their compile-time
+/// `MISSION_SEED` / `MISSION_TIER` constants — and, by convention,
+/// also flip on any balance-instrumentation logging.
+pub fn balance_get_scenario_override() -> Option<(u32, u8)> {
+    let mut seed: u32 = 0;
+    let mut tier: u32 = 0;
+    let n = unsafe {
+        host::balance_get_scenario_override(&mut seed as *mut u32, &mut tier as *mut u32)
+    };
+    if n == 1 { Some((seed, tier as u8)) } else { None }
 }
 
 // ============================================================================

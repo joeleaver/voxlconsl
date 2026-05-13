@@ -111,15 +111,17 @@ const MISSION_SEED: u32 = 0xA1F0_5E57;
 /// for the full table.
 const MISSION_TIER: u8 = 2;
 
-/// When `true`, the cart logs CSV-formatted balance rows via `log()`
-/// every `balance::BALANCE_LOG_INTERVAL_MS` of mission time and
-/// suppresses all player input (Primary/Confirm/Cancel/wheel-nav) so
-/// the run captures a pure no-op-player baseline. Default `false` for
-/// normal play.
-///
-/// To sweep tiers/seeds: flip on, edit `MISSION_SEED` + `MISSION_TIER`,
-/// rebuild, capture the browser console log, paste into a CSV.
-const BALANCE_MODE: bool = false;
+/// Runtime balance-mode flag. Set true by `init()` when an external
+/// harness (e.g. `voxlconsl balance`) supplies a scenario override
+/// via `balance_get_scenario_override()`. While true, the cart logs
+/// CSV-formatted rows via `log()` every
+/// `balance::BALANCE_LOG_INTERVAL_MS` of mission time and suppresses
+/// all player input so the run captures a no-op-player baseline.
+/// Normal cart boots (no override) leave this false; nothing changes.
+static mut BALANCE_MODE_FLAG: bool = false;
+
+#[inline]
+fn balance_mode() -> bool { unsafe { BALANCE_MODE_FLAG } }
 
 // ── Game state ───────────────────────────────────────────────────
 
@@ -215,8 +217,18 @@ pub extern "C" fn init() {
     light_set_sun(Vec3::new(-0.5, -0.6, 0.6), 0, 0);
 
     // Pick a scenario seed + tier and lock them in before any
-    // world / fire / roster initialisation reads from them.
-    scenario::init(MISSION_SEED, MISSION_TIER);
+    // world / fire / roster initialisation reads from them. If an
+    // external harness supplied an override (CLI `voxlconsl balance`),
+    // honour it AND flip on the balance-mode flag so the cart logs
+    // CSV + suppresses player input for the run.
+    let (mission_seed, mission_tier) = match balance_get_scenario_override() {
+        Some((seed, tier)) => {
+            unsafe { BALANCE_MODE_FLAG = true; }
+            (seed, tier)
+        }
+        None => (MISSION_SEED, MISSION_TIER),
+    };
+    scenario::init(mission_seed, mission_tier);
 
     // Reserve the left 36 pixels of the framebuffer for the
     // sidebar: the world ray-march skips that strip entirely.
@@ -254,7 +266,7 @@ pub extern "C" fn init() {
         fire.add_burn_site(fire_seed);
     }
 
-    if BALANCE_MODE {
+    if balance_mode() {
         unsafe { (&*(&raw const BAL)).emit_header(); }
     }
 }
@@ -446,7 +458,7 @@ pub extern "C" fn update(dt_ms: u32) {
     // BALANCE_MODE the cart runs as a passive observer so we force
     // every button to false regardless of physical input — the CSV
     // log captures the no-op-player baseline.
-    let (primary_pressed, confirm_pressed, cancel_pressed) = if BALANCE_MODE {
+    let (primary_pressed, confirm_pressed, cancel_pressed) = if balance_mode() {
         (false, false, false)
     } else {
         (
@@ -491,7 +503,7 @@ pub extern "C" fn update(dt_ms: u32) {
         // long renderer stall.
         unsafe { TIME_LEFT_MS = TIME_LEFT_MS.saturating_sub(dt_ms); }
 
-        if BALANCE_MODE {
+        if balance_mode() {
             unsafe {
                 let alive = surviving_mask();
                 let m = build_balance_metrics(alive);
@@ -631,7 +643,7 @@ fn check_end_conditions() {
     };
     if let Some(p) = new_phase {
         unsafe { PHASE = p; }
-        if BALANCE_MODE {
+        if balance_mode() {
             let outcome = match p { Phase::Won => "WON", _ => "LOST" };
             unsafe {
                 let m = build_balance_metrics(mask);

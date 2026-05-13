@@ -12,4 +12,4 @@ voxlconsl-types = { workspace = true, features = ["bytemuck"] }
 voxlconsl-svo = { workspace = true }
 voxlconsl-audio = { workspace = true }
 bytemuck = { workspace = true }
-wasmi = { version = "0.50", default-features = false }
+wasmi = { version = "0.50", default-features = false, features = ["std"] }

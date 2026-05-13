@@ -1355,19 +1355,31 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
         if memory.read(&caller, ptr as usize, &mut buf).is_err() {
             return;
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let s = String::from_utf8_lossy(&buf);
-            web_sys_log(&format!("[cart] {s}"));
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let s = String::from_utf8_lossy(&buf);
-            eprintln!("[cart] {s}");
-        }
+        let s = String::from_utf8_lossy(&buf);
+        cart_log_out(&format!("[cart] {s}"));
     };
     linker.func_wrap("env", "host_log", log_handler)?;
     linker.func_wrap("env", "log",      log_handler)?;
+
+    // Balance mode: the harness (CLI `voxlconsl balance` etc.) sets a
+    // thread-local override before loading the cart. The cart's init()
+    // reads it once via this import and gates its BALANCE_MODE logic
+    // on whether the override was present. The read CONSUMES the
+    // override so a second cart load in the same thread starts fresh.
+    linker.func_wrap(
+        "env", "balance_get_scenario_override",
+        |mut caller: Caller<WorldState>, out_seed: u32, out_tier: u32| -> u32 {
+            let ov = BALANCE_OVERRIDE.with(|c| c.take());
+            let Some((seed, tier)) = ov else { return 0; };
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 0,
+            };
+            let _ = memory.write(&mut caller, out_seed as usize, &seed.to_le_bytes());
+            let _ = memory.write(&mut caller, out_tier as usize, &(tier as u32).to_le_bytes());
+            1
+        },
+    )?;
 
     Ok(())
 }
@@ -1408,26 +1420,39 @@ fn orientation_from_u32(v: u32) -> Orientation {
 
 /// Host-provided log callback. `voxlconsl-host` doesn't depend on
 /// `web-sys` directly (so the crate stays buildable for native CLI /
-/// tests / MCU targets); the embedding host crate (host-browser etc.)
-/// installs this at startup via `set_log_callback`. When unset, cart
-/// log output is silently dropped.
+/// tests / MCU targets); embedding hosts install this at startup via
+/// `set_log_callback`.
 ///
-/// Single-threaded wasm32 runtime — plain `static mut` is fine. Native
-/// hosts that use this for testing should call `set_log_callback`
-/// before loading any cart.
+/// Single-threaded wasm32 runtime — plain `static mut` is fine. The
+/// CLI's balance harness installs its own callback per process to
+/// capture cart `log()` output into a buffer for CSV emission. When
+/// no callback is installed, native builds fall back to `eprintln!`
+/// and wasm builds silently drop the message.
 static mut LOG_CALLBACK: Option<fn(&str)> = None;
 
 pub fn set_log_callback(cb: fn(&str)) {
     unsafe { LOG_CALLBACK = Some(cb); }
 }
 
-#[cfg(target_arch = "wasm32")]
-fn web_sys_log(msg: &str) {
+fn cart_log_out(msg: &str) {
     unsafe {
         if let Some(cb) = LOG_CALLBACK {
             cb(msg);
+            return;
         }
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{msg}");
+}
+
+thread_local! {
+    /// Set by an embedding harness BEFORE calling `Cart::load` to make
+    /// the cart's init() pick up the given seed + tier instead of its
+    /// compile-time `MISSION_SEED` / `MISSION_TIER` consts. Drained by
+    /// the cart's first call to `env.balance_get_scenario_override` so
+    /// repeated cart loads in the same thread start clean.
+    pub static BALANCE_OVERRIDE: std::cell::Cell<Option<(u32, u8)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
