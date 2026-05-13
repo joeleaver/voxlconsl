@@ -71,6 +71,8 @@ struct StatusKey {
     fire:     u32,
     wind_dir: [u8; 2],   // padded with space when 1-letter
     wind_str: u32,
+    day_num:  u8,
+    day_total: u8,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -167,18 +169,24 @@ impl Hud {
             fire:     ctx.fire_sites,
             wind_dir,
             wind_str: ctx.wind_strength,
+            day_num:  ctx.day_num,
+            day_total: ctx.day_total,
         };
         if self.status_cache == Some(key) { return; }
         self.status_cache = Some(key);
         let actor = match self.actors[Section::Status as usize] { Some(a) => a, None => return };
         actor_clear(actor);
 
+        // STATUS panel — 4 lines × 4-px-tall font in a 32×32 panel.
+        // Day counter takes the slot the per-mission FR-count used to
+        // hold; fire-site count is dropped because the burning forest
+        // is plainly visible on the world view.
         let mut buf = [b' '; SIDEBAR_LINE_MAX];
-        let s = format_time(&mut buf, ctx.time_left_ms);
+        let s = format_day(&mut buf, ctx.day_num, ctx.day_total);
         paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, s);
-        let s = format_town(&mut buf, key.alive);
+        let s = format_time(&mut buf, ctx.time_left_ms);
         paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, s);
-        let s = format_fire(&mut buf, key.fire);
+        let s = format_town(&mut buf, key.alive);
         paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
         let s = format_wind(&mut buf, ctx.wind_dir, ctx.wind_strength);
         paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, s);
@@ -411,6 +419,15 @@ fn format_fire<'a>(buf: &'a mut [u8], sites: u32) -> &'a str {
     buf[len] = b'0' + o as u8;
     len += 1;
     core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// "DAY 3/7" — current day number / season length.
+fn format_day<'a>(buf: &'a mut [u8], num: u8, total: u8) -> &'a str {
+    buf[..4].copy_from_slice(b"DAY ");
+    buf[4] = b'0' + (num.min(9)) as u8;
+    buf[5] = b'/';
+    buf[6] = b'0' + (total.min(9)) as u8;
+    core::str::from_utf8(&buf[..7]).unwrap_or("")
 }
 
 /// "H 1/3" — pool busy/total for a unit type.

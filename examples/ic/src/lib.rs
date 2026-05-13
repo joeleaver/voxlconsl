@@ -536,13 +536,9 @@ pub extern "C" fn update(dt_ms: u32) {
                 .and_then(|s| s.tick(dt_ms, incident_active));
 
             if let Some((sx, sz)) = strike {
-                log("ic: ⚡lightning");
                 if let Some(p) = terrain::strike_at(sx, sz) {
                     let fire = &mut *(&raw mut FIRE_STATE);
                     fire.add_burn_site(p);
-                    log("ic: ⚡strike ignited");
-                } else {
-                    log("ic: ⚡strike dud");
                 }
             }
 
@@ -804,11 +800,16 @@ unsafe fn build_balance_metrics(alive_mask: u32) -> balance::BalanceMetrics {
     // Total elapsed = (completed days × DAY_DURATION_MS) + day_time_ms.
     // Lets the CSV row still expose a monotonic mission clock across
     // all days of the season.
-    let elapsed_ms = unsafe {
-        (&*(&raw const SEASON))
-            .as_ref()
-            .map(|s| (s.day as u32) * season::DAY_DURATION_MS + s.day_time_ms)
-            .unwrap_or(0)
+    let (elapsed_ms, day_num, strikes_today, strikes_total) = unsafe {
+        match (&*(&raw const SEASON)).as_ref() {
+            Some(s) => (
+                (s.day as u32) * season::DAY_DURATION_MS + s.day_time_ms,
+                s.day + 1,           // 1..7 for the CSV (human-readable)
+                s.strikes_today,
+                s.strikes_total,
+            ),
+            None => (0, 1, 0, 0),
+        }
     };
 
     balance::BalanceMetrics {
@@ -829,6 +830,9 @@ unsafe fn build_balance_metrics(alive_mask: u32) -> balance::BalanceMetrics {
         eng_busy:    e_b,
         eng_total:   e_t,
         queue_pending: q,
+        day:           day_num,
+        strikes_today,
+        strikes_total,
     }
 }
 

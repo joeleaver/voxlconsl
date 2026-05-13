@@ -38,6 +38,12 @@ pub(crate) struct BalanceMetrics {
     pub eng_busy:    u32,
     pub eng_total:   u32,
     pub queue_pending: u32,
+    /// 1..=DAYS_PER_SEASON.
+    pub day:         u8,
+    /// Strikes that have fired in the current day so far.
+    pub strikes_today:  u8,
+    /// Strikes that have fired across the season.
+    pub strikes_total:  u32,
 }
 
 pub(crate) struct BalanceLog {
@@ -53,6 +59,9 @@ pub(crate) struct BalanceLog {
     last_alive: u32,
     /// Latched once the mission ends.
     end_logged: bool,
+    /// Last day we emitted a BAL_DAY marker for. Lets us spot day
+    /// transitions without re-emitting at every tick during a day.
+    last_day_marker: u8,
 }
 
 impl BalanceLog {
@@ -62,18 +71,26 @@ impl BalanceLog {
             first_loss_ms: u32::MAX,
             last_alive: 6,
             end_logged: false,
+            last_day_marker: 0,
         }
     }
 
     /// Emit the column header. Call once at boot when BALANCE_MODE is on.
     pub(crate) fn emit_header(&self) {
-        log("BAL,t_s,tier,seed,fire,alive,mask,wind,str,h_b,h_t,c_b,c_t,hs_b,hs_t,e_b,e_t,q");
+        log("BAL,t_s,tier,seed,fire,alive,mask,wind,str,h_b,h_t,c_b,c_t,hs_b,hs_t,e_b,e_t,q,day,sk_d,sk_t");
     }
 
     /// Call every frame while the mission is Playing. Emits a CSV row
     /// when the interval elapses, plus a tagged FIRSTLOSS line on the
     /// frame a cabin first burns down.
     pub(crate) fn tick(&mut self, m: &BalanceMetrics) {
+        // Edge: day-rollover. Emits a BAL_DAY marker the first time
+        // we see each day so a sweep CSV can be split on day boundaries.
+        if m.day != self.last_day_marker {
+            self.emit_row("BAL_DAY", m);
+            self.last_day_marker = m.day;
+        }
+
         // First call after init: emit a baseline row so the CSV starts
         // at t=0 even if the run is short. After that, emit on the
         // configured interval.
@@ -170,6 +187,13 @@ impl BalanceLog {
         len = push_u32(&mut buf, len, m.eng_total);
         len = push_str(&mut buf, len, ",");
         len = push_u32(&mut buf, len, m.queue_pending);
+        // Season-aware tail: day index + strikes-today + strikes-total.
+        len = push_str(&mut buf, len, ",");
+        len = push_u32(&mut buf, len, m.day as u32);
+        len = push_str(&mut buf, len, ",");
+        len = push_u32(&mut buf, len, m.strikes_today as u32);
+        len = push_str(&mut buf, len, ",");
+        len = push_u32(&mut buf, len, m.strikes_total);
 
         emit_buf(&buf, len);
     }
