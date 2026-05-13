@@ -6,18 +6,26 @@
 //! LINE starts a fire-line draft whose first point IS the anchor
 //! cell.
 //!
-//! The wheel is painted across **two stacked 32×32 panels** (the
-//! engine caps prefab dimensions at CHUNK_SIZE=32, and a single panel
-//! can't fit ACTION + 5 options at FONT_TINY line spacing). Top
-//! panel: ACTION header + WATER / TANKER / RETARD. Bottom panel:
-//! LINE / HOTSHOT. The selection cursor moves across both panels as
-//! one continuous list — bottom-panel rows just start at index
-//! `TOP_OPTIONS`.
+//! ## Layout
 //!
-//! While the wheel is open, the cursor still moves with the
-//! mouse — but the wheel's *anchor* doesn't move. The player can
-//! pan the camera, change their mind, or hit Cancel to bail without
-//! consequence.
+//! The wheel is rendered across **two stacked 32×32 panels** because
+//! the engine caps prefab dimensions at CHUNK_SIZE=32 and the
+//! current option list overruns a single panel. The two panels are
+//! positioned to read as one continuous menu:
+//!
+//! - **Top panel**: ACTION header + the first `TOP_OPTION_CAPACITY`
+//!   options (5 rows total at LINE_SPACING=6).
+//! - **Bottom panel**: every option past that, painted from its row 0.
+//!   The panel's screen Y is offset so its row 0 lines up exactly
+//!   where row 5 of the top panel would render if the panel were
+//!   taller — i.e., no gap between the last top-panel option and the
+//!   first bottom-panel option.
+//!
+//! If all options fit on the top panel, the bottom panel actor is
+//! hidden so it doesn't take up screen space.
+//!
+//! The selection cursor walks the OPTIONS array as a single virtual
+//! list; nav-up / nav-down move across panel boundaries naturally.
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::text::FONT_TINY;
@@ -43,10 +51,11 @@ const OPTIONS: [(WheelChoice, &str); 6] = [
     (WheelChoice::Engine,    "ENGINE"),
 ];
 
-/// Number of OPTIONS painted onto the top panel (after ACTION header).
-/// Indices `[0..TOP_OPTIONS)` render on top; `[TOP_OPTIONS..)` on the
-/// bottom panel.
-const TOP_OPTIONS: usize = 3;
+/// Maximum options the top panel can paint *after* the ACTION header.
+/// Top panel = 5 rows max at LINE_SPACING=6 (rows 0..4); row 0 is the
+/// header, rows 1..4 are option slots. Bumping LINE_SPACING below 6
+/// would overlap glyphs (FONT_TINY cell_h=6) so this cap is tight.
+const TOP_OPTION_CAPACITY: usize = 4;
 
 const PANEL_W: u32 = 32;
 const PANEL_H: u32 = 32;
@@ -54,12 +63,20 @@ const PANEL_VOL_BYTES: usize = (PANEL_W * PANEL_H) as usize;
 const PANEL_PREFAB_TOP:    PrefabId = PrefabId(70);
 const PANEL_PREFAB_BOTTOM: PrefabId = PrefabId(74);
 
-/// Screen-space position of the wheel. Two panels stacked vertically:
-/// the bottom one sits 32 + GAP below the top.
+/// Screen-space position of the wheel.
+/// The bottom panel's Y is set so its row 0 lands exactly where a
+/// hypothetical row 5 of the top panel would (one `LINE_SPACING`
+/// step below row 4), giving the two panels a single-menu read.
+/// Concretely: top panel row 4 glyph top sits at local Y=6 → screen
+/// Y = 28 + (31 - 6) = 53. Next-row screen Y = 53 + 6 = 59. Bottom
+/// panel row 0 glyph top is at local Y=30 → screen Y =
+/// `WHEEL_SCREEN_Y_BOTTOM + 1` so `WHEEL_SCREEN_Y_BOTTOM = 58`. The
+/// resulting 2-pixel overlap with the top panel covers only the
+/// top panel's *unpainted* bottom rows (local Y=0..1 outside any
+/// glyph extents) so the composite stays clean.
 const WHEEL_SCREEN_X:        f32 = 110.0;
 const WHEEL_SCREEN_Y_TOP:    f32 = 28.0;
-const WHEEL_PANEL_GAP:       f32 = 4.0;
-const WHEEL_SCREEN_Y_BOTTOM: f32 = WHEEL_SCREEN_Y_TOP + PANEL_H as f32 + WHEEL_PANEL_GAP;
+const WHEEL_SCREEN_Y_BOTTOM: f32 = 58.0;
 /// Above the sidebar (PANEL_LAYER = 100) so the wheel always paints
 /// on top.
 const WHEEL_LAYER:    f32 = 200.0;
@@ -69,6 +86,17 @@ const LINE_SPACING: u32 = 6;
 
 static mut PANEL_DENSE_TOP:    [u8; PANEL_VOL_BYTES] = [0; PANEL_VOL_BYTES];
 static mut PANEL_DENSE_BOTTOM: [u8; PANEL_VOL_BYTES] = [0; PANEL_VOL_BYTES];
+
+/// How many options end up on top vs bottom for the current OPTIONS
+/// array. Always splits top-first up to TOP_OPTION_CAPACITY.
+const fn split_counts() -> (usize, usize) {
+    let total = OPTIONS.len();
+    if total <= TOP_OPTION_CAPACITY {
+        (total, 0)
+    } else {
+        (TOP_OPTION_CAPACITY, total - TOP_OPTION_CAPACITY)
+    }
+}
 
 pub(crate) struct ActionWheel {
     actor_top:    Option<ActorId>,
@@ -80,9 +108,9 @@ pub(crate) struct ActionWheel {
     /// applies to this cell (drop target, or first fire-line
     /// point) regardless of where the cursor has roamed since.
     pub anchor:   UVec3,
-    /// Per-panel cache key. None when the highlight is on the
-    /// *other* panel (so the row prefix on this panel is always ' ').
-    /// Concretely we cache the highlighted row index inside the panel.
+    /// Per-panel cache key: highlighted option index relative to
+    /// that panel (or -1 if the cursor isn't on this panel). Lets
+    /// each panel skip repaints when nothing about it changed.
     cache_top:    Option<i8>,
     cache_bottom: Option<i8>,
 }
@@ -120,6 +148,10 @@ impl ActionWheel {
         actor_set_visible(top, false);
         self.actor_top = Some(top);
 
+        // Bottom panel only matters if OPTIONS.len() overruns the
+        // top panel; for the current 6-option list it always does,
+        // but we conditionally show / hide it in open_at so future
+        // shorter lists collapse to a single-panel wheel cleanly.
         let bot = actor_spawn_from(PANEL_PREFAB_BOTTOM, Orientation::Up)
             .expect("ic action-wheel bottom spawn");
         actor_set_render_mode(bot, ActorRenderMode::Screen);
@@ -134,8 +166,11 @@ impl ActionWheel {
         self.open = true;
         self.cache_top = None;
         self.cache_bottom = None;
-        if let Some(id) = self.actor_top    { actor_set_visible(id, true); }
-        if let Some(id) = self.actor_bottom { actor_set_visible(id, true); }
+        let (_top_count, bottom_count) = split_counts();
+        if let Some(id) = self.actor_top { actor_set_visible(id, true); }
+        if let Some(id) = self.actor_bottom {
+            actor_set_visible(id, bottom_count > 0);
+        }
     }
 
     pub(crate) fn close(&mut self) {
@@ -158,15 +193,17 @@ impl ActionWheel {
     }
 
     /// Repaint each panel only when its highlight changed. The two
-    /// panels share a single index space; an entry's local row inside
-    /// its panel is `selected - TOP_OPTIONS` for the bottom panel and
-    /// `selected + 1` (ACTION header sits on row 0) for the top.
+    /// panels share a single virtual option list: indices 0..top_count
+    /// render on top (rows 1..top_count+1 below the ACTION header),
+    /// indices top_count.. render on bottom (rows 0..).
     pub(crate) fn render(&mut self, _confirm_label: &str) {
         if !self.open { return; }
+        let (top_count, bottom_count) = split_counts();
 
-        // Top panel highlight: which option index, or -1 if the
-        // cursor is on the bottom panel.
-        let top_hl: i8 = if (self.selected as usize) < TOP_OPTIONS {
+        // Top panel — its cache key is "which option index inside
+        // the top panel is highlighted", or -1 when the cursor is on
+        // the bottom panel.
+        let top_hl: i8 = if (self.selected as usize) < top_count {
             self.selected as i8
         } else {
             -1
@@ -176,7 +213,7 @@ impl ActionWheel {
             if let Some(actor) = self.actor_top {
                 actor_clear(actor);
                 paint_line(actor, 0, "ACTION");
-                for i in 0..TOP_OPTIONS {
+                for i in 0..top_count {
                     let (_, label) = OPTIONS[i];
                     let prefix = if top_hl == i as i8 { '>' } else { ' ' };
                     paint_prefixed(actor, (i + 1) as u32, prefix, label);
@@ -184,10 +221,18 @@ impl ActionWheel {
             }
         }
 
-        // Bottom panel highlight: index relative to TOP_OPTIONS, or
-        // -1 if cursor is on the top panel.
-        let bot_hl: i8 = if (self.selected as usize) >= TOP_OPTIONS {
-            (self.selected as usize - TOP_OPTIONS) as i8
+        // Bottom panel — its cache key is the highlighted option
+        // index *relative to the bottom panel* (so the global
+        // selection mapping is `top_count + bot_hl`), or -1 when the
+        // cursor is on the top panel.
+        if bottom_count == 0 {
+            // Nothing to render; ensure the cache reflects "no highlight"
+            // so a future open with overflow forces a repaint.
+            self.cache_bottom = Some(-1);
+            return;
+        }
+        let bot_hl: i8 = if (self.selected as usize) >= top_count {
+            (self.selected as usize - top_count) as i8
         } else {
             -1
         };
@@ -195,9 +240,8 @@ impl ActionWheel {
             self.cache_bottom = Some(bot_hl);
             if let Some(actor) = self.actor_bottom {
                 actor_clear(actor);
-                let bot_count = OPTIONS.len() - TOP_OPTIONS;
-                for j in 0..bot_count {
-                    let (_, label) = OPTIONS[TOP_OPTIONS + j];
+                for j in 0..bottom_count {
+                    let (_, label) = OPTIONS[top_count + j];
                     let prefix = if bot_hl == j as i8 { '>' } else { ' ' };
                     paint_prefixed(actor, j as u32, prefix, label);
                 }
