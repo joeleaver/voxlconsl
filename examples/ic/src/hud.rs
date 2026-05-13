@@ -4,7 +4,9 @@
 //! - **STATUS** — mission timer, town survival, fire site count.
 //! - **UNIT** — selected unit name, state, heli bucket level.
 //! - **ORDERS** — current orders the heli + crew are working on.
-//! - **HELP** — static reminder of WSAD / wheel / J / K.
+//! - **HELP** — controls cheat-sheet built from the host-provided
+//!   binding labels (§6.5), so the displayed keys follow the active
+//!   binding instead of being hard-coded.
 //!
 //! Each section is its own actor with its own cache key, so the
 //! STATUS section repainting once per displayed second doesn't
@@ -89,6 +91,18 @@ struct OrdersKey {
     crew_total: u32,
 }
 
+/// Snapshot of the four labels the HELP section paints. Repaint only
+/// fires when one of these changes (device switch / rebind).
+const LABEL_CAP: usize = 16;
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct HelpKey {
+    pan:     [u8; LABEL_CAP],
+    primary: [u8; LABEL_CAP],
+    confirm: [u8; LABEL_CAP],
+    cancel:  [u8; LABEL_CAP],
+}
+
 // ── Hud state ─────────────────────────────────────────────────────
 
 pub(crate) struct Hud {
@@ -96,7 +110,7 @@ pub(crate) struct Hud {
     status_cache: Option<StatusKey>,
     unit_cache:   Option<UnitKey>,
     orders_cache: Option<OrdersKey>,
-    help_painted: bool,
+    help_cache:   Option<HelpKey>,
 }
 
 impl Hud {
@@ -106,7 +120,7 @@ impl Hud {
             status_cache: None,
             unit_cache:   None,
             orders_cache: None,
-            help_painted: false,
+            help_cache:   None,
         }
     }
 
@@ -136,10 +150,7 @@ impl Hud {
         self.paint_status(&ctx);
         self.paint_unit(&ctx);
         self.paint_orders(&ctx);
-        if !self.help_painted {
-            self.paint_help();
-            self.help_painted = true;
-        }
+        self.paint_help(&ctx);
     }
 
     fn paint_status(&mut self, ctx: &HudCtx<'_>) {
@@ -224,14 +235,57 @@ impl Hud {
         paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
     }
 
-    fn paint_help(&mut self) {
+    fn paint_help(&mut self, ctx: &HudCtx<'_>) {
+        let key = HelpKey {
+            pan:     label_to_key(ctx.pan_label),
+            primary: label_to_key(ctx.primary_label),
+            confirm: label_to_key(ctx.confirm_label),
+            cancel:  label_to_key(ctx.cancel_label),
+        };
+        if self.help_cache == Some(key) { return; }
+        self.help_cache = Some(key);
         let actor = match self.actors[Section::Help as usize] { Some(a) => a, None => return };
         actor_clear(actor);
-        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "J ACT");
-        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, "K NEXT");
-        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, "ESC X");
-        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, "WSAD");
+
+        let mut buf = [b' '; SIDEBAR_LINE_MAX];
+        let s = format_help_line(&mut buf, ctx.pan_label,     "MOV");
+        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, s);
+        let s = format_help_line(&mut buf, ctx.primary_label, "ACT");
+        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, s);
+        let s = format_help_line(&mut buf, ctx.confirm_label, "OK");
+        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
+        let s = format_help_line(&mut buf, ctx.cancel_label,  "X");
+        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, s);
     }
+}
+
+/// Right-pad-truncate a label into a fixed-size key for the HELP
+/// cache. Trailing zeroes act as terminators so a "J" key never
+/// compares equal to a "JK" one.
+fn label_to_key(label: &str) -> [u8; LABEL_CAP] {
+    let mut out = [0u8; LABEL_CAP];
+    let bytes = label.as_bytes();
+    let n = bytes.len().min(LABEL_CAP);
+    out[..n].copy_from_slice(&bytes[..n]);
+    out
+}
+
+/// Format `"<label> <verb>"` into `buf`, truncating at the panel
+/// width so a long label doesn't bleed past the sidebar.
+fn format_help_line<'a>(buf: &'a mut [u8; SIDEBAR_LINE_MAX], label: &str, verb: &str) -> &'a str {
+    let mut i = 0;
+    for &b in label.as_bytes() {
+        if i >= buf.len() { break; }
+        buf[i] = b; i += 1;
+    }
+    if i < buf.len() && !verb.is_empty() {
+        buf[i] = b' '; i += 1;
+    }
+    for &b in verb.as_bytes() {
+        if i >= buf.len() { break; }
+        buf[i] = b; i += 1;
+    }
+    core::str::from_utf8(&buf[..i]).unwrap_or("")
 }
 
 /// Per-frame inputs the cart hands to `Hud::paint`. Bundled into a
@@ -250,6 +304,10 @@ pub(crate) struct HudCtx<'a> {
     pub line_mode_active: bool,
     pub line_mode_count:  u32,
     pub queue_total:   u32,
+    pub pan_label:     &'a str,
+    pub primary_label: &'a str,
+    pub confirm_label: &'a str,
+    pub cancel_label:  &'a str,
 }
 
 

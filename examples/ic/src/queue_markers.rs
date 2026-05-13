@@ -1,13 +1,18 @@
-//! On-map badges for queued orders. Each pending order in the
-//! CommandQueue gets a small Billboard actor positioned at its
-//! target cell, showing its queue position (`1`..`9`) painted in
-//! FONT_TINY. Players can tell at a glance where their committed
-//! orders are heading and how deep the queue is on each side of
-//! the map.
+//! On-map badges for queued AND in-flight orders. Each order gets a
+//! small Billboard actor positioned at its target cell, showing its
+//! position (`1`..`9`) painted in FONT_TINY. Players can tell at a
+//! glance where their committed orders are heading and how deep the
+//! pipeline is on each side of the map.
 //!
-//! - Cyan badges = queued water drops (positioned at the drop cell)
-//! - Yellow badges = queued fire lines (positioned at the line's
-//!   first waypoint)
+//! - Cyan badges = water drops (positioned at the drop cell)
+//! - Yellow badges = fire lines (positioned at the line's first
+//!   waypoint)
+//!
+//! Badges include **active** orders (a unit is already executing
+//! them) followed by **queued** orders (waiting for an idle unit).
+//! An active order's badge stays visible until the unit completes,
+//! so a single dispatch on an idle pool still shows a badge until
+//! the drop actually lands.
 //!
 //! Beyond position 9, badges aren't drawn — the player can still
 //! read the total in the HUD's POOL section.
@@ -15,42 +20,50 @@
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::text::FONT_TINY;
 
-use crate::units::CommandQueue;
-use crate::{M_BUCKET_WATER, M_SELECT_MARKER};
+use crate::terrain::terrain_height;
+use crate::units::{Roster, TankerKind};
+use crate::{M_BUCKET_WATER, M_SELECT_MARKER, M_TANKER_RETARDANT_STRIPE, M_TANKER_WATER_STRIPE};
 
 pub(crate) const MARKERS_PER_TYPE: usize = 9;
 const MARKER_W: u8 = 6;
 const MARKER_H: u8 = 8;
 const MARKER_VOL_BYTES: usize = (MARKER_W as usize) * (MARKER_H as usize);
 
-const WATER_PREFAB: PrefabId = PrefabId(68);
-const LINE_PREFAB:  PrefabId = PrefabId(69);
+const WATER_PREFAB:        PrefabId = PrefabId(68);
+const LINE_PREFAB:         PrefabId = PrefabId(69);
+const TANKER_REQ_PREFAB:   PrefabId = PrefabId(71);
 
-static mut WATER_DENSE: [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
-static mut LINE_DENSE:  [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
+static mut WATER_DENSE:      [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
+static mut LINE_DENSE:       [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
+static mut TANKER_REQ_DENSE: [u8; MARKER_VOL_BYTES] = [0; MARKER_VOL_BYTES];
 
 pub(crate) struct QueueMarkers {
-    water_actors: [Option<ActorId>; MARKERS_PER_TYPE],
-    line_actors:  [Option<ActorId>; MARKERS_PER_TYPE],
-    /// Per-slot cache: (digit_painted, target_x, target_z). When the
-    /// queue mutates we walk and update only the slots whose key
-    /// changed; idle frames are free.
-    water_cache: [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
-    line_cache:  [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
+    water_actors:        [Option<ActorId>; MARKERS_PER_TYPE],
+    line_actors:         [Option<ActorId>; MARKERS_PER_TYPE],
+    /// Badges over each queued tanker request (water or retardant).
+    /// Cache stores the colour too so a position change AND a kind
+    /// change (rare — when a request slot recycles between
+    /// different-kind requests) both trigger a repaint.
+    tanker_req_actors:   [Option<ActorId>; MARKERS_PER_TYPE],
+    water_cache:      [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
+    line_cache:       [Option<(u8, u32, u32)>; MARKERS_PER_TYPE],
+    tanker_req_cache: [Option<(u8, u32, u32, u8)>; MARKERS_PER_TYPE],
 }
 
 impl QueueMarkers {
     pub(crate) const fn new() -> Self {
         Self {
-            water_actors: [None; MARKERS_PER_TYPE],
-            line_actors:  [None; MARKERS_PER_TYPE],
-            water_cache:  [None; MARKERS_PER_TYPE],
-            line_cache:   [None; MARKERS_PER_TYPE],
+            water_actors:      [None; MARKERS_PER_TYPE],
+            line_actors:       [None; MARKERS_PER_TYPE],
+            tanker_req_actors: [None; MARKERS_PER_TYPE],
+            water_cache:      [None; MARKERS_PER_TYPE],
+            line_cache:       [None; MARKERS_PER_TYPE],
+            tanker_req_cache: [None; MARKERS_PER_TYPE],
         }
     }
 
     pub(crate) fn init(&mut self) {
-        // Both badge types share the same blank prefab template;
+        // All badge types share the same blank prefab template;
         // each actor's volume is painted on demand when its slot
         // becomes visible.
         unsafe {
@@ -62,6 +75,11 @@ impl QueueMarkers {
             prefab_define(
                 LINE_PREFAB,
                 &*(&raw const LINE_DENSE),
+                U8Vec3::new(MARKER_W, MARKER_H, 1),
+            );
+            prefab_define(
+                TANKER_REQ_PREFAB,
+                &*(&raw const TANKER_REQ_DENSE),
                 U8Vec3::new(MARKER_W, MARKER_H, 1),
             );
         }
@@ -79,66 +97,159 @@ impl QueueMarkers {
             actor_set_visible(id, false);
             *slot = Some(id);
         }
+        for slot in &mut self.tanker_req_actors {
+            let id = actor_spawn_from(TANKER_REQ_PREFAB, Orientation::Up)
+                .expect("queue tanker-req marker spawn");
+            actor_set_render_mode(id, ActorRenderMode::Billboard);
+            actor_set_visible(id, false);
+            *slot = Some(id);
+        }
     }
 
-    /// Walk the queue and sync the marker pool. Cached so unchanged
-    /// slots cost only the cache compare.
-    pub(crate) fn update(&mut self, queue: &CommandQueue) {
-        let n_water = (queue.pending_water() as usize).min(MARKERS_PER_TYPE);
-        for i in 0..MARKERS_PER_TYPE {
-            let actor = match self.water_actors[i] { Some(a) => a, None => continue };
-            if i >= n_water {
-                if self.water_cache[i].is_some() {
-                    actor_set_visible(actor, false);
-                    self.water_cache[i] = None;
-                }
-                continue;
-            }
-            let target = match queue.water_at(i) {
-                Some(t) => t,
-                None    => continue,
-            };
-            let digit = (i + 1).min(9) as u8;
-            let key = (digit, target.x, target.z);
-            if self.water_cache[i] != Some(key) {
-                actor_clear(actor);
-                paint_badge(actor, digit, M_BUCKET_WATER);
-                self.water_cache[i] = Some(key);
-            }
-            actor_set_position(
-                actor,
-                Vec3::new(target.x as f32 + 0.5, target.y as f32 + 4.0, target.z as f32 + 0.5),
+    /// Walk active units and the queue, syncing the marker pool to
+    /// the merged list. Active orders take the low slots (so the
+    /// soonest-to-finish badges are 1, 2, …), queued orders fill in
+    /// behind. Cached so unchanged slots cost only the cache compare.
+    pub(crate) fn update(&mut self, roster: &Roster) {
+        // ── Water drops ──
+        let mut idx = 0usize;
+        for slot in roster.helis.iter() {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let h = match slot { Some(h) => h, None => continue };
+            let (x, z) = match h.active_drop_target() { Some(c) => c, None => continue };
+            let y = terrain_height(x, z);
+            refresh_slot(
+                self.water_actors[idx], &mut self.water_cache[idx],
+                idx, UVec3::new(x, y, z), M_BUCKET_WATER,
             );
-            actor_set_visible(actor, true);
+            idx += 1;
+        }
+        for i in 0..(roster.queue.pending_water() as usize) {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let target = match roster.queue.water_at(i) { Some(t) => t, None => continue };
+            refresh_slot(
+                self.water_actors[idx], &mut self.water_cache[idx],
+                idx, target, M_BUCKET_WATER,
+            );
+            idx += 1;
+        }
+        for i in idx..MARKERS_PER_TYPE {
+            hide_slot(self.water_actors[i], &mut self.water_cache[i]);
         }
 
-        let n_line = (queue.pending_lines() as usize).min(MARKERS_PER_TYPE);
-        for i in 0..MARKERS_PER_TYPE {
-            let actor = match self.line_actors[i] { Some(a) => a, None => continue };
-            if i >= n_line {
-                if self.line_cache[i].is_some() {
-                    actor_set_visible(actor, false);
-                    self.line_cache[i] = None;
-                }
-                continue;
-            }
-            let target = match queue.line_head_at(i) {
-                Some(t) => t,
-                None    => continue,
-            };
-            let digit = (i + 1).min(9) as u8;
-            let key = (digit, target.x, target.z);
-            if self.line_cache[i] != Some(key) {
-                actor_clear(actor);
-                paint_badge(actor, digit, M_SELECT_MARKER);
-                self.line_cache[i] = Some(key);
-            }
-            actor_set_position(
-                actor,
-                Vec3::new(target.x as f32 + 0.5, target.y as f32 + 4.0, target.z as f32 + 0.5),
+        // ── Fire lines ──
+        let mut idx = 0usize;
+        for slot in roster.crews.iter() {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let c = match slot { Some(c) => c, None => continue };
+            let (x, z) = match c.active_line_head() { Some(c) => c, None => continue };
+            let y = terrain_height(x, z);
+            refresh_slot(
+                self.line_actors[idx], &mut self.line_cache[idx],
+                idx, UVec3::new(x, y, z), M_SELECT_MARKER,
             );
-            actor_set_visible(actor, true);
+            idx += 1;
         }
+        for i in 0..(roster.queue.pending_lines() as usize) {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let target = match roster.queue.line_head_at(i) { Some(t) => t, None => continue };
+            refresh_slot(
+                self.line_actors[idx], &mut self.line_cache[idx],
+                idx, target, M_SELECT_MARKER,
+            );
+            idx += 1;
+        }
+        for i in idx..MARKERS_PER_TYPE {
+            hide_slot(self.line_actors[i], &mut self.line_cache[i]);
+        }
+
+        // ── Tanker requests (shared between water + retardant) ──
+        // Each pending sortie gets a badge floating over the strip's
+        // midpoint while it waits for a tanker slot. Cyan for water,
+        // salmon-pink for retardant; queue position is the digit.
+        let mut idx = 0usize;
+        for slot in roster.tanker_requests.iter() {
+            if idx >= MARKERS_PER_TYPE { break; }
+            let req = match slot { Some(r) => r, None => continue };
+            let color = match req.kind {
+                TankerKind::Water     => M_TANKER_WATER_STRIPE,
+                TankerKind::Retardant => M_TANKER_RETARDANT_STRIPE,
+            };
+            refresh_tanker_slot(
+                self.tanker_req_actors[idx], &mut self.tanker_req_cache[idx],
+                idx, req.badge_cell(), color,
+            );
+            idx += 1;
+        }
+        for i in idx..MARKERS_PER_TYPE {
+            hide_tanker_slot(self.tanker_req_actors[i], &mut self.tanker_req_cache[i]);
+        }
+    }
+}
+
+/// Same shape as `refresh_slot` but with a 4-tuple cache key that
+/// includes the colour, so a request slot that recycles from a
+/// water-tanker badge to a retardant-tanker badge (same position,
+/// same XZ, different colour) still triggers a repaint.
+fn refresh_tanker_slot(
+    actor: Option<ActorId>,
+    cache: &mut Option<(u8, u32, u32, u8)>,
+    slot: usize,
+    target: UVec3,
+    color: u8,
+) {
+    let actor = match actor { Some(a) => a, None => return };
+    let digit = (slot + 1).min(9) as u8;
+    let key = (digit, target.x, target.z, color);
+    if *cache != Some(key) {
+        actor_clear(actor);
+        paint_badge(actor, digit, color);
+        *cache = Some(key);
+    }
+    actor_set_position(
+        actor,
+        Vec3::new(target.x as f32 + 0.5, target.y as f32 + 4.0, target.z as f32 + 0.5),
+    );
+    actor_set_visible(actor, true);
+}
+
+fn hide_tanker_slot(actor: Option<ActorId>, cache: &mut Option<(u8, u32, u32, u8)>) {
+    let actor = match actor { Some(a) => a, None => return };
+    if cache.is_some() {
+        actor_set_visible(actor, false);
+        *cache = None;
+    }
+}
+
+/// Paint + position + show a single badge slot. The cache compares
+/// the (digit, target) tuple so repaints only happen on real changes.
+fn refresh_slot(
+    actor: Option<ActorId>,
+    cache: &mut Option<(u8, u32, u32)>,
+    slot: usize,
+    target: UVec3,
+    color: u8,
+) {
+    let actor = match actor { Some(a) => a, None => return };
+    let digit = (slot + 1).min(9) as u8;
+    let key = (digit, target.x, target.z);
+    if *cache != Some(key) {
+        actor_clear(actor);
+        paint_badge(actor, digit, color);
+        *cache = Some(key);
+    }
+    actor_set_position(
+        actor,
+        Vec3::new(target.x as f32 + 0.5, target.y as f32 + 4.0, target.z as f32 + 0.5),
+    );
+    actor_set_visible(actor, true);
+}
+
+fn hide_slot(actor: Option<ActorId>, cache: &mut Option<(u8, u32, u32)>) {
+    let actor = match actor { Some(a) => a, None => return };
+    if cache.is_some() {
+        actor_set_visible(actor, false);
+        *cache = None;
     }
 }
 

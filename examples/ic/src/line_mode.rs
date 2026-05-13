@@ -1,20 +1,27 @@
-//! Fire-line drafting. The player presses K once per point they want
-//! the crew to walk through; ENTER commits the draft as a single
-//! FireLine command on the queue; ESC discards it.
+//! Fire-line drafting + pending visualisation.
 //!
-//! No "mode toggle": every K press is a point-drop, every ENTER is
-//! a commit. The HUD shows the in-progress draft count
-//! (`LN n/8`) so the player can see they're mid-draft; an idle
-//! line has count == 0.
+//! ## Drafting
+//!
+//! The player presses Primary once per waypoint, then Confirm to
+//! commit the draft as a single FireLine command on the queue, or
+//! Cancel to discard it.
 //!
 //! Each drafted point gets a Billboard marker plus a magenta
 //! preview line painted in the air above the terrain between
 //! consecutive points, so the player can see the polyline shape
 //! before committing.
 //!
-//! Discarding a draft pre-commit is fine — the points never reached
-//! the queue. Once committed, the order is non-cancellable per the
-//! cart's gameplay rules.
+//! ## After commit
+//!
+//! The magenta preview voxels persist after `commit()` so a queued
+//! fire-line stays visible as a planned-action marker — the player
+//! can see exactly where the crew will dig once it's their turn.
+//! The crew's `tick` calls `clear_planned_line_voxels(path)` when
+//! it finishes walking the line, returning the airspace to empty.
+//!
+//! Discarding a draft pre-commit clears the voxels in place
+//! (`discard()`). Once committed, the order is non-cancellable per
+//! the cart's gameplay rules.
 
 use voxlconsl_sdk::*;
 use voxlconsl_sdk::physics;
@@ -157,10 +164,30 @@ impl LineMode {
         }
     }
 
-    /// Hide every draft marker, clear any painted preview voxels,
-    /// and reset the count. Called when the draft is committed or
-    /// cancelled.
-    pub(crate) fn clear(&mut self) {
+    /// Player committed the draft. Hide the per-point Billboard
+    /// markers and reset the count, but LEAVE the magenta preview
+    /// voxels painted in the world — they're now the pending-action
+    /// marker until the crew finishes walking the line. The cart
+    /// hands the path to `Roster::dispatch_fire_line`; the crew
+    /// itself owns cleanup via `clear_planned_line_voxels`.
+    pub(crate) fn commit(&mut self) {
+        for i in 0..self.count as usize {
+            if let Some(actor) = self.markers[i] {
+                actor_set_visible(actor, false);
+            }
+        }
+        self.count = 0;
+        // Forget our per-draft preview-voxel bookkeeping without
+        // erasing the world voxels themselves.
+        for slot in &mut self.preview { *slot = None; }
+        self.preview_count = 0;
+    }
+
+    /// Player cancelled the draft pre-commit. Hide every Billboard
+    /// marker, clear every painted preview voxel, and reset the
+    /// count. The draft never reached the queue, so there's no
+    /// pending order to visualise.
+    pub(crate) fn discard(&mut self) {
         for i in 0..self.count as usize {
             if let Some(actor) = self.markers[i] {
                 actor_set_visible(actor, false);
@@ -188,5 +215,41 @@ impl LineMode {
         let n = self.count as usize;
         for i in 0..n { dst[i] = self.points[i]; }
         n
+    }
+}
+
+/// Clear the magenta preview voxels along a committed fire-line's
+/// polyline. The crew calls this when it finishes walking the line so
+/// the airspace marker doesn't linger past the order.
+///
+/// Reuses the same deterministic segment-walk that `paint_segment`
+/// did at draft time, so we don't have to remember the cell list per
+/// queued line. Only voxels that are still `M_PLANNED_LINE` are
+/// touched — anything ember-painted-over is left alone.
+pub(crate) fn clear_planned_line_voxels(path: &[Option<(u32, u32)>; LINE_CAP]) {
+    // Find the last live waypoint.
+    let mut n = 0usize;
+    for slot in path.iter() {
+        if slot.is_some() { n += 1; } else { break; }
+    }
+    if n < 2 { return; }
+
+    for seg in 1..n {
+        let (ax, az) = match path[seg - 1] { Some(p) => p, None => break };
+        let (bx, bz) = match path[seg]     { Some(p) => p, None => break };
+        let dx = bx as i32 - ax as i32;
+        let dz = bz as i32 - az as i32;
+        let dx_abs = if dx < 0 { -dx } else { dx };
+        let dz_abs = if dz < 0 { -dz } else { dz };
+        let steps = dx_abs.max(dz_abs).max(1);
+        for i in 1..steps {
+            let t = i as f32 / steps as f32;
+            let x = (ax as f32 + dx as f32 * t) as u32;
+            let z = (az as f32 + dz as f32 * t) as u32;
+            let y = terrain_height(x, z) + PREVIEW_Y_OFFSET;
+            if physics::material_at(x, y, z) == M_PLANNED_LINE {
+                set_voxel(UVec3::new(x, y, z), 0);
+            }
+        }
     }
 }

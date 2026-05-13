@@ -81,6 +81,15 @@ impl Cursor {
         self.z = (self.z + ay * speed).clamp(FOOT_MIN as f32 + 4.0, FOOT_MAX as f32 - 4.0);
     }
 
+    /// Slide the cursor by the camera's focus delta so WASD-pan keeps
+    /// the reticle anchored to the same screen position. Without this
+    /// the cursor stays put in world-space and walks off the viewport
+    /// as the camera pans.
+    pub(crate) fn follow_camera(&mut self, dx: f32, dz: f32) {
+        self.x = (self.x + dx).clamp(FOOT_MIN as f32 + 4.0, FOOT_MAX as f32 - 4.0);
+        self.z = (self.z + dz).clamp(FOOT_MIN as f32 + 4.0, FOOT_MAX as f32 - 4.0);
+    }
+
     /// Integer cell the cursor currently points at.
     pub(crate) fn cell(&self) -> (u32, u32) { (self.x as u32, self.z as u32) }
 

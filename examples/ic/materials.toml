@@ -180,10 +180,67 @@ color    = "red:3"
 emission = 12
 
 # Planned-line preview — floating magenta voxels the cart paints
-# along the segments of the player's in-progress fire-line draft.
-# Cleared on commit / cancel.
+# along the segments of the player's in-progress fire-line draft
+# AND of committed-but-still-pending fire lines. Cleared when the
+# crew finishes walking the line, or when the player cancels a draft.
 [[material]]
 slot     = 25
 name     = "planned_line"
 color    = "magenta:3"
 emission = 12
+
+# Planned-water target — single floating cyan voxel the cart paints
+# above the drop cell when a water-drop order is queued, so the
+# player can see what's pending without reading the badge number.
+# Cleared when the helicopter drops on the cell.
+[[material]]
+slot     = 26
+name     = "planned_water"
+color    = "cyan:3"
+emission = 12
+
+# Fire retardant — bright salmon-pink stripe painted by the
+# retardant air tanker. Non-flammable (no flag → §10.3 CA can't
+# propagate fire into it, cart-side ember + wind-spread checks are
+# both flammable-allow-list so retardant gets snuff-on-contact for
+# free). Persistent until burned off or overwritten by the player.
+[[material]]
+slot     = 27
+name     = "retardant"
+color    = "magenta:2"
+emission = 4
+
+# Planned-retardant target — a darker pink marker the cart paints
+# at the dispatch cell so the player can see the incoming drop.
+# Cleared when the tanker actually paints the strip.
+[[material]]
+slot     = 28
+name     = "planned_retardant"
+color    = "magenta:3"
+emission = 12
+
+# Air-tanker pigments. Body for the fuselage, a slightly lighter
+# wing color, and a coloured nose stripe so the player can tell at
+# a glance whether the incoming plane is carrying water (cyan) or
+# retardant (pink). Wing pigment is shared.
+[[material]]
+slot  = 29
+name  = "tanker_body"
+color = "cool_gray:1"
+
+[[material]]
+slot  = 30
+name  = "tanker_wing"
+color = "cool_gray:2"
+
+[[material]]
+slot     = 31
+name     = "tanker_water_stripe"
+color    = "cyan:3"
+emission = 6
+
+[[material]]
+slot     = 32
+name     = "tanker_retardant_stripe"
+color    = "magenta:3"
+emission = 6

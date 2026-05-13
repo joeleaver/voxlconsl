@@ -48,6 +48,7 @@ mod hud;
 mod line_mode;
 mod mathlib;
 mod queue_markers;
+mod retardant_aim;
 mod rng;
 mod scenario;
 mod terrain;
@@ -77,6 +78,13 @@ pub(crate) const M_CREW_HELMET:      u8 = 19;
 pub(crate) const M_BUCKET_WATER:     u8 = 20;
 pub(crate) const M_HUD_TEXT:         u8 = 21;
 pub(crate) const M_PLANNED_LINE:     u8 = 25;
+pub(crate) const M_PLANNED_WATER:    u8 = 26;
+pub(crate) const M_RETARDANT:        u8 = 27;
+pub(crate) const M_PLANNED_RETARDANT: u8 = 28;
+pub(crate) const M_TANKER_BODY:      u8 = 29;
+pub(crate) const M_TANKER_WING:      u8 = 30;
+pub(crate) const M_TANKER_WATER_STRIPE: u8 = 31;
+pub(crate) const M_TANKER_RETARDANT_STRIPE: u8 = 32;
 
 // ── Mission tuning ────────────────────────────────────────────────
 
@@ -114,36 +122,53 @@ static mut ROSTER: Option<units::Roster> = None;
 
 // ── Action handles ───────────────────────────────────────────────
 
-static mut PAN_ACTION:    ActionHandle = ActionHandle(0);
-static mut AIM_ACTION:    ActionHandle = ActionHandle(0);
-static mut ZOOM_ACTION:   ActionHandle = ActionHandle(0);
-/// PRIMARY (J) — context-sensitive interact verb. Idle: open the
-/// action wheel. WheelOpen: confirm the highlighted option.
+static mut PAN_ACTION:      ActionHandle = ActionHandle(0);
+static mut AIM_ACTION:      ActionHandle = ActionHandle(0);
+static mut ZOOM_ACTION:     ActionHandle = ActionHandle(0);
+/// "Do the thing at this cell" (`BindingHint::PrimaryFire`).
+/// Idle: open the action wheel anchored at the cursor cell.
+/// WheelOpen: commit the highlighted option (same as Confirm).
 /// LineDrafting: append the next fire-line point.
-static mut DROP_ACTION:   ActionHandle = ActionHandle(0);
-/// SECONDARY (K) — also context-sensitive. WheelOpen: cycle to the
-/// next option. LineDrafting: commit the draft to the queue.
+static mut PRIMARY_ACTION:  ActionHandle = ActionHandle(0);
+/// "Yes, do it" (`BindingHint::Confirm`). WheelOpen: commit the
+/// highlighted option. LineDrafting: commit the draft to the queue.
 /// Idle: no-op.
-static mut LINE_ACTION:   ActionHandle = ActionHandle(0);
-/// CANCEL (Esc) — closes the wheel or discards the current draft.
-static mut CANCEL_ACTION: ActionHandle = ActionHandle(0);
+static mut CONFIRM_ACTION:  ActionHandle = ActionHandle(0);
+/// "Back out" (`BindingHint::Cancel`). WheelOpen: close the wheel.
+/// LineDrafting: discard the draft. Idle: no-op.
+static mut CANCEL_ACTION:   ActionHandle = ActionHandle(0);
 
 static mut LINE_MODE: line_mode::LineMode = line_mode::LineMode::new();
 static mut QUEUE_MARKERS: queue_markers::QueueMarkers = queue_markers::QueueMarkers::new();
 static mut ACTION_WHEEL: action_wheel::ActionWheel = action_wheel::ActionWheel::new();
+static mut RETARDANT_AIM: retardant_aim::RetardantAim = retardant_aim::RetardantAim::new();
 static mut INTERACTION: InteractionMode = InteractionMode::Idle;
+/// Previous frame's pan axis sample. Used to derive edge presses for
+/// W / S while the action wheel is open — the engine only gives us a
+/// continuous Axis2D for movement, not per-key edges.
+static mut PAN_PREV: (f32, f32) = (0.0, 0.0);
+/// Threshold for treating a pan-axis component as a "pressed"
+/// direction. 0.5 is well past any analog drift but doesn't require
+/// the player to slam the key.
+const NAV_THRESHOLD: f32 = 0.5;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum InteractionMode {
-    /// No order in progress. J opens the action wheel.
+    /// No order in progress. Primary opens the action wheel.
     Idle,
-    /// Wheel open, anchored at a captured cursor cell. K cycles
-    /// options, J confirms, ESC closes.
+    /// Wheel open, anchored at a captured cursor cell. Nav-up /
+    /// nav-down move the highlight, Confirm or Primary commits the
+    /// pick, Cancel closes.
     WheelOpen,
     /// Fire-line draft underway after picking LINE from the wheel.
-    /// J adds the next point at the current cursor cell, K commits,
-    /// ESC cancels.
+    /// Primary appends the next point at the current cursor cell,
+    /// Confirm commits, Cancel discards.
     LineDrafting,
+    /// Retardant aim mode after picking RETARDANT from the wheel.
+    /// Only the direction is player-controlled — the strip is a
+    /// fixed length from the wheel anchor toward the cursor.
+    /// Confirm or Primary paints, Cancel discards.
+    RetardantAiming,
 }
 
 // ── Boot ─────────────────────────────────────────────────────────
@@ -183,6 +208,7 @@ pub extern "C" fn init() {
         (&mut *(&raw mut LINE_MODE)).init();
         (&mut *(&raw mut QUEUE_MARKERS)).init();
         (&mut *(&raw mut ACTION_WHEEL)).init();
+        units::init_tanker_prefabs();
     }
 
     // First fire — seed it now so the player sees smoke from the
@@ -197,43 +223,72 @@ pub extern "C" fn init() {
 
 fn register_actions() {
     unsafe {
-        PAN_ACTION    = input_declare_action(ActionKind::Axis2D, BindingHint::PrimaryMovement, "pan");
-        AIM_ACTION    = input_declare_action(ActionKind::Axis2D, BindingHint::Aim, "cursor");
-        ZOOM_ACTION   = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom, "zoom");
-        DROP_ACTION   = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire, "primary");
-        LINE_ACTION   = input_declare_action(ActionKind::Button, BindingHint::SecondaryFire, "secondary");
-        CANCEL_ACTION = input_declare_action(ActionKind::Button, BindingHint::Cancel, "cancel");
+        PAN_ACTION     = input_declare_action(ActionKind::Axis2D, BindingHint::PrimaryMovement, "pan");
+        AIM_ACTION     = input_declare_action(ActionKind::Axis2D, BindingHint::Aim,             "cursor");
+        ZOOM_ACTION    = input_declare_action(ActionKind::Axis1D, BindingHint::Zoom,            "zoom");
+        PRIMARY_ACTION = input_declare_action(ActionKind::Button, BindingHint::PrimaryFire,     "primary");
+        CONFIRM_ACTION = input_declare_action(ActionKind::Button, BindingHint::Confirm,         "confirm");
+        CANCEL_ACTION  = input_declare_action(ActionKind::Button, BindingHint::Cancel,          "cancel");
     }
 }
 
-/// Dispatch J / K / ESC presses through the interaction state
-/// machine. Mode-specific behaviour is documented on
-/// `InteractionMode` and `action_wheel::ActionWheel`.
-unsafe fn handle_interaction(cursor_cell: UVec3, j: bool, k: bool, esc: bool) {
+/// Dispatch primary / confirm / cancel + nav-up / nav-down edges
+/// through the interaction state machine. Each button has the same
+/// meaning across modes:
+///
+/// - **Primary** — "click the world" (opens the wheel, appends a
+///   line point, or re-anchors an already-open wheel).
+/// - **Confirm** — "yes, do it" (commits a wheel pick or a fire-line
+///   draft).
+/// - **Cancel** — "back out" (closes the wheel, discards a draft).
+unsafe fn handle_interaction(
+    cursor_cell: UVec3,
+    primary: bool, confirm: bool, cancel: bool,
+    nav_up: bool, nav_down: bool,
+) {
     let mode = unsafe { INTERACTION };
     let lm     = unsafe { &mut *(&raw mut LINE_MODE) };
     let wheel  = unsafe { &mut *(&raw mut ACTION_WHEEL) };
+    let aim    = unsafe { &mut *(&raw mut RETARDANT_AIM) };
     let roster = unsafe { &mut *(&raw mut ROSTER) };
 
     match mode {
         InteractionMode::Idle => {
-            if j {
+            if primary {
                 wheel.open_at(cursor_cell);
                 unsafe { INTERACTION = InteractionMode::WheelOpen; }
             }
         }
         InteractionMode::WheelOpen => {
-            if esc {
+            if cancel {
                 wheel.close();
                 unsafe { INTERACTION = InteractionMode::Idle; }
-            } else if k {
-                wheel.cycle_next();
-            } else if j {
+            } else if nav_up {
+                wheel.select_prev();
+            } else if nav_down {
+                wheel.select_next();
+            } else if confirm || primary {
+                // Both Confirm and Primary commit — Primary "does the
+                // thing at this cell" in every mode, and inside the
+                // wheel that thing is the highlighted option.
                 match wheel.current_choice() {
                     action_wheel::WheelChoice::WaterDrop => {
                         if let Some(r) = roster { r.dispatch_water_drop(wheel.anchor); }
                         wheel.close();
                         unsafe { INTERACTION = InteractionMode::Idle; }
+                    }
+                    action_wheel::WheelChoice::Tanker => {
+                        if let Some(r) = roster { r.dispatch_water_tanker(wheel.anchor); }
+                        wheel.close();
+                        unsafe { INTERACTION = InteractionMode::Idle; }
+                    }
+                    action_wheel::WheelChoice::Retardant => {
+                        // Enter aim mode — the wheel's anchor is the
+                        // strip's start point. The player rotates
+                        // the cursor to set direction, then commits.
+                        aim.begin(wheel.anchor);
+                        wheel.close();
+                        unsafe { INTERACTION = InteractionMode::RetardantAiming; }
                     }
                     action_wheel::WheelChoice::FireLine => {
                         // First fire-line point is the wheel's anchor.
@@ -245,19 +300,43 @@ unsafe fn handle_interaction(cursor_cell: UVec3, j: bool, k: bool, esc: bool) {
             }
         }
         InteractionMode::LineDrafting => {
-            if esc {
-                lm.clear();
+            if cancel {
+                lm.discard();
                 unsafe { INTERACTION = InteractionMode::Idle; }
-            } else if k {
+            } else if confirm {
                 if lm.count > 0 {
                     let mut buf = [UVec3::ZERO; line_mode::LINE_CAP];
                     let n = lm.copy_points_into(&mut buf);
                     if let Some(r) = roster { r.dispatch_fire_line(&buf[..n]); }
-                    lm.clear();
+                    // Commit (not discard) — keep the preview voxels
+                    // painted as the queued line's in-world marker.
+                    lm.commit();
                 }
                 unsafe { INTERACTION = InteractionMode::Idle; }
-            } else if j {
+            } else if primary {
                 lm.push_point(cursor_cell);
+            }
+        }
+        InteractionMode::RetardantAiming => {
+            if cancel {
+                aim.discard();
+                unsafe { INTERACTION = InteractionMode::Idle; }
+            } else if confirm || primary {
+                if let Some((anchor, dir)) = aim.commit() {
+                    // Hand the aimed line to a tanker; the plane
+                    // overwrites the magenta preview voxels with
+                    // real retardant cell by cell as it flies.
+                    let dispatched = roster
+                        .as_mut()
+                        .map(|r| r.dispatch_retardant_strip(anchor, dir))
+                        .unwrap_or(false);
+                    if !dispatched {
+                        // Pool full — fall back to instant paint so
+                        // the player's order isn't silently dropped.
+                        retardant_aim::paint_strip(anchor, dir);
+                    }
+                }
+                unsafe { INTERACTION = InteractionMode::Idle; }
             }
         }
     }
@@ -277,14 +356,36 @@ pub extern "C" fn update(dt_ms: u32) {
 
     let cam = unsafe { &mut *(&raw mut CAMERA) };
     let cur = unsafe { &mut *(&raw mut CURSOR) };
-    cam.update(mx, my, zoom, dt);
+
+    // While the wheel is open, WASD navigates the option list — feed
+    // a zeroed pan axis to the camera so the world stays put while
+    // the player is picking.
+    let wheel_open = unsafe { INTERACTION == InteractionMode::WheelOpen };
+    let (cam_mx, cam_my) = if wheel_open { (0.0, 0.0) } else { (mx, my) };
+
+    let cam_fx_prev = cam.focus_x;
+    let cam_fz_prev = cam.focus_z;
+    cam.update(cam_mx, cam_my, zoom, dt);
+    // Drag the cursor by the camera's *actual* focus delta (post-clamp)
+    // so WASD-pan keeps the reticle on-screen and a clamped camera
+    // doesn't push the cursor past the world edge.
+    cur.follow_camera(cam.focus_x - cam_fx_prev, cam.focus_z - cam_fz_prev);
     cur.pan(ax, ay, cam.cursor_speed());
 
-    // Input edges. J / K become contextual via the InteractionMode
-    // state machine — see action_wheel.rs for the user-facing model.
-    let pressed_j   = input_action_pressed(unsafe { DROP_ACTION });
-    let pressed_k   = input_action_pressed(unsafe { LINE_ACTION });
-    let pressed_esc = input_action_pressed(unsafe { CANCEL_ACTION });
+    // W/S edge detection on the pan axis — input is Axis2D so we
+    // synthesise per-key edges by comparing with last frame. Only
+    // meaningful when the wheel is open; ignored elsewhere.
+    let (_mx_prev, my_prev) = unsafe { PAN_PREV };
+    let nav_up   = my >=  NAV_THRESHOLD && my_prev <  NAV_THRESHOLD;
+    let nav_down = my <= -NAV_THRESHOLD && my_prev > -NAV_THRESHOLD;
+    unsafe { PAN_PREV = (mx, my); }
+
+    // Input edges. Primary clicks the world, Confirm commits, Cancel
+    // backs out. Each button has the same meaning in every mode —
+    // see handle_interaction's doc comment for the table.
+    let primary_pressed = input_action_pressed(unsafe { PRIMARY_ACTION });
+    let confirm_pressed = input_action_pressed(unsafe { CONFIRM_ACTION });
+    let cancel_pressed  = input_action_pressed(unsafe { CANCEL_ACTION });
 
     let phase = unsafe { PHASE };
     if phase == Phase::Playing {
@@ -292,7 +393,19 @@ pub extern "C" fn update(dt_ms: u32) {
             let (cx, cz) = cur.cell();
             UVec3::new(cx, cur.marker_y(), cz)
         };
-        unsafe { handle_interaction(cursor_cell, pressed_j, pressed_k, pressed_esc); }
+        unsafe {
+            handle_interaction(
+                cursor_cell,
+                primary_pressed, confirm_pressed, cancel_pressed,
+                nav_up, nav_down,
+            );
+        }
+        // RetardantAiming reads the cursor every frame, not just on
+        // key-edges, so the preview line tracks live as the cursor
+        // sweeps around the anchor.
+        if unsafe { INTERACTION == InteractionMode::RetardantAiming } {
+            unsafe { (&mut *(&raw mut RETARDANT_AIM)).aim_at(cursor_cell); }
+        }
 
         unsafe {
             let fire = &mut *(&raw mut FIRE_STATE);
@@ -301,7 +414,7 @@ pub extern "C" fn update(dt_ms: u32) {
             if let Some(roster) = &mut *(&raw mut ROSTER) {
                 roster.tick();
                 let markers = &mut *(&raw mut QUEUE_MARKERS);
-                markers.update(&roster.queue);
+                markers.update(roster);
             }
         }
 
@@ -314,18 +427,39 @@ pub extern "C" fn update(dt_ms: u32) {
     // Cursor render is last so it sits on top of any fresh
     // ember / water / firebreak voxels painted this frame.
     cur.render();
+
+    // Sample the host-side binding labels (SPEC §6.5) once per frame
+    // so the wheel + HUD both see the same snapshot and repaint
+    // automatically on a device switch or rebind.
+    let mut buf_pan = [0u8; 16];
+    let mut buf_pri = [0u8; 16];
+    let mut buf_cnf = [0u8; 16];
+    let mut buf_cxl = [0u8; 16];
+    let pan_label     = input_action_label(unsafe { PAN_ACTION },     &mut buf_pan);
+    let primary_label = input_action_label(unsafe { PRIMARY_ACTION }, &mut buf_pri);
+    let confirm_label = input_action_label(unsafe { CONFIRM_ACTION }, &mut buf_cnf);
+    let cancel_label  = input_action_label(unsafe { CANCEL_ACTION },  &mut buf_cxl);
+
     // Wheel render no-ops when the wheel is closed; otherwise
-    // repaints only on selection change.
-    unsafe { (&mut *(&raw mut ACTION_WHEEL)).render(); }
+    // repaints when the selection or the confirm-label changes.
+    unsafe { (&mut *(&raw mut ACTION_WHEEL)).render(confirm_label); }
 
     // HUD paints regardless of phase so the player can see the
     // final timer + dot state on the end screen.
     let alive_mask = surviving_mask();
-    let ctx = unsafe { build_hud_ctx(alive_mask) };
+    let ctx = unsafe {
+        build_hud_ctx(alive_mask, pan_label, primary_label, confirm_label, cancel_label)
+    };
     unsafe { (&mut *(&raw mut HUD)).paint(ctx); }
 }
 
-unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
+unsafe fn build_hud_ctx<'a>(
+    alive_mask: u32,
+    pan_label: &'a str,
+    primary_label: &'a str,
+    confirm_label: &'a str,
+    cancel_label: &'a str,
+) -> hud::HudCtx<'a> {
     let roster_ref = unsafe { &*(&raw const ROSTER) };
     let fire_ref   = unsafe { &*(&raw const FIRE_STATE) };
     let line_ref   = unsafe { &*(&raw const LINE_MODE) };
@@ -358,6 +492,10 @@ unsafe fn build_hud_ctx(alive_mask: u32) -> hud::HudCtx<'static> {
         line_mode_active: line_ref.is_drafting(),
         line_mode_count:  line_ref.count as u32,
         queue_total,
+        pan_label,
+        primary_label,
+        confirm_label,
+        cancel_label,
     }
 }
 

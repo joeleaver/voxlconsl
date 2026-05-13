@@ -1,9 +1,10 @@
-//! Action-wheel UX. J presses become contextual: tap J on a map
-//! cell to open the wheel anchored at that cell. K cycles the
-//! available options (WATER / LINE); J confirms the highlighted
-//! one. Confirming WATER queues a drop at the anchor cell;
-//! confirming LINE starts a fire-line draft whose first point IS
-//! the anchor cell.
+//! Action-wheel UX. Primary on a map cell opens the wheel anchored
+//! at that cell. While the wheel is open, nav-up / nav-down edges
+//! move the highlight through the option list; Confirm or another
+//! Primary press commits the pick; Cancel closes the wheel.
+//! Confirming WATER queues a drop at the anchor cell; confirming
+//! LINE starts a fire-line draft whose first point IS the anchor
+//! cell.
 //!
 //! While the wheel is open, the cursor still moves with the
 //! mouse — but the wheel's *anchor* doesn't move. The player can
@@ -18,15 +19,22 @@ use crate::M_HUD_TEXT;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WheelChoice {
     WaterDrop,
+    Tanker,
+    Retardant,
     FireLine,
 }
 
-const OPTIONS: [(WheelChoice, &str); 2] = [
+const OPTIONS: [(WheelChoice, &str); 4] = [
     (WheelChoice::WaterDrop, "WATER"),
+    (WheelChoice::Tanker,    "TANKER"),
+    (WheelChoice::Retardant, "RETARD"),
     (WheelChoice::FireLine,  "LINE"),
 ];
 
 const PANEL_W: u32 = 32;
+/// 32 — engine caps prefab dimensions at CHUNK_SIZE = 32, so the
+/// wheel has to live inside a single 32³ volume. Anything taller is
+/// silently rejected by `prefabs::define`.
 const PANEL_H: u32 = 32;
 const PANEL_VOL_BYTES: usize = (PANEL_W * PANEL_H) as usize;
 const PANEL_PREFAB: PrefabId = PrefabId(70);
@@ -40,7 +48,11 @@ const WHEEL_SCREEN_Y: f32 = 52.0;
 /// on top.
 const WHEEL_LAYER:    f32 = 200.0;
 
-const LINE_SPACING: u32 = 7;
+/// 6 (= FONT_TINY cell height) makes adjacent rows touch with no gap.
+/// Tight, but lets us fit ACTION + 4 options inside the 32-px panel.
+/// Drop the hint row entirely — the cart's HUD HELP sidebar shows
+/// the same confirm-key reminder.
+const LINE_SPACING: u32 = 6;
 
 static mut PANEL_DENSE: [u8; PANEL_VOL_BYTES] = [0; PANEL_VOL_BYTES];
 
@@ -53,8 +65,9 @@ pub(crate) struct ActionWheel {
     /// applies to this cell (drop target, or first fire-line
     /// point) regardless of where the cursor has roamed since.
     pub anchor:   UVec3,
-    /// Cache so the wheel only repaints when selection changes.
-    cache: Option<u8>,
+    /// Cache so the wheel only repaints when the highlighted option
+    /// or the host-provided confirm-binding label changes.
+    cache: Option<u16>,
 }
 
 impl ActionWheel {
@@ -97,19 +110,33 @@ impl ActionWheel {
         if let Some(id) = self.actor { actor_set_visible(id, false); }
     }
 
-    pub(crate) fn cycle_next(&mut self) {
-        self.selected = (self.selected + 1) % OPTIONS.len() as u8;
+    /// Move highlight one step toward the top of the list. Clamps
+    /// at index 0 so holding the nav-up direction doesn't wrap past
+    /// the player.
+    pub(crate) fn select_prev(&mut self) {
+        if self.selected > 0 { self.selected -= 1; }
+    }
+
+    /// Move highlight one step toward the bottom of the list,
+    /// clamped at the last option.
+    pub(crate) fn select_next(&mut self) {
+        let last = (OPTIONS.len() as u8).saturating_sub(1);
+        if self.selected < last { self.selected += 1; }
     }
 
     pub(crate) fn current_choice(&self) -> WheelChoice {
         OPTIONS[self.selected as usize % OPTIONS.len()].0
     }
 
-    /// Repaint when the wheel state changes. Skips work otherwise.
-    pub(crate) fn render(&mut self) {
+    /// Repaint when the highlighted option changes. The bottom hint
+    /// was dropped to fit ACTION + 4 options inside the 32-px panel —
+    /// the cart's HUD HELP sidebar shows the same confirm/cancel keys.
+    /// `_confirm_label` is left in the signature so the cart's frame
+    /// loop can keep handing the label down once we have room again.
+    pub(crate) fn render(&mut self, _confirm_label: &str) {
         if !self.open { return; }
-        if self.cache == Some(self.selected) { return; }
-        self.cache = Some(self.selected);
+        if self.cache == Some(self.selected as u16) { return; }
+        self.cache = Some(self.selected as u16);
         let actor = match self.actor { Some(a) => a, None => return };
         actor_clear(actor);
 
@@ -128,8 +155,6 @@ impl ActionWheel {
             let s = core::str::from_utf8(&buf[..len]).unwrap_or("");
             paint_line(actor, (i + 1) as u32, s);
         }
-        // Bottom hint row — short key reminder while wheel is open.
-        paint_line(actor, OPTIONS.len() as u32 + 1, "K NXT");
     }
 }
 
