@@ -52,6 +52,13 @@ impl BrowserHost {
             web_sys::console::error_1(&format!("voxlconsl panic: {info}").into());
         }));
 
+        // Forward cart `log()` output to the browser console. host-browser
+        // is the only place that pulls in web-sys; voxlconsl-host stays
+        // web-sys-free so it builds for native + MCU targets.
+        voxlconsl_host::sandbox::set_log_callback(|msg| {
+            web_sys::console::log_1(&msg.into());
+        });
+
         let cart = Cart::load(bytes)
             .map_err(|e| JsValue::from_str(&format!("cart load failed: {e:?}")))?;
 

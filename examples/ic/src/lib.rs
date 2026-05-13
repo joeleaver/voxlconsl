@@ -41,6 +41,7 @@
 use voxlconsl_sdk::*;
 
 mod action_wheel;
+mod balance;
 mod camera;
 mod cursor;
 mod engine;
@@ -110,6 +111,16 @@ const MISSION_SEED: u32 = 0xA1F0_5E57;
 /// for the full table.
 const MISSION_TIER: u8 = 2;
 
+/// When `true`, the cart logs CSV-formatted balance rows via `log()`
+/// every `balance::BALANCE_LOG_INTERVAL_MS` of mission time and
+/// suppresses all player input (Primary/Confirm/Cancel/wheel-nav) so
+/// the run captures a pure no-op-player baseline. Default `false` for
+/// normal play.
+///
+/// To sweep tiers/seeds: flip on, edit `MISSION_SEED` + `MISSION_TIER`,
+/// rebuild, capture the browser console log, paste into a CSV.
+const BALANCE_MODE: bool = false;
+
 // ── Game state ───────────────────────────────────────────────────
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -122,6 +133,7 @@ enum Phase {
 static mut PHASE: Phase = Phase::Playing;
 static mut TIME_LEFT_MS: u32 = MISSION_DURATION_MS;
 static mut FIRE_SITES_LAST: u32 = 0;
+static mut BAL: balance::BalanceLog = balance::BalanceLog::new();
 
 static mut CAMERA: camera::Camera = camera::Camera::new(0.0, 0.0);
 static mut CURSOR: cursor::Cursor = cursor::Cursor::new(0.0, 0.0);
@@ -240,6 +252,10 @@ pub extern "C" fn init() {
         let fire = &mut *(&raw mut FIRE_STATE);
         fire.apply_scenario(scenario::get());
         fire.add_burn_site(fire_seed);
+    }
+
+    if BALANCE_MODE {
+        unsafe { (&*(&raw const BAL)).emit_header(); }
     }
 }
 
@@ -426,10 +442,19 @@ pub extern "C" fn update(dt_ms: u32) {
 
     // Input edges. Primary clicks the world, Confirm commits, Cancel
     // backs out. Each button has the same meaning in every mode —
-    // see handle_interaction's doc comment for the table.
-    let primary_pressed = input_action_pressed(unsafe { PRIMARY_ACTION });
-    let confirm_pressed = input_action_pressed(unsafe { CONFIRM_ACTION });
-    let cancel_pressed  = input_action_pressed(unsafe { CANCEL_ACTION });
+    // see handle_interaction's doc comment for the table. In
+    // BALANCE_MODE the cart runs as a passive observer so we force
+    // every button to false regardless of physical input — the CSV
+    // log captures the no-op-player baseline.
+    let (primary_pressed, confirm_pressed, cancel_pressed) = if BALANCE_MODE {
+        (false, false, false)
+    } else {
+        (
+            input_action_pressed(unsafe { PRIMARY_ACTION }),
+            input_action_pressed(unsafe { CONFIRM_ACTION }),
+            input_action_pressed(unsafe { CANCEL_ACTION }),
+        )
+    };
 
     let phase = unsafe { PHASE };
     if phase == Phase::Playing {
@@ -465,6 +490,15 @@ pub extern "C" fn update(dt_ms: u32) {
         // Mission time — saturating so we don't underflow on a
         // long renderer stall.
         unsafe { TIME_LEFT_MS = TIME_LEFT_MS.saturating_sub(dt_ms); }
+
+        if BALANCE_MODE {
+            unsafe {
+                let alive = surviving_mask();
+                let m = build_balance_metrics(alive);
+                (&mut *(&raw mut BAL)).tick(&m);
+            }
+        }
+
         check_end_conditions();
     }
 
@@ -585,20 +619,71 @@ fn surviving_mask() -> u32 {
 }
 
 fn check_end_conditions() {
-    let alive = surviving_mask().count_ones();
+    let mask = surviving_mask();
+    let alive = mask.count_ones();
     let time_left = unsafe { TIME_LEFT_MS };
-    if alive == 0 {
-        unsafe { PHASE = Phase::Lost; }
-        return;
-    }
-    if time_left == 0 {
-        unsafe {
-            PHASE = if alive >= WIN_STRUCTURE_THRESHOLD {
-                Phase::Won
-            } else {
-                Phase::Lost
-            };
+    let new_phase = if alive == 0 {
+        Some(Phase::Lost)
+    } else if time_left == 0 {
+        Some(if alive >= WIN_STRUCTURE_THRESHOLD { Phase::Won } else { Phase::Lost })
+    } else {
+        None
+    };
+    if let Some(p) = new_phase {
+        unsafe { PHASE = p; }
+        if BALANCE_MODE {
+            let outcome = match p { Phase::Won => "WON", _ => "LOST" };
+            unsafe {
+                let m = build_balance_metrics(mask);
+                (&mut *(&raw mut BAL)).emit_end(outcome, &m);
+            }
         }
+    }
+}
+
+/// Collect a balance-metrics snapshot. Cheap reads from the existing
+/// roster/fire/scenario singletons.
+unsafe fn build_balance_metrics(alive_mask: u32) -> balance::BalanceMetrics {
+    let s = scenario::get();
+    let fire_ref = unsafe { &*(&raw const FIRE_STATE) };
+    let roster_ref = unsafe { &*(&raw const ROSTER) };
+
+    let wind_label = fire_ref.wind_direction_label();
+    let mut wind_dir = [b' '; 2];
+    let bytes = wind_label.as_bytes();
+    for i in 0..2.min(bytes.len()) { wind_dir[i] = bytes[i]; }
+
+    let (h_b, h_t, c_b, c_t, hs_b, hs_t, e_b, e_t, q) = match roster_ref {
+        Some(r) => (
+            r.heli_busy(), r.heli_total(),
+            r.crew_busy(), r.crew_total(),
+            r.hotshot_busy(), r.hotshot_total(),
+            r.engine_busy(), r.engine_total(),
+            r.queue.pending_total(),
+        ),
+        None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
+    };
+
+    let elapsed_ms = MISSION_DURATION_MS.saturating_sub(unsafe { TIME_LEFT_MS });
+
+    balance::BalanceMetrics {
+        elapsed_ms,
+        tier:        s.tier as u32,
+        seed:        s.seed,
+        fire_sites:  unsafe { FIRE_SITES_LAST },
+        alive_count: alive_mask.count_ones(),
+        alive_mask,
+        wind_dir,
+        wind_str:    fire_ref.wind_strength_digit(),
+        heli_busy:   h_b,
+        heli_total:  h_t,
+        crew_busy:   c_b,
+        crew_total:  c_t,
+        hs_busy:     hs_b,
+        hs_total:    hs_t,
+        eng_busy:    e_b,
+        eng_total:   e_t,
+        queue_pending: q,
     }
 }
 

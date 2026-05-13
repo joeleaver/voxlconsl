@@ -88,6 +88,13 @@ mod host {
         pub fn input_action_active(h: u32) -> u32;
         pub fn input_action_label(h: u32, out_ptr: *mut u8, out_cap: u32) -> u32;
 
+        // Imported as `env.host_log` rather than `env.log` to dodge a
+        // wasm-ld signature collision with libcompiler_builtins's math
+        // `log(f64)->f64`. When a cart actually calls log() (not just
+        // declared in the dead panic handler) wasm-ld would otherwise
+        // emit a `signature_mismatch:log` stub that traps on the first
+        // call. The Rust function name stays `log` for cart authors.
+        #[link_name = "host_log"]
         pub fn log(ptr: *const u8, len: u32);
 
         // Physics queries (§10.1)

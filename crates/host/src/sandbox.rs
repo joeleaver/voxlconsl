@@ -1337,32 +1337,37 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), wasmi::E
     )?;
 
     // Misc (§8.3)
-    linker.func_wrap(
-        "env", "log",
-        |caller: Caller<WorldState>, ptr: u32, len: u32| {
-            // Read the cart's memory at [ptr, ptr+len) as UTF-8 and emit it.
-            // Best-effort; ignore errors silently.
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return,
-            };
-            let mut buf = vec![0u8; len as usize];
-            if memory.read(&caller, ptr as usize, &mut buf).is_err() {
-                return;
-            }
-            // Best-effort UTF-8; just dump bytes if invalid.
-            #[cfg(target_arch = "wasm32")]
-            {
-                let s = String::from_utf8_lossy(&buf);
-                web_sys_log(&format!("[cart] {s}"));
-            }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let s = String::from_utf8_lossy(&buf);
-                eprintln!("[cart] {s}");
-            }
-        },
-    )?;
+    //
+    // Carts import this as `env.host_log` rather than `env.log` to
+    // dodge a wasm-ld symbol collision with the math `log(f64)->f64`
+    // pulled in transitively by `core::fmt` (see the SDK's
+    // `pub fn log` decl). The Rust-side callable stays `log()`. We
+    // also keep `env.log` registered for backwards compat with any
+    // already-shipped cart wasm whose import name predates the rename;
+    // wasmi silently ignores host-side imports that the module doesn't
+    // declare, so the duplicate registration is harmless.
+    let log_handler = |caller: Caller<WorldState>, ptr: u32, len: u32| {
+        let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            Some(m) => m,
+            None => return,
+        };
+        let mut buf = vec![0u8; len as usize];
+        if memory.read(&caller, ptr as usize, &mut buf).is_err() {
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let s = String::from_utf8_lossy(&buf);
+            web_sys_log(&format!("[cart] {s}"));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let s = String::from_utf8_lossy(&buf);
+            eprintln!("[cart] {s}");
+        }
+    };
+    linker.func_wrap("env", "host_log", log_handler)?;
+    linker.func_wrap("env", "log",      log_handler)?;
 
     Ok(())
 }
@@ -1401,11 +1406,28 @@ fn orientation_from_u32(v: u32) -> Orientation {
     }
 }
 
+/// Host-provided log callback. `voxlconsl-host` doesn't depend on
+/// `web-sys` directly (so the crate stays buildable for native CLI /
+/// tests / MCU targets); the embedding host crate (host-browser etc.)
+/// installs this at startup via `set_log_callback`. When unset, cart
+/// log output is silently dropped.
+///
+/// Single-threaded wasm32 runtime — plain `static mut` is fine. Native
+/// hosts that use this for testing should call `set_log_callback`
+/// before loading any cart.
+static mut LOG_CALLBACK: Option<fn(&str)> = None;
+
+pub fn set_log_callback(cb: fn(&str)) {
+    unsafe { LOG_CALLBACK = Some(cb); }
+}
+
 #[cfg(target_arch = "wasm32")]
-fn web_sys_log(_msg: &str) {
-    // The `voxlconsl-host` crate avoids depending on web-sys; the browser
-    // host crate sets this up. For now, drop the message — TODO: thread
-    // through via a host-provided log callback.
+fn web_sys_log(msg: &str) {
+    unsafe {
+        if let Some(cb) = LOG_CALLBACK {
+            cb(msg);
+        }
+    }
 }
 
 #[cfg(test)]
