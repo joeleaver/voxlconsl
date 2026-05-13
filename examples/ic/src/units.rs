@@ -1131,6 +1131,7 @@ impl GroundCrew {
 pub(crate) const WATER_DROP_QUEUE_CAP: usize = 16;
 pub(crate) const FIRE_LINE_QUEUE_CAP:  usize = 8;
 pub(crate) const HOTSHOT_QUEUE_CAP:    usize = 4;
+pub(crate) const ENGINE_QUEUE_CAP:     usize = 4;
 
 #[derive(Copy, Clone, Default)]
 pub(crate) struct FireLinePath {
@@ -1163,6 +1164,8 @@ pub(crate) struct CommandQueue {
     line_count:  u8,
     hotshots:       [Option<FireLinePath>; HOTSHOT_QUEUE_CAP],
     hotshot_count:  u8,
+    engines:        [Option<UVec3>; ENGINE_QUEUE_CAP],
+    engine_count:   u8,
 }
 
 impl CommandQueue {
@@ -1174,6 +1177,8 @@ impl CommandQueue {
             line_count:  0,
             hotshots:       [None; HOTSHOT_QUEUE_CAP],
             hotshot_count:  0,
+            engines:        [None; ENGINE_QUEUE_CAP],
+            engine_count:   0,
         }
     }
 
@@ -1199,6 +1204,13 @@ impl CommandQueue {
         if (self.hotshot_count as usize) >= HOTSHOT_QUEUE_CAP { return false; }
         self.hotshots[self.hotshot_count as usize] = Some(line);
         self.hotshot_count += 1;
+        true
+    }
+
+    pub(crate) fn push_engine(&mut self, cell: UVec3) -> bool {
+        if (self.engine_count as usize) >= ENGINE_QUEUE_CAP { return false; }
+        self.engines[self.engine_count as usize] = Some(cell);
+        self.engine_count += 1;
         true
     }
 
@@ -1233,12 +1245,27 @@ impl CommandQueue {
         head
     }
 
+    fn pop_engine(&mut self) -> Option<UVec3> {
+        if self.engine_count == 0 { return None; }
+        let head = self.engines[0].take();
+        for i in 1..self.engine_count as usize {
+            self.engines[i - 1] = self.engines[i];
+        }
+        self.engine_count -= 1;
+        self.engines[self.engine_count as usize] = None;
+        head
+    }
+
     pub(crate) fn pending_total(&self) -> u32 {
-        self.water_count as u32 + self.line_count as u32 + self.hotshot_count as u32
+        self.water_count as u32
+            + self.line_count as u32
+            + self.hotshot_count as u32
+            + self.engine_count as u32
     }
     pub(crate) fn pending_water(&self) -> u32 { self.water_count as u32 }
     pub(crate) fn pending_lines(&self) -> u32 { self.line_count as u32 }
     pub(crate) fn pending_hotshots(&self) -> u32 { self.hotshot_count as u32 }
+    pub(crate) fn pending_engines(&self) -> u32 { self.engine_count as u32 }
 
     /// Peek at the i'th queued water drop without removing it.
     /// Used by the on-map badge renderer.
@@ -1258,6 +1285,12 @@ impl CommandQueue {
     pub(crate) fn hotshot_head_at(&self, i: usize) -> Option<UVec3> {
         if i >= self.hotshot_count as usize { return None; }
         self.hotshots[i].as_ref().and_then(|l| l.points[0])
+    }
+
+    /// Peek at the i'th queued engine park order's target cell.
+    pub(crate) fn engine_at(&self, i: usize) -> Option<UVec3> {
+        if i >= self.engine_count as usize { return None; }
+        self.engines[i]
     }
 }
 
@@ -1289,6 +1322,9 @@ pub(crate) const MAX_DROP_PLANES: usize = 2;
 /// the chutes are released ~5 ticks apart and the first ones land
 /// before the last ones are even released for a second sortie.
 pub(crate) const MAX_PARACHUTES:  usize = 4;
+/// Hard cap on fire engines. The scenario tier sets the *usable*
+/// count via the engine budget; surplus slots stay None.
+pub(crate) const MAX_ENGINES:     usize = 4;
 /// Frames of "call sign" delay after a tanker order is committed
 /// before the plane spawns off-map. Gives the player a beat to see
 /// the badge (and preview, for retardant) before the plane appears.
@@ -1333,6 +1369,7 @@ pub(crate) struct Roster {
     pub hotshots:    [Option<crate::hotshot::HotShot>;    MAX_HOTSHOTS],
     pub drop_planes: [Option<crate::hotshot::DropPlane>;  MAX_DROP_PLANES],
     pub parachutes:  [Option<crate::hotshot::Parachute>;  MAX_PARACHUTES],
+    pub engines:     [Option<crate::engine::FireEngine>;  MAX_ENGINES],
     /// Maximum live hot-shot crews permitted by the current scenario
     /// tier. The queue only drains while `alive_hotshots() < hotshot_cap`.
     pub hotshot_cap: u8,
@@ -1343,10 +1380,17 @@ pub(crate) struct Roster {
 }
 
 impl Roster {
-    pub(crate) fn init(heli_count: u8, crew_count: u8, hotshot_count: u8) -> Self {
+    pub(crate) fn init(
+        heli_count:    u8,
+        crew_count:    u8,
+        hotshot_count: u8,
+        engine_count:  u8,
+    ) -> Self {
         let mut helis: [Option<Helicopter>; MAX_HELIS] = [None, None, None, None];
         let mut crews: [Option<GroundCrew>; MAX_CREWS] =
             [None, None, None, None, None, None];
+        let mut engines: [Option<crate::engine::FireEngine>; MAX_ENGINES] =
+            [None, None, None, None];
 
         let helis_to_spawn = (heli_count as usize).min(MAX_HELIS);
         for i in 0..helis_to_spawn {
@@ -1362,6 +1406,14 @@ impl Roster {
             let spawn_x = HELI_PAD_X + 8 + (i as u32) * 4;
             crews[i] = Some(GroundCrew::init(spawn_x, HELI_PAD_Z));
         }
+        // Engines park east of the crew row along the same road. 4-cell
+        // spacing leaves a 1-cell gap between adjacent 3-wide engines.
+        let engines_to_spawn = (engine_count as usize).min(MAX_ENGINES);
+        let crew_end_x = HELI_PAD_X + 8 + (crews_to_spawn as u32) * 4;
+        for i in 0..engines_to_spawn {
+            let spawn_x = crew_end_x + 4 + (i as u32) * 4;
+            engines[i] = Some(crate::engine::FireEngine::init(spawn_x, HELI_PAD_Z));
+        }
         Self {
             helis,
             crews,
@@ -1370,6 +1422,7 @@ impl Roster {
             hotshots:    [None, None, None, None, None, None, None, None],
             drop_planes: [None, None],
             parachutes:  [None, None, None, None],
+            engines,
             hotshot_cap: (hotshot_count as usize).min(MAX_HOTSHOTS) as u8,
             hotshot_home: (HELI_PAD_X, HELI_PAD_Z),
             queue: CommandQueue::new(),
@@ -1414,8 +1467,29 @@ impl Roster {
         // drop-plane slot. Each order takes a full drop-plane sortie.
         self.process_hotshot_queue();
 
+        // Fire engines: idle engines pull from the engine queue (one
+        // engine per order). Engines reject orders they can't reach
+        // by road so a clogged target rolls forward to the next free
+        // engine on the next tick.
+        for slot in self.engines.iter_mut() {
+            if let Some(e) = slot {
+                if e.is_idle() {
+                    if let Some(cell) = self.queue.pop_engine() {
+                        if !e.issue_target(cell) {
+                            // Engine rejected — drop the order rather
+                            // than re-queue, matching the no-cancel
+                            // rule for everything else. Player's
+                            // target validation upstream should make
+                            // this rare.
+                        }
+                    }
+                }
+            }
+        }
+
         for slot in self.helis.iter_mut() { if let Some(h) = slot { h.tick(); } }
         for slot in self.crews.iter_mut() { if let Some(c) = slot { c.tick(); } }
+        for slot in self.engines.iter_mut() { if let Some(e) = slot { e.tick(); } }
         for slot in self.tankers.iter_mut() {
             let despawn = match slot.as_mut() {
                 Some(t) => !t.tick(),
@@ -1725,6 +1799,29 @@ impl Roster {
         self.queue.push_line(FireLinePath::from_slice(points));
     }
 
+    /// Queue a single-cell engine park order. Rejected (returns
+    /// `false`) when the target cell isn't on a road / the engine
+    /// can't reach it, when the engine pool is empty (tier 1), or
+    /// when the queue is full.
+    pub(crate) fn dispatch_engine_park(&mut self, cell: UVec3) -> bool {
+        if !crate::engine::is_drivable_cell(cell.x, cell.z) { return false; }
+        // Validate reachability from at least one engine's spawn —
+        // if none can reach this cell by road, drop the order. The
+        // current linear road plus shared spawn row means any engine
+        // can reach the same cells, so the first alive engine's
+        // spawn is a fine representative.
+        let mut representative: Option<(u32, u32)> = None;
+        for slot in self.engines.iter() {
+            if slot.is_some() {
+                representative = Some((HELI_PAD_X, HELI_PAD_Z));
+                break;
+            }
+        }
+        let Some(start) = representative else { return false; };
+        if !crate::engine::target_reachable_from(start, cell) { return false; }
+        self.queue.push_engine(cell)
+    }
+
     /// Queue a hot-shot deployment along `points`. The crew
     /// parachutes in at the first waypoint, lays firebreak along
     /// the polyline, then awaits a heli pickup. Returns `true` iff
@@ -1756,6 +1853,13 @@ impl Roster {
     pub(crate) fn hotshot_total(&self) -> u32 { self.hotshot_cap as u32 }
     pub(crate) fn hotshot_busy(&self) -> u32 {
         self.hotshots.iter().filter(|s| s.is_some()).count() as u32
+    }
+    pub(crate) fn engine_total(&self) -> u32 {
+        self.engines.iter().filter(|s| s.is_some()).count() as u32
+    }
+    pub(crate) fn engine_busy(&self) -> u32 {
+        self.engines.iter().filter_map(|s| s.as_ref())
+            .filter(|e| !e.is_idle()).count() as u32
     }
 }
 

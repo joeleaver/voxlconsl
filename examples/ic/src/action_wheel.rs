@@ -31,14 +31,16 @@ pub(crate) enum WheelChoice {
     Retardant,
     FireLine,
     HotShot,
+    Engine,
 }
 
-const OPTIONS: [(WheelChoice, &str); 5] = [
+const OPTIONS: [(WheelChoice, &str); 6] = [
     (WheelChoice::WaterDrop, "WATER"),
     (WheelChoice::Tanker,    "TANKER"),
     (WheelChoice::Retardant, "RETARD"),
     (WheelChoice::FireLine,  "LINE"),
     (WheelChoice::HotShot,   "HOTSHO"),
+    (WheelChoice::Engine,    "ENGINE"),
 ];
 
 /// Number of OPTIONS painted onto the top panel (after ACTION header).

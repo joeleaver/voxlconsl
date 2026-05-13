@@ -283,3 +283,18 @@ slot     = 37
 name     = "planned_hotshot"
 color    = "yellow:3"
 emission = 12
+
+# Fire-engine pigments. The chassis is classic fire-engine red so the
+# unit reads distinct from the firetruck (which is the orange "crew"
+# vehicle). The hose nozzle is a small dark voxel on top so the player
+# can see which direction the engine is "spraying" at-a-glance.
+[[material]]
+slot     = 38
+name     = "engine_body"
+color    = "red:3"
+emission = 6
+
+[[material]]
+slot  = 39
+name  = "engine_hose"
+color = "warm_gray:0"

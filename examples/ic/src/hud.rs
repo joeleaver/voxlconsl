@@ -81,6 +81,8 @@ struct UnitKey {
     crew_total:   u32,
     hotshot_busy: u32,
     hotshot_total: u32,
+    engine_busy:  u32,
+    engine_total: u32,
     line_active:  bool,
     line_count:   u32,
     queue_total:  u32,
@@ -190,6 +192,8 @@ impl Hud {
             crew_total:   ctx.crew_total,
             hotshot_busy: ctx.hotshot_busy,
             hotshot_total: ctx.hotshot_total,
+            engine_busy:  ctx.engine_busy,
+            engine_total: ctx.engine_total,
             line_active:  ctx.line_mode_active,
             line_count:   ctx.line_mode_count,
             queue_total:  ctx.queue_total,
@@ -209,13 +213,11 @@ impl Hud {
         // Line 2: hot-shot crew pool busy/total — "S 4/8".
         let s = format_pool(&mut buf, b'S', ctx.hotshot_busy, ctx.hotshot_total);
         paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
-        // Line 3: line draft size when drafting; total queue size
-        // otherwise. (Per-order map badges show the queue itself.)
-        let s = if ctx.line_mode_active {
-            format_line_count(&mut buf, ctx.line_mode_count)
-        } else {
-            format_queue_total(&mut buf, ctx.queue_total)
-        };
+        // Line 3: fire-engine pool busy/total — "E 1/2".
+        // (Q/LN moved off the sidebar — on-map badges already show
+        // queued orders, draft point count is visible as Billboard
+        // markers along the polyline.)
+        let s = format_pool(&mut buf, b'E', ctx.engine_busy, ctx.engine_total);
         paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, s);
     }
 
@@ -306,6 +308,8 @@ pub(crate) struct HudCtx<'a> {
     pub crew_total:    u32,
     pub hotshot_busy:  u32,
     pub hotshot_total: u32,
+    pub engine_busy:   u32,
+    pub engine_total:  u32,
     pub tier:          u32,
     pub line_mode_active: bool,
     pub line_mode_count:  u32,

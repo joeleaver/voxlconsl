@@ -19,6 +19,7 @@ pub(crate) struct Scenario {
     pub heli_count:     u8,
     pub crew_count:     u8,
     pub hotshot_count:  u8,
+    pub engine_count:   u8,
     pub forest_rng:     u32,
     pub wind_angle_rad: f32,
     pub wind_strength:  f32,
@@ -26,20 +27,16 @@ pub(crate) struct Scenario {
 
 impl Scenario {
     /// Map a difficulty tier (1.. arbitrary) to the unit budget the
-    /// player starts with. Each step roughly doubles capability.
-    /// Tier 1 is intentionally crews-only — the player has to walk
-    /// firebreaks without any air support and learn the spread
-    /// dynamics. Helis appear at tier 2; hot-shots at tier 2+.
-    /// Returns `(helis, crews, hotshot_crew_cap)`. Each hot-shot
-    /// order deploys a squad of `SQUAD_SIZE = 4` crews so the crew
-    /// cap should be a multiple of 4 (one squad = 4, two = 8).
-    pub(crate) fn budget_for_tier(tier: u8) -> (u8, u8, u8) {
+    /// player starts with. Returns `(helis, crews, hotshot_crew_cap,
+    /// engines)`. Each hot-shot order deploys a squad of
+    /// `SQUAD_SIZE = 4` crews so the crew cap is a multiple of 4.
+    pub(crate) fn budget_for_tier(tier: u8) -> (u8, u8, u8, u8) {
         match tier {
-            0 | 1 => (0, 2, 0),
-            2     => (1, 2, 4),  // 1 squad of 4
-            3     => (2, 3, 8),  // 2 squads
-            4     => (3, 4, 8),
-            _     => (3, 4, 8),  // ceiling at MAX_HELIS=4 / MAX_CREWS=6 / MAX_HOTSHOTS=8
+            0 | 1 => (0, 2, 0, 0),
+            2     => (1, 2, 4, 1),  // 1 squad + 1 engine
+            3     => (2, 3, 8, 2),  // 2 squads + 2 engines
+            4     => (3, 4, 8, 3),
+            _     => (3, 4, 8, 3),  // ceiling at MAX_ENGINES=4
         }
     }
 
@@ -61,7 +58,7 @@ impl Scenario {
         while wind_angle_rad >= TAU_F32 { wind_angle_rad -= TAU_F32; }
         let wind_strength = 0.30 + rng.unit() * 0.30;
 
-        let (heli_count, crew_count, hotshot_count) = Self::budget_for_tier(tier);
+        let (heli_count, crew_count, hotshot_count, engine_count) = Self::budget_for_tier(tier);
 
         Self {
             seed,
@@ -69,6 +66,7 @@ impl Scenario {
             heli_count,
             crew_count,
             hotshot_count,
+            engine_count,
             forest_rng,
             wind_angle_rad,
             wind_strength,

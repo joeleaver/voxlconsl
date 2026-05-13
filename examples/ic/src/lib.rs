@@ -43,6 +43,7 @@ use voxlconsl_sdk::*;
 mod action_wheel;
 mod camera;
 mod cursor;
+mod engine;
 mod fire;
 mod hotshot;
 mod hud;
@@ -91,6 +92,8 @@ pub(crate) const M_HOTSHOT_STRIPE:   u8 = 34;
 pub(crate) const M_HOTSHOT_BODY:     u8 = 35;
 pub(crate) const M_HOTSHOT_HELMET:   u8 = 36;
 pub(crate) const M_PLANNED_HOTSHOT:  u8 = 37;
+pub(crate) const M_ENGINE_BODY:      u8 = 38;
+pub(crate) const M_ENGINE_HOSE:      u8 = 39;
 
 // ── Mission tuning ────────────────────────────────────────────────
 
@@ -216,7 +219,9 @@ pub extern "C" fn init() {
         CAMERA = camera::Camera::new(focus_x, focus_z);
         CURSOR = cursor::Cursor::new(focus_x, focus_z - 8.0);
         let s = scenario::get();
-        ROSTER = Some(units::Roster::init(s.heli_count, s.crew_count, s.hotshot_count));
+        ROSTER = Some(units::Roster::init(
+            s.heli_count, s.crew_count, s.hotshot_count, s.engine_count,
+        ));
         register_actions();
         (&mut *(&raw mut HUD)).init();
         (&mut *(&raw mut CURSOR)).init();
@@ -318,6 +323,17 @@ unsafe fn handle_interaction(
                         lm.push_point(wheel.anchor);
                         wheel.close();
                         unsafe { INTERACTION = InteractionMode::LineDrafting(Drafter::HotShot); }
+                    }
+                    action_wheel::WheelChoice::Engine => {
+                        // Single-cell deploy — engines park at the
+                        // anchor and run their hose. Roster rejects
+                        // off-road targets, in which case the click
+                        // is silently dropped.
+                        if let Some(r) = roster {
+                            r.dispatch_engine_park(wheel.anchor);
+                        }
+                        wheel.close();
+                        unsafe { INTERACTION = InteractionMode::Idle; }
                     }
                 }
             }
@@ -496,15 +512,16 @@ unsafe fn build_hud_ctx<'a>(
     let wind_dir = fire_ref.wind_direction_label();
     let wind_strength = fire_ref.wind_strength_digit();
 
-    let (heli_busy, heli_total, crew_busy, crew_total, hotshot_busy, hotshot_total, queue_total) =
+    let (heli_busy, heli_total, crew_busy, crew_total, hotshot_busy, hotshot_total, engine_busy, engine_total, queue_total) =
         match roster_ref {
             Some(r) => (
                 r.heli_busy(), r.heli_total(),
                 r.crew_busy(), r.crew_total(),
                 r.hotshot_busy(), r.hotshot_total(),
+                r.engine_busy(), r.engine_total(),
                 r.queue.pending_total(),
             ),
-            None => (0, 0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
 
     hud::HudCtx {
@@ -519,6 +536,8 @@ unsafe fn build_hud_ctx<'a>(
         crew_total,
         hotshot_busy,
         hotshot_total,
+        engine_busy,
+        engine_total,
         tier: s.tier as u32,
         line_mode_active: line_ref.is_drafting(),
         line_mode_count:  line_ref.count as u32,
