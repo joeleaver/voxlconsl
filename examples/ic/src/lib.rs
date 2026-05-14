@@ -55,6 +55,7 @@ mod retardant_aim;
 mod rng;
 mod scenario;
 mod season;
+mod story;
 mod terrain;
 mod units;
 
@@ -112,6 +113,14 @@ const MISSION_SEED: u32 = 0xA1F0_5E57;
 /// helicopter; tier 3 doubles up. See `Scenario::budget_for_tier`
 /// for the full table.
 const MISSION_TIER: u8 = 2;
+
+/// Story-mode level selector. `Some(N)` boots into `story::LEVELS[N]`
+/// (seed/tier/days from the level table). `None` plays endless mode
+/// from `MISSION_SEED` + `MISSION_TIER` + `DAYS_PER_SEASON`.
+///
+/// This is the placeholder mechanism while the in-game level selector
+/// hasn't been built — set the const here at compile time and rebuild.
+const STORY_LEVEL: Option<usize> = None;
 
 /// Runtime balance-mode flag. Set true by `init()` when an external
 /// harness (e.g. `voxlconsl balance`) supplies a scenario override
@@ -217,16 +226,20 @@ pub extern "C" fn init() {
     light_set_sun(Vec3::new(-0.5, -0.6, 0.6), 0, 0);
 
     // Pick a scenario seed + tier and lock them in before any
-    // world / fire / roster initialisation reads from them. If an
-    // external harness supplied an override (CLI `voxlconsl balance`),
-    // honour it AND flip on the balance-mode flag so the cart logs
-    // CSV + suppresses player input for the run.
-    let (mission_seed, mission_tier) = match balance_get_scenario_override() {
+    // world / fire / roster initialisation reads from them. Priority:
+    //   1. Balance-harness override (CLI `voxlconsl balance`): forces
+    //      a specific seed+tier and turns on BALANCE_MODE_FLAG.
+    //   2. Story-mode level (compile-time `STORY_LEVEL` const).
+    //   3. Endless mode (compile-time `MISSION_SEED` + `MISSION_TIER`).
+    let (mission_seed, mission_tier, season_days) = match balance_get_scenario_override() {
         Some((seed, tier)) => {
             unsafe { BALANCE_MODE_FLAG = true; }
-            (seed, tier)
+            (seed, tier, season::DAYS_PER_SEASON)
         }
-        None => (MISSION_SEED, MISSION_TIER),
+        None => match STORY_LEVEL.and_then(|i| story::LEVELS.get(i)) {
+            Some(level) => (level.seed, level.tier, level.days),
+            None        => (MISSION_SEED, MISSION_TIER, season::DAYS_PER_SEASON),
+        },
     };
     scenario::init(mission_seed, mission_tier);
 
@@ -260,8 +273,9 @@ pub extern "C" fn init() {
     unsafe {
         // Season state machine — drives day timer + lightning strikes
         // from now on. No initial fire seed; the first lightning of
-        // day 1 provides the first incident.
-        SEASON = Some(season::Season::new(mission_seed));
+        // day 1 provides the first incident. Day count comes from the
+        // story-mode level table when STORY_LEVEL is set.
+        SEASON = Some(season::Season::new_with_days(mission_seed, season_days));
         let fire = &mut *(&raw mut FIRE_STATE);
         if let Some(s) = &*(&raw const SEASON) {
             fire.set_wind(s.weather.angle_rad, s.weather.strength);
@@ -626,16 +640,19 @@ unsafe fn build_hud_ctx<'a>(
         };
 
     // HUD's "TM" countdown becomes the day timer. Day counter +
-    // weather glyph are routed through additional fields below.
-    let (time_left_ms, day_num, day_total, weather_glyph) = unsafe {
+    // weather glyph + season-end status are routed through
+    // additional fields below.
+    let (time_left_ms, day_num, day_total, weather_glyph, season_ended, season_won) = unsafe {
         match (&*(&raw const SEASON)).as_ref() {
             Some(s) => (
                 season::DAY_DURATION_MS.saturating_sub(s.day_time_ms),
                 s.day + 1,
-                season::DAYS_PER_SEASON,
+                s.days_total,
                 s.weather_glyph(),
+                s.state != season::SeasonState::DayActive,
+                s.state == season::SeasonState::SeasonWon,
             ),
-            None => (0, 1, season::DAYS_PER_SEASON, "----"),
+            None => (0, 1, season::DAYS_PER_SEASON, "----", false, false),
         }
     };
 
@@ -644,6 +661,8 @@ unsafe fn build_hud_ctx<'a>(
         day_num,
         day_total,
         weather_glyph,
+        season_ended,
+        season_won,
         alive_mask,
         fire_sites:   unsafe { FIRE_SITES_LAST },
         wind_dir,

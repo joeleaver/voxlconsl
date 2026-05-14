@@ -35,7 +35,9 @@ const PANEL_PREFAB: PrefabId = PrefabId(64);
 const SIDEBAR_X: f32 = 3.0;
 const SIDEBAR_GAP: f32 = 4.0;
 const PANEL_LAYER:  f32 = 100.0;
-const LINE_SPACING: u32 = 7;
+// 6 px spacing fits 5 lines in a 32-px-tall panel (was 7 = 4 lines).
+// FONT_TINY is 6 px tall so the lines touch with no gap. Reads fine.
+const LINE_SPACING: u32 = 6;
 
 const SIDEBAR_LINE_MAX: usize = 8;     // 8 chars × 4 px = 32 px ≤ panel width
 
@@ -73,6 +75,7 @@ struct StatusKey {
     wind_str: u32,
     day_num:  u8,
     day_total: u8,
+    weather:  [u8; 5],   // padded with space; e.g. b"CALM ", b"STORM"
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -117,6 +120,10 @@ pub(crate) struct Hud {
     unit_cache:   Option<UnitKey>,
     orders_cache: Option<OrdersKey>,
     help_cache:   Option<HelpKey>,
+    /// Banner that appears in the center of the world view when the
+    /// season resolves. Hidden during DayActive.
+    end_banner:        Option<ActorId>,
+    end_banner_cache:  Option<(bool, u32)>,   // (won, alive_count)
 }
 
 impl Hud {
@@ -127,6 +134,8 @@ impl Hud {
             unit_cache:   None,
             orders_cache: None,
             help_cache:   None,
+            end_banner:        None,
+            end_banner_cache:  None,
         }
     }
 
@@ -148,6 +157,15 @@ impl Hud {
             actor_set_position(id, Vec3::new(SIDEBAR_X, section_y(s), PANEL_LAYER));
             self.actors[s as usize] = Some(id);
         }
+        // End-of-season banner — same 32×32 prefab, centered in the
+        // 220-wide world viewport (36..256 in screen X). Higher Z than
+        // the sidebar panels so it draws on top of anything else.
+        let banner = actor_spawn_from(PANEL_PREFAB, Orientation::Up)
+            .expect("ic end-banner spawn");
+        actor_set_render_mode(banner, ActorRenderMode::Screen);
+        actor_set_position(banner, Vec3::new(130.0, 56.0, PANEL_LAYER + 1.0));
+        actor_set_visible(banner, false);
+        self.end_banner = Some(banner);
     }
 
     /// Render every section. Cheap per-frame; each painter early-
@@ -157,12 +175,57 @@ impl Hud {
         self.paint_unit(&ctx);
         self.paint_orders(&ctx);
         self.paint_help(&ctx);
+        self.paint_end_banner(&ctx);
+    }
+
+    fn paint_end_banner(&mut self, ctx: &HudCtx<'_>) {
+        let Some(actor) = self.end_banner else { return; };
+        if !ctx.season_ended {
+            // Mid-season: keep banner hidden + reset cache so a fresh
+            // resolve repaints (in case of a future restart).
+            actor_set_visible(actor, false);
+            self.end_banner_cache = None;
+            return;
+        }
+        let alive = ctx.alive_mask.count_ones();
+        let key = (ctx.season_won, alive);
+        if self.end_banner_cache == Some(key) {
+            // Already painted this outcome — leave the actor visible
+            // and skip the redraw.
+            return;
+        }
+        self.end_banner_cache = Some(key);
+        actor_clear(actor);
+        actor_set_visible(actor, true);
+
+        let mut buf = [b' '; SIDEBAR_LINE_MAX];
+        let header = if ctx.season_won { "SEASON" } else { "SEASON" };
+        let outcome = if ctx.season_won { "SURVIVED" } else { "LOST" };
+        // 5 lines centered-ish in the 32×32 banner.
+        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, header);
+        paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, outcome);
+        let s = {
+            // "4/6 ALIVE"
+            buf[0] = b'0' + (alive.min(9)) as u8;
+            buf[1] = b'/';
+            buf[2] = b'6';
+            buf[3] = b' ';
+            buf[4..9].copy_from_slice(b"ALIVE");
+            core::str::from_utf8(&buf[..9]).unwrap_or("")
+        };
+        paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
+        let hint = if ctx.season_won { "GOOD JOB" } else { "TOWN BURNT" };
+        paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, hint);
+        paint_line(actor, &FONT_TINY, 4, M_HUD_TEXT, "F5 = NEW");
     }
 
     fn paint_status(&mut self, ctx: &HudCtx<'_>) {
         let wind_bytes = ctx.wind_dir.as_bytes();
         let mut wind_dir = [b' '; 2];
         for i in 0..2.min(wind_bytes.len()) { wind_dir[i] = wind_bytes[i]; }
+        let mut weather = [b' '; 5];
+        let g = ctx.weather_glyph.as_bytes();
+        for i in 0..5.min(g.len()) { weather[i] = g[i]; }
         let key = StatusKey {
             t_sec:    ctx.time_left_ms / 1000,
             alive:    ctx.alive_mask.count_ones(),
@@ -171,13 +234,14 @@ impl Hud {
             wind_str: ctx.wind_strength,
             day_num:  ctx.day_num,
             day_total: ctx.day_total,
+            weather,
         };
         if self.status_cache == Some(key) { return; }
         self.status_cache = Some(key);
         let actor = match self.actors[Section::Status as usize] { Some(a) => a, None => return };
         actor_clear(actor);
 
-        // STATUS panel — 4 lines × 4-px-tall font in a 32×32 panel.
+        // STATUS panel — 5 lines × 6 px / line in a 32 px panel.
         // Day counter takes the slot the per-mission FR-count used to
         // hold; fire-site count is dropped because the burning forest
         // is plainly visible on the world view.
@@ -190,6 +254,8 @@ impl Hud {
         paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
         let s = format_wind(&mut buf, ctx.wind_dir, ctx.wind_strength);
         paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, s);
+        let s = format_weather(&mut buf, ctx.weather_glyph);
+        paint_line(actor, &FONT_TINY, 4, M_HUD_TEXT, s);
     }
 
     fn paint_unit(&mut self, ctx: &HudCtx<'_>) {
@@ -312,6 +378,11 @@ pub(crate) struct HudCtx<'a> {
     pub day_num:       u8,
     pub day_total:     u8,
     pub weather_glyph: &'a str,
+    /// `true` once the season state machine has resolved (Won or Lost).
+    /// Drives the end-of-season banner visibility.
+    pub season_ended:  bool,
+    /// Only meaningful when `season_ended` is true. `true` = SeasonWon.
+    pub season_won:    bool,
     pub alive_mask:    u32,
     pub fire_sites:    u32,
     pub wind_dir:      &'a str,
@@ -428,6 +499,15 @@ fn format_day<'a>(buf: &'a mut [u8], num: u8, total: u8) -> &'a str {
     buf[5] = b'/';
     buf[6] = b'0' + (total.min(9)) as u8;
     core::str::from_utf8(&buf[..7]).unwrap_or("")
+}
+
+/// "WX CALM" / "WX MILD" / "WX GUST" / "WX STORM" — weather glyph.
+fn format_weather<'a>(buf: &'a mut [u8], glyph: &str) -> &'a str {
+    buf[..3].copy_from_slice(b"WX ");
+    let g = glyph.as_bytes();
+    let n = g.len().min(5);
+    buf[3..3 + n].copy_from_slice(&g[..n]);
+    core::str::from_utf8(&buf[..3 + n]).unwrap_or("")
 }
 
 /// "H 1/3" — pool busy/total for a unit type.

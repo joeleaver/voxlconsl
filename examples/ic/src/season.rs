@@ -10,6 +10,8 @@
 use crate::mathlib::TAU_F32;
 use crate::rng::Rng;
 
+/// Default season length when no override is provided. Story-mode
+/// levels can pass shorter / longer values via `Season::new_with_days`.
 pub(crate) const DAYS_PER_SEASON:  u8  = 7;
 pub(crate) const DAY_DURATION_MS:  u32 = 120_000;   // 2 minutes per day
 
@@ -46,6 +48,9 @@ pub(crate) struct DailyWeather {
 
 pub(crate) struct Season {
     pub day: u8,
+    /// Total days in this season. Either `DAYS_PER_SEASON` (default)
+    /// or a story-mode override.
+    pub days_total: u8,
     pub day_time_ms: u32,
     pub state: SeasonState,
     rng: Rng,
@@ -64,9 +69,17 @@ pub(crate) struct Season {
 
 impl Season {
     pub(crate) fn new(seed: u32) -> Self {
-        let mut rng = Rng::new(seed ^ 0xB529_7A4D);
+        Self::new_with_days(seed, DAYS_PER_SEASON)
+    }
+
+    /// Construct a Season with a custom day-count. Used by story-mode
+    /// levels that override the procedural default.
+    pub(crate) fn new_with_days(seed: u32, days_total: u8) -> Self {
+        let days_total = days_total.max(1);
+        let rng = Rng::new(seed ^ 0xB529_7A4D);
         let mut s = Self {
             day: 0,
+            days_total,
             day_time_ms: 0,
             state: SeasonState::DayActive,
             rng,
@@ -160,7 +173,7 @@ impl Season {
     }
 
     fn advance_day(&mut self) {
-        if self.day + 1 >= DAYS_PER_SEASON {
+        if self.day + 1 >= self.days_total {
             self.state = SeasonState::SeasonWon;
             return;
         }
@@ -180,8 +193,9 @@ impl Season {
         self.weather.angle_rad = self.rng.unit() * TAU_F32;
         self.weather.strength = 0.20 + self.rng.unit() * 0.70;
         // Strike budget rolls 1..=4 per day, with later-season days
-        // skewed slightly hotter so the season ramps up.
-        let day_bias = (self.day as f32 / DAYS_PER_SEASON as f32) * 0.5;
+        // skewed slightly hotter so the season ramps up. Use the
+        // *per-season* day index (so a 3-day season ramps fast).
+        let day_bias = (self.day as f32 / self.days_total.max(1) as f32) * 0.5;
         let roll = self.rng.unit() + day_bias;
         self.weather.strike_budget = if      roll < 0.30 { 1 }
                                      else if roll < 0.65 { 2 }
