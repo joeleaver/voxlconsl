@@ -9,14 +9,25 @@
 // every request goes through this worker.
 //
 // Cache version bump forces all clients to pick up worker changes.
-const SW_VERSION = "coi-v1";
+const SW_VERSION = "coi-v2";
 
 self.addEventListener("install", (event) => {
     self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
-    event.waitUntil(self.clients.claim());
+    // On every activation also nuke the HTTP cache for build artefacts —
+    // the wasm-bindgen JS and the host `.wasm` aren't query-string
+    // versioned, so a stale browser cache from a previous deploy can
+    // leave the page calling host methods that no longer exist
+    // (or, equivalently, missing methods the new JS expects).
+    event.waitUntil((async () => {
+        if (self.caches) {
+            const keys = await caches.keys();
+            await Promise.all(keys.map((k) => caches.delete(k)));
+        }
+        await self.clients.claim();
+    })());
 });
 
 self.addEventListener("fetch", (event) => {
@@ -28,7 +39,24 @@ self.addEventListener("fetch", (event) => {
     }
     event.respondWith((async () => {
         try {
-            const response = await fetch(event.request);
+            // Force the network for our own build artefacts so the
+            // HTTP cache can't pin the page to a stale deploy. Other
+            // requests follow normal caching.
+            const url = new URL(event.request.url);
+            const sameOrigin = url.origin === self.location.origin;
+            const isBuildArtefact = sameOrigin && (
+                url.pathname.endsWith(".js") ||
+                url.pathname.endsWith(".wasm") ||
+                url.pathname.endsWith(".voxl") ||
+                url.pathname.endsWith(".json") ||
+                url.pathname.endsWith(".css") ||
+                url.pathname.endsWith("/") ||
+                url.pathname.endsWith(".html")
+            );
+            const req = isBuildArtefact
+                ? new Request(event.request, { cache: "reload" })
+                : event.request;
+            const response = await fetch(req);
             // Don't touch opaque (no-cors) responses; modifying them
             // strips most metadata and isn't useful anyway.
             if (response.type !== "basic" && response.type !== "default") {

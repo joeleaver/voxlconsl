@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>voxlconsl</title>
-    <link rel="stylesheet" href="style.css?v=mute1">
+    <link rel="stylesheet" href="style.css?v=coi2">
 </head>
 <body>
     <main>
@@ -31,7 +31,7 @@
                 console.warn("service workers unavailable; SAB will not work");
             } else {
                 try {
-                    const reg = await navigator.serviceWorker.register("sw.js?v=coi1");
+                    const reg = await navigator.serviceWorker.register("sw.js?v=coi2");
                     if (reg.active && !window.crossOriginIsolated) {
                         // SW is active but this page loaded before
                         // it was, so headers aren't applied yet.
@@ -53,7 +53,7 @@
             // gracefully), load the main app.
             const s = document.createElement("script");
             s.type = "module";
-            s.src = "main.js?v=mute2";
+            s.src = "main.js?v=coi2";
             document.body.appendChild(s);
         })();
     </script>
