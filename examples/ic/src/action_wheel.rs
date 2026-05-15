@@ -129,6 +129,17 @@ impl ActionWheel {
     }
 
     pub(crate) fn init(&mut self) {
+        // Idempotent: endless-mode restart calls this again. Just
+        // close + clear caches, actors stay.
+        if self.actor_top.is_some() {
+            self.open = false;
+            self.selected = 0;
+            self.cache_top = None;
+            self.cache_bottom = None;
+            if let Some(a) = self.actor_top    { actor_set_visible(a, false); }
+            if let Some(a) = self.actor_bottom { actor_set_visible(a, false); }
+            return;
+        }
         unsafe {
             prefab_define(
                 PANEL_PREFAB_TOP,

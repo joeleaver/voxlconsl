@@ -49,7 +49,7 @@ use crate::{
     M_FIREBREAK_DIRT, M_HELICOPTER_BODY, M_HELICOPTER_ROTOR, M_PINE_LEAVES,
     M_PINE_WOOD, M_PLANNED_RETARDANT, M_PLANNED_WATER, M_RETARDANT,
     M_TANKER_BODY, M_TANKER_RETARDANT_STRIPE, M_TANKER_WATER_STRIPE,
-    M_TANKER_WING, M_WATER,
+    M_TANKER_WING,
 };
 
 // ── Helicopter ────────────────────────────────────────────────────
@@ -59,7 +59,13 @@ const HELI_SIZE_Y: u8 = 4;
 const HELI_SIZE_Z: u8 = 5;
 const HELI_ALT:    f32 = 14.0;
 const HELI_SPEED:  f32 = 0.7;
-const HELI_DROP_RADIUS: i32 = 2;
+// Drop radius in cells, so the actual footprint is (2r+1)². 3 gives
+// a 7×7 footprint — pine canopies are 3×3 wide, so a tree centred
+// on the drop's edge still has its full canopy inside the snuff
+// region. With radius=2 the canopy of an edge-tree had cells in a
+// column just outside the drop, which kept burning visibly inside
+// the visible water patch.
+const HELI_DROP_RADIUS: i32 = 3;
 const HELI_REFILL_TICKS: u8 = 12;
 const HELI_DROP_TICKS:   u8 = 8;
 /// XZ distance at which "we've arrived" snaps the state machine.
@@ -97,6 +103,8 @@ pub(crate) struct Helicopter {
 }
 
 impl Helicopter {
+    pub(crate) fn despawn_actor(&self) { actor_despawn(self.actor); }
+
     /// Spawn at world cell `(pad_x, pad_z)`. The Roster spaces multiple
     /// helis along +X so their volumes don't visually overlap.
     pub(crate) fn init(pad_x: u32, pad_z: u32) -> Self {
@@ -151,11 +159,18 @@ impl Helicopter {
     }
 
     /// Animate the rotor by stamping a 2-phase blade pattern on the
-    /// top of the actor volume.
+    /// top of the actor volume. Updates every 3 frames — the rotor
+    /// still reads as spinning at 20 fps and we save the ~10 host
+    /// crossings/frame on the other two frames (cheap in native but
+    /// adds up in the browser's wasmi interpreter when multiple
+    /// helis are active).
     fn tick_rotor(&mut self) {
         self.rotor_phase = self.rotor_phase.wrapping_add(1);
-        // Clear the rotor plane every frame, then paint one of two
-        // cross patterns based on the phase parity.
+        if self.rotor_phase % 3 != 0 {
+            return;
+        }
+        // Clear the rotor plane, then paint one of two cross
+        // patterns based on the phase.
         actor_fill_box(
             self.actor,
             U8Vec3::new(0, 3, 0),
@@ -163,11 +178,9 @@ impl Helicopter {
             0,
         );
         let blade = M_HELICOPTER_ROTOR;
-        if self.rotor_phase & 1 == 0 {
-            // Horizontal blade — span along X.
+        if (self.rotor_phase / 3) & 1 == 0 {
             for x in 0u8..5 { actor_set_voxel(self.actor, U8Vec3::new(x, 3, 2), blade); }
         } else {
-            // Diagonal blade — corners of a cross.
             actor_set_voxel(self.actor, U8Vec3::new(0, 3, 0), blade);
             actor_set_voxel(self.actor, U8Vec3::new(1, 3, 1), blade);
             actor_set_voxel(self.actor, U8Vec3::new(2, 3, 2), blade);
@@ -223,10 +236,15 @@ impl Helicopter {
     }
 
     pub(crate) fn issue_drop(&mut self, target: UVec3) {
-        // Target is the cell the player wants water on. Heli flies
-        // to it; if the bucket is empty we route through the lake
-        // first.
-        self.target_xz = (target.x as f32, target.z as f32);
+        // Target is the cell the player wants water on. fly_toward
+        // moves `self.pos` (heli CORNER) toward the target; the
+        // drop is centred on heli's CENTRE, which is corner + size/2.
+        // Bias the target so the drop's centre lands on the clicked
+        // cell — otherwise the drop is offset by ~2 cells from where
+        // the player aimed.
+        let cx = target.x as f32 - HELI_SIZE_X as f32 * 0.5;
+        let cz = target.z as f32 - HELI_SIZE_Z as f32 * 0.5;
+        self.target_xz = (cx, cz);
         self.state = if self.bucket_full {
             HeliState::FlyToTarget
         } else {
@@ -357,10 +375,14 @@ impl Helicopter {
                 let x = (cx + dx) as u32;
                 let z = (cz + dz) as u32;
                 let h = terrain_height(x, z);
-                // Snuff fire in the 4-cell column above terrain.
-                for y in h..h + 4 {
+                // Snuff fire in the full column above terrain.
+                // Pine canopies reach `terrain + 8`, so a shorter
+                // sweep leaves the upper leaves burning — which now
+                // matters because the cart-side long-burn loop
+                // keeps each fire cell alight for 6-15 s.
+                for y in h..h + 10 {
                     if physics::material_at(x, y, z) == M_FIRE {
-                        set_voxel(UVec3::new(x, y, z), 0);
+                        crate::extinguish_fire_cell(UVec3::new(x, y, z));
                     }
                 }
                 // Wipe any planning marker that was painted at this
@@ -374,9 +396,10 @@ impl Helicopter {
                 // Paint a water cell ABOVE the surface so the CA
                 // settles it onto the terrain rather than overlaying
                 // the surface voxel itself (which could blast away
-                // useful materials).
+                // useful materials). Route through `place_water` so
+                // the cart tracks the cell for TTL-driven evaporation.
                 if physics::material_at(x, h, z) == 0 {
-                    set_voxel(UVec3::new(x, h, z), M_WATER);
+                    crate::place_water(UVec3::new(x, h, z));
                 }
             }
         }
@@ -647,18 +670,21 @@ impl Tanker {
             let zu = zf as u32;
             if xu >= FOOT_MAX || zu >= FOOT_MAX { continue; }
             let h = terrain_height(xu, zu);
-            // Snuff fire in the 4-cell column above terrain.
-            for y in h..h + 4 {
+            // Snuff fire in the full column above terrain (pines
+            // reach `terrain + 8`).
+            for y in h..h + 10 {
                 if physics::material_at(xu, y, zu) == M_FIRE {
-                    set_voxel(UVec3::new(xu, y, zu), 0);
+                    crate::extinguish_fire_cell(UVec3::new(xu, y, zu));
                 }
             }
             match self.kind {
                 TankerKind::Water => {
                     // Water settles via the liquid CA: paint a cell
                     // above the surface so it spreads onto terrain.
+                    // Route through `place_water` so the cell tracks
+                    // for TTL-driven evaporation.
                     if physics::material_at(xu, h, zu) == 0 {
-                        set_voxel(UVec3::new(xu, h, zu), M_WATER);
+                        crate::place_water(UVec3::new(xu, h, zu));
                     }
                     // Clear the cyan planning marker if a heli also
                     // had this cell queued.
@@ -833,6 +859,8 @@ pub(crate) struct GroundCrew {
 }
 
 impl GroundCrew {
+    pub(crate) fn despawn_actor(&self) { actor_despawn(self.actor); }
+
     pub(crate) fn init(spawn_x: u32, spawn_z: u32) -> Self {
         let actor = actor_spawn().expect("actor pool full");
         let y = terrain_height(spawn_x, spawn_z) as f32;
@@ -1106,11 +1134,15 @@ impl GroundCrew {
                 // Clear flammables (and fire / embers) standing on
                 // the strip. Cabin slots are intentionally not in
                 // this list so the crew won't accidentally raze a
-                // structure they're walking past.
-                for y in h..h + 6 {
+                // structure they're walking past. Column extends
+                // to terrain + 10 to catch upper-canopy fire on
+                // pine_leaves (canopies reach +8).
+                for y in h..h + 10 {
                     let m = physics::material_at(x, y, z);
-                    if m == M_PINE_WOOD || m == M_PINE_LEAVES
-                        || m == M_FIRE || m == M_EMBER
+                    if m == M_FIRE {
+                        crate::extinguish_fire_cell(UVec3::new(x, y, z));
+                    } else if m == M_PINE_WOOD || m == M_PINE_LEAVES
+                        || m == M_EMBER
                     {
                         set_voxel(UVec3::new(x, y, z), 0);
                     }
@@ -1427,6 +1459,36 @@ impl Roster {
             hotshot_home: (HELI_PAD_X, HELI_PAD_Z),
             queue: CommandQueue::new(),
         }
+    }
+
+    /// Despawn every unit's actor and zero the slots. Called from
+    /// `lib::restart_season()` before re-running `Roster::init` for
+    /// the next season — without this each restart leaks ~10-20
+    /// actors and we hit the 256-actor host cap after a few rounds.
+    pub(crate) fn teardown(&mut self) {
+        for slot in self.helis.iter_mut() {
+            if let Some(h) = slot.take() { h.despawn_actor(); }
+        }
+        for slot in self.crews.iter_mut() {
+            if let Some(c) = slot.take() { c.despawn_actor(); }
+        }
+        for slot in self.tankers.iter_mut() {
+            if let Some(t) = slot.take() { t.despawn_actor(); }
+        }
+        for slot in self.hotshots.iter_mut() {
+            if let Some(h) = slot.take() { h.despawn_actor(); }
+        }
+        for slot in self.drop_planes.iter_mut() {
+            if let Some(p) = slot.take() { p.despawn_actor(); }
+        }
+        for slot in self.parachutes.iter_mut() {
+            if let Some(p) = slot.take() { p.despawn_actor(); }
+        }
+        for slot in self.engines.iter_mut() {
+            if let Some(e) = slot.take() { e.despawn_actor(); }
+        }
+        for slot in self.tanker_requests.iter_mut() { *slot = None; }
+        self.queue = CommandQueue::new();
     }
 
     /// Hand out queued orders this tick, then tick every unit slot.

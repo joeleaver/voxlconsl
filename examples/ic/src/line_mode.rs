@@ -85,6 +85,15 @@ impl LineMode {
     /// boot. Each marker starts hidden; `push_point` re-positions
     /// and shows them as the player drafts.
     pub(crate) fn init(&mut self) {
+        // Idempotent: endless-mode restart calls this again. Just
+        // hide existing markers and reset state, actors stay.
+        if self.markers[0].is_some() {
+            for slot in self.markers.iter() {
+                if let Some(id) = slot { actor_set_visible(*id, false); }
+            }
+            self.count = 0;
+            return;
+        }
         unsafe {
             let dense = &mut *(&raw mut MARKER_DENSE);
             for (row_idx, row) in MARKER_BITMAP.iter().enumerate() {

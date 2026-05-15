@@ -13,3 +13,7 @@ output = "../../target/wasm32-unknown-unknown/release/ic.wasm"
 
 [materials]
 file = "materials.toml"
+
+[audio]
+patches = "audio/patches.toml"
+songs   = "audio/songs"

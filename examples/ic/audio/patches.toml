@@ -1,0 +1,467 @@
+# ic audio patches — see SPEC.md §5.1 / §12.6.3.
+#
+# Title-screen "Firefighter Theme" routes its 11 melodic MIDI
+# channels through 11 distinct synth voices so each instrument has
+# its own colour. Drums (channel 10 / 0-indexed 9) bypass this
+# table — the host kit handles them.
+#
+# Channel → patch routing lives in `src/audio.rs::init_title_music`:
+#
+#   MIDI ch  Track                    Patch slot   Voice
+#   ────────────────────────────────────────────────────────────
+#    1       Bass: Acoustic Piano     0  tri_sub      pure triangle sub
+#    2       Bass: Organ              1  saw_bass     growly saw bass
+#    3       Bass: Guitar (clean)     2  pluck_bass   plucked square bass
+#    4       Bass: Bass               3  square_bass  round square bass
+#    5       Synth: Electric Piano    4  square_lead  bright square lead
+#    6       Synth: Guitar (clean)    5  saw_lead     saw lead w/ bite
+#    7       Synth: Strings           6  string_pad   slow-attack pad
+#    8       Synth: Brass             7  brass        punchy saw stab
+#   10       Synth: Reed              8  reed         square w/ filter env
+#   11       Synth: Synth Lead        9  sine_lead    pure sine
+#   12       Synth: Singing Voice    10  voice_lead   pulse w/ vibrato
+
+# ── 0  tri_sub — sub-octave triangle bass ────────────────────────
+
+[[patch]]
+slot = 0
+name = "tri_sub"
+kind = "synth"
+
+[patch.osc1]
+mode   = "triangle"
+level  = 127
+octave = -1
+
+[patch.osc2]
+mode         = "triangle"
+detune_cents = 4
+level        = 80
+octave       = -1
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 1800
+resonance = 10
+
+[patch.amp_env]
+attack_ms  = 4
+decay_ms   = 140
+sustain    = 95
+release_ms = 90
+
+
+# ── 1  saw_bass — growly low saw bass ────────────────────────────
+
+[[patch]]
+slot = 1
+name = "saw_bass"
+kind = "synth"
+
+[patch.osc1]
+mode   = "saw"
+level  = 110
+octave = -1
+
+[patch.osc2]
+mode         = "saw"
+detune_cents = 7
+level        = 80
+octave       = -1
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 900
+resonance = 40
+
+[patch.amp_env]
+attack_ms  = 3
+decay_ms   = 130
+sustain    = 80
+release_ms = 70
+
+[patch.filter_env]
+attack_ms  = 3
+decay_ms   = 160
+sustain    = 30
+release_ms = 80
+depth      = 40
+
+
+# ── 2  pluck_bass — short square bass with sharp filter pluck ────
+
+[[patch]]
+slot = 2
+name = "pluck_bass"
+kind = "synth"
+
+[patch.osc1]
+mode   = "square"
+level  = 120
+octave = -1
+
+[patch.osc2]
+mode         = "saw"
+detune_cents = -5
+level        = 50
+octave       = -1
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 1500
+resonance = 55
+
+[patch.amp_env]
+attack_ms  = 2
+decay_ms   = 90
+sustain    = 60
+release_ms = 60
+
+[patch.filter_env]
+attack_ms  = 1
+decay_ms   = 80
+sustain    = 15
+release_ms = 60
+depth      = 60
+
+
+# ── 3  square_bass — rounded square mid-bass ─────────────────────
+
+[[patch]]
+slot = 3
+name = "square_bass"
+kind = "synth"
+
+[patch.osc1]
+mode   = "square"
+level  = 110
+octave = -1
+
+[patch.osc2]
+mode         = "triangle"
+detune_cents = 6
+level        = 70
+octave       = -1
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 1300
+resonance = 20
+
+[patch.amp_env]
+attack_ms  = 3
+decay_ms   = 150
+sustain    = 85
+release_ms = 80
+
+
+# ── 4  square_lead — bright detuned square lead (main melody) ────
+
+[[patch]]
+slot = 4
+name = "square_lead"
+kind = "synth"
+
+[patch.osc1]
+mode  = "square"
+level = 120
+
+[patch.osc2]
+mode         = "square"
+detune_cents = -7
+level        = 60
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 5500
+resonance = 20
+
+[patch.amp_env]
+attack_ms  = 4
+decay_ms   = 120
+sustain    = 80
+release_ms = 120
+
+[patch.filter_env]
+attack_ms  = 2
+decay_ms   = 220
+sustain    = 50
+release_ms = 120
+depth      = 40
+
+[patch.lfo]
+rate_hz = 5
+shape   = "sine"
+target  = "pitch"
+depth   = 3
+
+
+# ── 5  saw_lead — saw-dominant lead with extra harmonics ─────────
+
+[[patch]]
+slot = 5
+name = "saw_lead"
+kind = "synth"
+
+[patch.osc1]
+mode  = "saw"
+level = 110
+
+[patch.osc2]
+mode         = "square"
+detune_cents = 10
+level        = 55
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 3800
+resonance = 30
+
+[patch.amp_env]
+attack_ms  = 5
+decay_ms   = 180
+sustain    = 75
+release_ms = 110
+
+[patch.filter_env]
+attack_ms  = 4
+decay_ms   = 220
+sustain    = 35
+release_ms = 100
+depth      = 55
+
+[patch.lfo]
+rate_hz = 4
+shape   = "sine"
+target  = "pitch"
+depth   = 2
+
+
+# ── 6  string_pad — slow-attack square pad (strings) ─────────────
+
+[[patch]]
+slot = 6
+name = "string_pad"
+kind = "synth"
+
+[patch.osc1]
+mode  = "square"
+level = 100
+
+[patch.osc2]
+mode         = "square"
+detune_cents = 12
+level        = 80
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 2400
+resonance = 18
+
+[patch.amp_env]
+attack_ms  = 30
+decay_ms   = 180
+sustain    = 90
+release_ms = 120
+
+[patch.filter_env]
+attack_ms  = 40
+decay_ms   = 240
+sustain    = 60
+release_ms = 120
+depth      = 30
+
+[patch.lfo]
+rate_hz = 3
+shape   = "sine"
+target  = "pitch"
+depth   = 3
+
+
+# ── 7  brass — punchy saw brass stab ─────────────────────────────
+
+[[patch]]
+slot = 7
+name = "brass"
+kind = "synth"
+
+[patch.osc1]
+mode  = "saw"
+level = 115
+
+[patch.osc2]
+mode         = "saw"
+detune_cents = 12
+level        = 75
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 3000
+resonance = 35
+
+[patch.amp_env]
+attack_ms  = 8
+decay_ms   = 200
+sustain    = 70
+release_ms = 100
+
+[patch.filter_env]
+attack_ms  = 6
+decay_ms   = 280
+sustain    = 30
+release_ms = 100
+depth      = 70
+
+
+# ── 8  reed — square with breathy filter sweep ──────────────────
+
+[[patch]]
+slot = 8
+name = "reed"
+kind = "synth"
+
+[patch.osc1]
+mode  = "square"
+level = 110
+
+[patch.osc2]
+mode         = "triangle"
+detune_cents = -8
+level        = 70
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 2600
+resonance = 40
+
+[patch.amp_env]
+attack_ms  = 18
+decay_ms   = 200
+sustain    = 80
+release_ms = 110
+
+[patch.filter_env]
+attack_ms  = 22
+decay_ms   = 250
+sustain    = 50
+release_ms = 110
+depth      = 45
+
+[patch.lfo]
+rate_hz = 6
+shape   = "sine"
+target  = "pitch"
+depth   = 4
+
+
+# ── 9  sine_lead — pure sine lead (highest, very clean) ──────────
+
+[[patch]]
+slot = 9
+name = "sine_lead"
+kind = "synth"
+
+[patch.osc1]
+mode  = "sine"
+level = 127
+
+[patch.osc2]
+mode         = "sine"
+detune_cents = 4
+level        = 60
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 8000
+resonance = 5
+
+[patch.amp_env]
+attack_ms  = 6
+decay_ms   = 140
+sustain    = 85
+release_ms = 130
+
+[patch.lfo]
+rate_hz = 5
+shape   = "sine"
+target  = "pitch"
+depth   = 4
+
+
+# ── 10  voice_lead — pulse with vibrato (vocal-ish) ─────────────
+
+[[patch]]
+slot = 10
+name = "voice_lead"
+kind = "synth"
+
+[patch.osc1]
+mode  = "square"
+level = 110
+
+[patch.osc2]
+mode         = "saw"
+detune_cents = 6
+level        = 60
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 2200
+resonance = 30
+
+[patch.amp_env]
+attack_ms  = 20
+decay_ms   = 200
+sustain    = 88
+release_ms = 130
+
+[patch.filter_env]
+attack_ms  = 25
+decay_ms   = 240
+sustain    = 60
+release_ms = 130
+depth      = 40
+
+[patch.lfo]
+rate_hz = 5
+shape   = "sine"
+target  = "pitch"
+depth   = 6
+
+
+# ── 11  thunder — filtered noise rumble for the title bolt ──────
+#
+# Triggered once per title-screen lightning strike. Noise through a
+# very-low LP filter reads as a distant rumble; the slow filter env
+# adds a "crack → roll" arc so it doesn't feel like flat static.
+
+[[patch]]
+slot = 11
+name = "thunder"
+kind = "synth"
+
+[patch.osc1]
+mode  = "noise"
+level = 127
+
+[patch.osc2]
+mode  = "noise"
+level = 0
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 600
+resonance = 25
+
+[patch.amp_env]
+attack_ms  = 10
+decay_ms   = 700
+sustain    = 0
+release_ms = 400
+
+[patch.filter_env]
+attack_ms  = 5
+decay_ms   = 600
+sustain    = 0
+release_ms = 400
+depth      = 80

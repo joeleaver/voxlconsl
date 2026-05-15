@@ -41,9 +41,19 @@ impl Cursor {
         Self { x, z, actor: None }
     }
 
+    /// Reposition the cursor without disturbing its host actor.
+    /// Used by `lib::restart_season()` so the actor allocated on
+    /// first boot is reused across endless restarts.
+    pub(crate) fn set_focus(&mut self, x: f32, z: f32) {
+        self.x = x;
+        self.z = z;
+    }
+
     /// Register the reticle prefab and spawn a Billboard actor for
-    /// the cursor. Called once after the world is built.
+    /// the cursor. Called once after the world is built. Idempotent
+    /// — endless-mode restarts call this again, but the actor stays.
     pub(crate) fn init(&mut self) {
+        if self.actor.is_some() { return; }
         unsafe {
             // Convert the row-major bitmap into the prefab's
             // (x, y, z) layout. Bitmap row 0 (top of glyph) should

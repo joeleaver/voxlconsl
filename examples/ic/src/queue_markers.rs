@@ -84,6 +84,24 @@ impl QueueMarkers {
     }
 
     pub(crate) fn init(&mut self) {
+        // Idempotent: endless-mode restart calls this again. Just
+        // hide existing markers and clear caches, actors stay.
+        if self.water_actors[0].is_some() {
+            for slot in self.water_actors.iter()
+                .chain(self.line_actors.iter())
+                .chain(self.tanker_req_actors.iter())
+                .chain(self.hotshot_actors.iter())
+                .chain(self.engine_actors.iter())
+            {
+                if let Some(id) = slot { actor_set_visible(*id, false); }
+            }
+            self.water_cache = [None; MARKERS_PER_TYPE];
+            self.line_cache = [None; MARKERS_PER_TYPE];
+            self.tanker_req_cache = [None; MARKERS_PER_TYPE];
+            self.hotshot_cache = [None; MARKERS_PER_TYPE];
+            self.engine_cache = [None; MARKERS_PER_TYPE];
+            return;
+        }
         // All badge types share the same blank prefab template;
         // each actor's volume is painted on demand when its slot
         // becomes visible.

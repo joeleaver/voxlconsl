@@ -9,8 +9,8 @@ use voxlconsl_sdk::physics;
 
 use crate::rng::Rng;
 use crate::{
-    M_CABIN_ROOF, M_CABIN_WOOD, M_DIRT, M_FIRE, M_GRASS, M_HELI_PAD,
-    M_PINE_LEAVES, M_PINE_WOOD, M_ROAD_DIRT, M_STONE, M_WATER,
+    M_CABIN_ROOF, M_CABIN_WOOD, M_DIRT, M_GRASS, M_HELI_PAD,
+    M_PINE_LEAVES, M_PINE_WOOD, M_ROAD_DIRT, M_STONE,
 };
 
 // ── Footprint ─────────────────────────────────────────────────────
@@ -147,7 +147,10 @@ fn paint_lake() {
             // doesn't leave a floating grass cap.
             fill_box(UVec3::new(x, 0, z), UVec3::new(x, level - 2, z), M_STONE);
             set_voxel(UVec3::new(x, level - 1, z), M_DIRT);
-            set_voxel(UVec3::new(x, level, z), M_WATER);
+            // M_LAKE_WATER instead of M_WATER so the cart's
+            // water.rs evaporation sweep (which only clears
+            // M_WATER) can't accidentally drain the lake.
+            set_voxel(UVec3::new(x, level, z), crate::M_LAKE_WATER);
             fill_box(UVec3::new(x, level + 1, z), UVec3::new(x, 24, z), 0);
         }
     }
@@ -298,18 +301,20 @@ fn forbidden_for_pine(x: u32, z: u32) -> bool {
 
 // ── Cabin survival check ──────────────────────────────────────────
 
-/// Lightning strike: search for a flammable cell near the given XZ
-/// and ignite it. Returns the ignited cell on success, or `None`
-/// when the strike landed on bare grass / lake / road / town with
-/// no flammable column nearby — the strike is wasted, no fire
-/// starts. Caller (season.rs) accounts for the strike budget either
-/// way, so a "dud" still counts.
-pub(crate) fn strike_at(target_x: u32, target_z: u32) -> Option<UVec3> {
-    // Scan a 16-cell box around the target XZ for any flammable cell
-    // (canopy or trunk). The dy range only covers the realistic pine
-    // canopy zone (terrain_height + 1..10) — pines are 5-8 voxels
-    // tall, so anything above dy=10 is empty air, anything below is
-    // ground.
+/// Lightning strike target search: scan a box around the requested
+/// XZ for the first flammable cell (canopy or trunk). Returns the
+/// candidate ignition cell + its current material on success, or
+/// `None` when the strike landed on bare grass / lake / road / town
+/// with no flammable column nearby — `lightning.rs` treats that as
+/// a natural dud. The material is the cell's pre-ignition slot so
+/// `fire.rs` can pick a per-material burn TTL.
+///
+/// Pure search — no world mutation. The caller (lightning.rs) sets
+/// the cell to M_FIRE once the bolt flash ends.
+pub(crate) fn find_strike_target(target_x: u32, target_z: u32) -> Option<(UVec3, u8)> {
+    // dy range covers the realistic pine canopy zone
+    // (terrain_height + 1..10) — pines are 5-8 voxels tall, so
+    // anything above dy=10 is empty air, anything below is ground.
     const RADIUS: i32 = 16;
     for dy in 1..10 {
         for dz in -RADIUS..=RADIUS {
@@ -319,8 +324,7 @@ pub(crate) fn strike_at(target_x: u32, target_z: u32) -> Option<UVec3> {
                 let y = (terrain_height(x, z) as i32 + dy).clamp(0, 250) as u32;
                 let m = physics::material_at(x, y, z);
                 if m == M_PINE_LEAVES || m == M_PINE_WOOD {
-                    set_voxel(UVec3::new(x, y, z), M_FIRE);
-                    return Some(UVec3::new(x, y, z));
+                    return Some((UVec3::new(x, y, z), m));
                 }
             }
         }

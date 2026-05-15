@@ -86,6 +86,10 @@ pub(crate) struct FireEngine {
 }
 
 impl FireEngine {
+    pub(crate) fn despawn_actor(&self) {
+        actor_despawn(self.actor);
+    }
+
     pub(crate) fn init(spawn_x: u32, spawn_z: u32) -> Self {
         let actor = actor_spawn().expect("engine actor pool full");
         let y = terrain_height(spawn_x, spawn_z) as f32;
@@ -229,12 +233,17 @@ impl FireEngine {
                 let z = z as u32;
                 if x >= FOOT_MAX || z >= FOOT_MAX { continue; }
                 let h = terrain_height(x, z);
-                // Sweep a 4-voxel column above terrain — catches
-                // fire sitting on flammable tree tops too, not just
-                // surface-level burns.
-                for y in h..h + 4 {
+                // Sweep the full column above terrain — pines
+                // reach `terrain + 8`, so a 4-cell sweep leaves the
+                // upper canopy burning. With the cart-side long-burn
+                // loop holding each fire cell alight for 6-15 s,
+                // missed cells reignite spread instead of going out.
+                for y in h..h + 10 {
                     let m = physics::material_at(x, y, z);
-                    if m == M_FIRE || m == M_EMBER {
+                    if m == M_FIRE {
+                        crate::extinguish_fire_cell(UVec3::new(x, y, z));
+                        any = true;
+                    } else if m == M_EMBER {
                         set_voxel(UVec3::new(x, y, z), 0);
                         any = true;
                     }

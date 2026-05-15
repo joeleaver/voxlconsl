@@ -41,6 +41,7 @@
 use voxlconsl_sdk::*;
 
 mod action_wheel;
+mod audio;
 mod balance;
 mod camera;
 mod cursor;
@@ -48,6 +49,7 @@ mod engine;
 mod fire;
 mod hotshot;
 mod hud;
+mod lightning;
 mod line_mode;
 mod mathlib;
 mod queue_markers;
@@ -57,7 +59,9 @@ mod scenario;
 mod season;
 mod story;
 mod terrain;
+mod title;
 mod units;
+mod water;
 
 // ── Material slots (mirror materials.toml) ───────────────────────
 
@@ -97,6 +101,12 @@ pub(crate) const M_HOTSHOT_HELMET:   u8 = 36;
 pub(crate) const M_PLANNED_HOTSHOT:  u8 = 37;
 pub(crate) const M_ENGINE_BODY:      u8 = 38;
 pub(crate) const M_ENGINE_HOSE:      u8 = 39;
+pub(crate) const M_TITLE_FLAME:      u8 = 40;
+pub(crate) const M_SCORCH:           u8 = 41;
+pub(crate) const M_TITLE_MENU:       u8 = 42;
+pub(crate) const M_TITLE_MENU_BG:    u8 = 43;
+pub(crate) const M_TITLE_LIGHTNING:  u8 = 44;
+pub(crate) const M_LAKE_WATER:       u8 = 45;
 
 // ── Season tuning ────────────────────────────────────────────────
 //
@@ -114,13 +124,28 @@ const MISSION_SEED: u32 = 0xA1F0_5E57;
 /// for the full table.
 const MISSION_TIER: u8 = 2;
 
-/// Story-mode level selector. `Some(N)` boots into `story::LEVELS[N]`
-/// (seed/tier/days from the level table). `None` plays endless mode
-/// from `MISSION_SEED` + `MISSION_TIER` + `DAYS_PER_SEASON`.
-///
-/// This is the placeholder mechanism while the in-game level selector
-/// hasn't been built — set the const here at compile time and rebuild.
-const STORY_LEVEL: Option<usize> = None;
+/// Story-mode level the title-screen menu selects when the player
+/// picks "STORY MODE". Future work: in-cart level grid that lets the
+/// player choose any unlocked entry; for v0 we just boot the first
+/// level when story is picked.
+const STORY_FIRST_LEVEL: usize = 0;
+
+/// Scene ids — title runs in scene 0, gameplay in scene 1. Switching
+/// to scene 1 in `start_game()` leaves the title voxels behind in
+/// scene 0 so we never have to repaint or clear them on transition.
+const SCENE_TITLE: SceneId = SceneId(0);
+const SCENE_GAME:  SceneId = SceneId(1);
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum GameMode {
+    /// Title screen is showing. The gameplay world hasn't been built.
+    Title,
+    /// Gameplay world is live. Title state has been torn down.
+    Playing,
+}
+
+static mut GAME_MODE: GameMode = GameMode::Title;
+static mut TITLE: title::Title = title::Title::new();
 
 /// Runtime balance-mode flag. Set true by `init()` when an external
 /// harness (e.g. `voxlconsl balance`) supplies a scenario override
@@ -134,6 +159,34 @@ static mut BALANCE_MODE_FLAG: bool = false;
 #[inline]
 fn balance_mode() -> bool { unsafe { BALANCE_MODE_FLAG } }
 
+/// Snuff a fire cell. Drops the matching cart-side burn-site entry
+/// (so `FireState::tick` won't restock M_FIRE on the next frame) and
+/// clears the voxel to air. Use this from any unit-side code that
+/// would otherwise call `set_voxel(p, 0)` on a fire cell — the
+/// cart-side long-burn loop in `fire.rs` would undo a plain
+/// `set_voxel` snuff on the very next tick.
+pub(crate) fn extinguish_fire_cell(pos: UVec3) {
+    unsafe {
+        let fire = &mut *(&raw mut FIRE_STATE);
+        fire.drop_burn_site(pos);
+    }
+    set_voxel(pos, 0);
+}
+
+/// Drop water at `pos` and register it for cart-side TTL expiry.
+/// Uses `M_WATER` (the standard liquid material) so the drop flows
+/// naturally via the §10.3 CA. The lake uses `M_LAKE_WATER` (a
+/// separate static slot) so the evaporation sweep in `water.rs`
+/// can flood-fill-clear all connected `M_WATER` cells without any
+/// risk of draining the lake.
+pub(crate) fn place_water(pos: UVec3) {
+    set_voxel(pos, M_WATER);
+    unsafe {
+        let w = &mut *(&raw mut WATER);
+        w.mark(pos);
+    }
+}
+
 // ── Game state ───────────────────────────────────────────────────
 
 // `Phase` was the per-mission state machine — replaced by
@@ -146,11 +199,26 @@ static mut FIRE_SITES_LAST: u32 = 0;
 static mut BAL: balance::BalanceLog = balance::BalanceLog::new();
 static mut SEASON: Option<season::Season> = None;
 
+/// Endless mode replays seasons forever with a fresh random map each
+/// time. Story mode runs one fixed season. Set in `start_game_from_menu`.
+static mut IS_ENDLESS: bool = false;
+/// Count of seasons the player has resolved (won or lost) in the
+/// current endless run. Used for the summary screen + naming.
+static mut SEASONS_COMPLETED: u32 = 0;
+/// xorshift32 state for picking the next-season seed in endless mode.
+/// Seeded from the first season's seed; each restart advances it.
+static mut ENDLESS_RNG: u32 = 0;
+/// True between "season ended" and "player pressed J to start next".
+/// While set, the cart freezes gameplay and displays the summary banner.
+static mut AWAITING_NEXT_SEASON: bool = false;
+
 static mut CAMERA: camera::Camera = camera::Camera::new(0.0, 0.0);
 static mut CURSOR: cursor::Cursor = cursor::Cursor::new(0.0, 0.0);
 static mut FIRE_STATE: fire::FireState = fire::FireState::new();
 static mut HUD: hud::Hud = hud::Hud::new();
+static mut LIGHTNING: lightning::Lightning = lightning::Lightning::new();
 static mut ROSTER: Option<units::Roster> = None;
+static mut WATER: water::WaterTracker = water::WaterTracker::new();
 
 // ── Action handles ───────────────────────────────────────────────
 
@@ -225,28 +293,62 @@ pub extern "C" fn init() {
     // give the terrain depth from the high overhead view.
     light_set_sun(Vec3::new(-0.5, -0.6, 0.6), 0, 0);
 
-    // Pick a scenario seed + tier and lock them in before any
-    // world / fire / roster initialisation reads from them. Priority:
-    //   1. Balance-harness override (CLI `voxlconsl balance`): forces
-    //      a specific seed+tier and turns on BALANCE_MODE_FLAG.
-    //   2. Story-mode level (compile-time `STORY_LEVEL` const).
-    //   3. Endless mode (compile-time `MISSION_SEED` + `MISSION_TIER`).
-    let (mission_seed, mission_tier, season_days) = match balance_get_scenario_override() {
-        Some((seed, tier)) => {
-            unsafe { BALANCE_MODE_FLAG = true; }
-            (seed, tier, season::DAYS_PER_SEASON)
-        }
-        None => match STORY_LEVEL.and_then(|i| story::LEVELS.get(i)) {
-            Some(level) => (level.seed, level.tier, level.days),
-            None        => (MISSION_SEED, MISSION_TIER, season::DAYS_PER_SEASON),
-        },
-    };
+    register_actions();
+
+    // Balance-harness override (CLI `voxlconsl balance`) skips the
+    // title screen entirely — it needs the gameplay world up and the
+    // CSV log emitted from the first frame.
+    if let Some((seed, tier)) = balance_get_scenario_override() {
+        unsafe { BALANCE_MODE_FLAG = true; }
+        start_game_with(seed, tier, season::DAYS_PER_SEASON);
+        return;
+    }
+
+    // Normal boot: drop into the title scene. The gameplay world
+    // doesn't exist yet — start_game() builds it once the menu picks
+    // story / endless.
+    scene_set_active(SCENE_TITLE);
+    // Title needs the full framebuffer (no sidebar reservation).
+    viewport_set(0, 0, 256, 144);
+    unsafe { (&mut *(&raw mut TITLE)).init(); }
+}
+
+/// Build the gameplay world for the given mission params and switch
+/// `GAME_MODE` to `Playing`. Called from the title-screen confirm
+/// handler, the balance-harness boot path, and `restart_season()`
+/// in endless mode. The function is idempotent — second-and-later
+/// calls reuse the existing actors (via per-module idempotent init)
+/// and clear the stale voxels in the playable area before repainting.
+fn start_game_with(mission_seed: u32, mission_tier: u8, season_days: u8) {
     scenario::init(mission_seed, mission_tier);
+
+    scene_set_active(SCENE_GAME);
 
     // Reserve the left 36 pixels of the framebuffer for the
     // sidebar: the world ray-march skips that strip entirely.
     // World viewport = (36, 0, 220, 144).
     viewport_set(36, 0, 220, 144);
+
+    // Clear the playable footprint so endless-mode restart doesn't
+    // leave stale terrain / trees / fire / water from the prior
+    // season behind. Y goes up to 30 — tallest pine top is ~24 and
+    // we leave some headroom for stray fire/ember voxels.
+    fill_box(
+        UVec3::new(terrain::FOOT_MIN, 0, terrain::FOOT_MIN),
+        UVec3::new(terrain::FOOT_MAX - 1, 30, terrain::FOOT_MAX - 1),
+        0,
+    );
+
+    // Reset cart-side state that's keyed to the previous season.
+    // Static `Option`s with const-fn `new()` get wiped fully; HUD-
+    // adjacent modules with actors reset via their idempotent init
+    // calls below.
+    unsafe {
+        FIRE_STATE = fire::FireState::new();
+        WATER = water::WaterTracker::new();
+        INTERACTION = InteractionMode::Idle;
+        FIRE_SITES_LAST = 0;
+    }
 
     terrain::paint_world();
 
@@ -254,17 +356,28 @@ pub extern "C" fn init() {
     let focus_z = terrain::HELI_PAD_Z as f32 - 20.0;
     unsafe {
         CAMERA = camera::Camera::new(focus_x, focus_z);
-        CURSOR = cursor::Cursor::new(focus_x, focus_z - 8.0);
+        // Reposition cursor in-place (not via `= Cursor::new(..)`) so
+        // its actor allocated on first boot is preserved across an
+        // endless-mode restart.
+        (&mut *(&raw mut CURSOR)).set_focus(focus_x, focus_z - 8.0);
+        // Tear down the prior season's units before spawning fresh
+        // ones — without this each endless-mode restart leaks the
+        // unit actors (heli + crews + engines + transient tankers /
+        // hotshots / planes / parachutes), exhausting the 256-actor
+        // host pool after a few rounds.
+        if let Some(r) = (&mut *(&raw mut ROSTER)).as_mut() {
+            r.teardown();
+        }
         let s = scenario::get();
         ROSTER = Some(units::Roster::init(
             s.heli_count, s.crew_count, s.hotshot_count, s.engine_count,
         ));
-        register_actions();
         (&mut *(&raw mut HUD)).init();
         (&mut *(&raw mut CURSOR)).init();
         (&mut *(&raw mut LINE_MODE)).init();
         (&mut *(&raw mut QUEUE_MARKERS)).init();
         (&mut *(&raw mut ACTION_WHEEL)).init();
+        (&mut *(&raw mut LIGHTNING)).init(s.seed);
         units::init_tanker_prefabs();
         hotshot::init_drop_plane_prefab();
         hotshot::init_scatter_rng(s.seed);
@@ -273,8 +386,7 @@ pub extern "C" fn init() {
     unsafe {
         // Season state machine — drives day timer + lightning strikes
         // from now on. No initial fire seed; the first lightning of
-        // day 1 provides the first incident. Day count comes from the
-        // story-mode level table when STORY_LEVEL is set.
+        // day 1 provides the first incident.
         SEASON = Some(season::Season::new_with_days(mission_seed, season_days));
         let fire = &mut *(&raw mut FIRE_STATE);
         if let Some(s) = &*(&raw const SEASON) {
@@ -285,6 +397,59 @@ pub extern "C" fn init() {
     if balance_mode() {
         unsafe { (&*(&raw const BAL)).emit_header(); }
     }
+
+    unsafe {
+        (&mut *(&raw mut TITLE)).teardown();
+        GAME_MODE = GameMode::Playing;
+    }
+    // Title's sunset gradient is global — restore the smoky-blue
+    // gameplay sky now that we're leaving the title scene.
+    sky_set_gradient(
+        Material::pack_color(7, 1),
+        Material::pack_color(6, 2),
+    );
+}
+
+/// Endless-mode restart: pick a fresh seed from `ENDLESS_RNG`,
+/// rebuild the world, bump the season counter. Called from the
+/// update loop on the J/U press that dismisses the summary screen.
+fn restart_season() {
+    unsafe {
+        SEASONS_COMPLETED += 1;
+        // xorshift32 on ENDLESS_RNG → next-season seed.
+        let mut x = ENDLESS_RNG;
+        if x == 0 { x = 0xCAFE_BABE; }
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        ENDLESS_RNG = x;
+        AWAITING_NEXT_SEASON = false;
+    }
+    let seed = unsafe { ENDLESS_RNG };
+    start_game_with(seed, MISSION_TIER, season::DAYS_PER_SEASON);
+}
+
+/// Translate a menu pick (`title::PICK_STORY` / `title::PICK_ENDLESS`)
+/// into mission params and bring up the world.
+fn start_game_from_menu(pick: u8) {
+    let endless = pick != title::PICK_STORY;
+    let (seed, tier, days) = if endless {
+        // Endless mode: seed from MISSION_SEED but every restart will
+        // advance via xorshift on ENDLESS_RNG.
+        (MISSION_SEED, MISSION_TIER, season::DAYS_PER_SEASON)
+    } else {
+        match story::LEVELS.get(STORY_FIRST_LEVEL) {
+            Some(level) => (level.seed, level.tier, level.days),
+            None        => (MISSION_SEED, MISSION_TIER, season::DAYS_PER_SEASON),
+        }
+    };
+    unsafe {
+        IS_ENDLESS = endless;
+        SEASONS_COMPLETED = 0;
+        ENDLESS_RNG = if seed == 0 { 0xCAFE_BABE } else { seed };
+        AWAITING_NEXT_SEASON = false;
+    }
+    start_game_with(seed, tier, days);
 }
 
 fn register_actions() {
@@ -445,6 +610,57 @@ pub extern "C" fn update(dt_ms: u32) {
     let (ax, ay) = input_action_axis2d(unsafe { AIM_ACTION });
     let zoom = input_action_axis1d(unsafe { ZOOM_ACTION });
 
+    // Title screen takes the whole update loop until the user picks
+    // a mode. Edge-detect W (+my) and S (-my) off the pan axis so the
+    // title can navigate without competing with the gameplay wheel.
+    if unsafe { GAME_MODE == GameMode::Title } {
+        let (_mx_prev, my_prev) = unsafe { PAN_PREV };
+        let edge_w = my >=  NAV_THRESHOLD && my_prev <  NAV_THRESHOLD;
+        let edge_s = my <= -NAV_THRESHOLD && my_prev > -NAV_THRESHOLD;
+        unsafe { PAN_PREV = (mx, my); }
+        // Accept both J (PrimaryFire) and U (Confirm) on the title menu.
+        // J is the most-prominent face button in the browser's J/K/U/I
+        // diamond, so players reach for it as the "go" key even though
+        // Confirm is technically bound to U.
+        let confirm = input_action_pressed(unsafe { CONFIRM_ACTION })
+            || input_action_pressed(unsafe { PRIMARY_ACTION });
+        unsafe {
+            let title = &mut *(&raw mut TITLE);
+            title.tick(dt_ms, edge_w, edge_s, confirm);
+            if let Some(pick) = title.confirmed() {
+                start_game_from_menu(pick);
+            }
+        }
+        return;
+    }
+
+    // Endless-mode summary screen: in endless mode, when the season
+    // resolves (won or lost) we hold the world frozen and wait for
+    // J/U to start the next season with a fresh map. Detect the
+    // resolve at the top of each frame so a single check covers
+    // both the SeasonWon path (advance_day) and the SeasonLost path
+    // (check_end_conditions).
+    let season_resolved = unsafe {
+        (&*(&raw const SEASON))
+            .as_ref()
+            .map(|s| s.state != season::SeasonState::DayActive)
+            .unwrap_or(false)
+    };
+    if season_resolved && unsafe { IS_ENDLESS && !AWAITING_NEXT_SEASON } {
+        unsafe { AWAITING_NEXT_SEASON = true; }
+    }
+    if unsafe { AWAITING_NEXT_SEASON } {
+        let confirm = input_action_pressed(unsafe { CONFIRM_ACTION })
+            || input_action_pressed(unsafe { PRIMARY_ACTION });
+        if confirm {
+            restart_season();
+            return;
+        }
+        // Fall through: gameplay is gated by `season_active` later,
+        // so it's already skipped. The post-update HUD paint at the
+        // bottom of update() keeps the summary banner visible.
+    }
+
     let cam = unsafe { &mut *(&raw mut CAMERA) };
     let cur = unsafe { &mut *(&raw mut CURSOR) };
 
@@ -519,6 +735,7 @@ pub extern "C" fn update(dt_ms: u32) {
             let fire = &mut *(&raw mut FIRE_STATE);
             fire.tick();
             FIRE_SITES_LAST = fire.burn_site_count();
+            (&mut *(&raw mut WATER)).tick();
             if let Some(roster) = &mut *(&raw mut ROSTER) {
                 roster.tick();
                 let markers = &mut *(&raw mut QUEUE_MARKERS);
@@ -535,7 +752,9 @@ pub extern "C" fn update(dt_ms: u32) {
             let incident_active = {
                 let fire = &*(&raw const FIRE_STATE);
                 let roster = (&*(&raw const ROSTER)).as_ref();
+                let lightning = &*(&raw const LIGHTNING);
                 fire.burn_site_count() > 0
+                    || lightning.flashing()
                     || roster.map(|r| {
                         r.queue.pending_total() > 0
                             || r.heli_busy() > 0
@@ -549,11 +768,15 @@ pub extern "C" fn update(dt_ms: u32) {
                 .as_mut()
                 .and_then(|s| s.tick(dt_ms, incident_active));
 
+            let lightning = &mut *(&raw mut LIGHTNING);
             if let Some((sx, sz)) = strike {
-                if let Some(p) = terrain::strike_at(sx, sz) {
-                    let fire = &mut *(&raw mut FIRE_STATE);
-                    fire.add_burn_site(p);
-                }
+                // Bolt flashes immediately; ignition (if any) is
+                // deferred until tick() reports the flash ended.
+                lightning.strike(sx, sz);
+            }
+            if let Some((p, mat)) = lightning.tick(dt_ms) {
+                let fire = &mut *(&raw mut FIRE_STATE);
+                fire.add_burn_site(p, mat);
             }
 
             // Wind sync: SEASON owns the per-day weather. We push the
@@ -663,6 +886,8 @@ unsafe fn build_hud_ctx<'a>(
         weather_glyph,
         season_ended,
         season_won,
+        is_endless:        unsafe { IS_ENDLESS },
+        seasons_completed: unsafe { SEASONS_COMPLETED },
         alive_mask,
         fire_sites:   unsafe { FIRE_SITES_LAST },
         wind_dir,
@@ -690,6 +915,10 @@ unsafe fn build_hud_ctx<'a>(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn render() {
+    if unsafe { GAME_MODE == GameMode::Title } {
+        unsafe { (&*(&raw const TITLE)).render_camera(); }
+        return;
+    }
     unsafe { (&*(&raw const CAMERA)).apply(); }
 }
 

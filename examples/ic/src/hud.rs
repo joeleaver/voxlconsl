@@ -123,7 +123,7 @@ pub(crate) struct Hud {
     /// Banner that appears in the center of the world view when the
     /// season resolves. Hidden during DayActive.
     end_banner:        Option<ActorId>,
-    end_banner_cache:  Option<(bool, u32)>,   // (won, alive_count)
+    end_banner_cache:  Option<(bool, u32, bool, u32)>,   // (won, alive, endless, seasons)
 }
 
 impl Hud {
@@ -140,6 +140,20 @@ impl Hud {
     }
 
     pub(crate) fn init(&mut self) {
+        // Idempotent: if already initialised (endless-mode restart),
+        // just reset caches + hide the banner; actors stay where they
+        // are.
+        if self.actors[0].is_some() {
+            self.status_cache = None;
+            self.unit_cache = None;
+            self.orders_cache = None;
+            self.help_cache = None;
+            self.end_banner_cache = None;
+            if let Some(actor) = self.end_banner {
+                actor_set_visible(actor, false);
+            }
+            return;
+        }
         // Define the shared all-air panel prefab. Every section's
         // actor spawns from this and forks on first set_voxel.
         unsafe {
@@ -188,7 +202,9 @@ impl Hud {
             return;
         }
         let alive = ctx.alive_mask.count_ones();
-        let key = (ctx.season_won, alive);
+        // Cache key includes is_endless + seasons_completed so the
+        // "SEASON N" header repaints between rounds.
+        let key = (ctx.season_won, alive, ctx.is_endless, ctx.seasons_completed);
         if self.end_banner_cache == Some(key) {
             // Already painted this outcome — leave the actor visible
             // and skip the redraw.
@@ -199,13 +215,18 @@ impl Hud {
         actor_set_visible(actor, true);
 
         let mut buf = [b' '; SIDEBAR_LINE_MAX];
-        let header = if ctx.season_won { "SEASON" } else { "SEASON" };
-        let outcome = if ctx.season_won { "SURVIVED" } else { "LOST" };
         // 5 lines centered-ish in the 32×32 banner.
-        paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, header);
+        if ctx.is_endless {
+            // "SEASON N" where N is the just-finished season number.
+            let n = ctx.seasons_completed + 1;
+            let header_str = format_season_header(&mut buf, n);
+            paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, header_str);
+        } else {
+            paint_line(actor, &FONT_TINY, 0, M_HUD_TEXT, "SEASON");
+        }
+        let outcome = if ctx.season_won { "SURVIVED" } else { "LOST" };
         paint_line(actor, &FONT_TINY, 1, M_HUD_TEXT, outcome);
         let s = {
-            // "4/6 ALIVE"
             buf[0] = b'0' + (alive.min(9)) as u8;
             buf[1] = b'/';
             buf[2] = b'6';
@@ -216,7 +237,8 @@ impl Hud {
         paint_line(actor, &FONT_TINY, 2, M_HUD_TEXT, s);
         let hint = if ctx.season_won { "GOOD JOB" } else { "TOWN BURNT" };
         paint_line(actor, &FONT_TINY, 3, M_HUD_TEXT, hint);
-        paint_line(actor, &FONT_TINY, 4, M_HUD_TEXT, "F5 = NEW");
+        let footer = if ctx.is_endless { "J=NEXT" } else { "F5 = NEW" };
+        paint_line(actor, &FONT_TINY, 4, M_HUD_TEXT, footer);
     }
 
     fn paint_status(&mut self, ctx: &HudCtx<'_>) {
@@ -383,6 +405,12 @@ pub(crate) struct HudCtx<'a> {
     pub season_ended:  bool,
     /// Only meaningful when `season_ended` is true. `true` = SeasonWon.
     pub season_won:    bool,
+    /// `true` in endless mode — drives the banner's "PRESS J FOR NEXT
+    /// SEASON" hint vs the story-mode "F5 = NEW" hint.
+    pub is_endless:    bool,
+    /// Number of seasons resolved so far in the current endless run.
+    /// Used in the summary banner for "SEASON N". Always 0 in story.
+    pub seasons_completed: u32,
     pub alive_mask:    u32,
     pub fire_sites:    u32,
     pub wind_dir:      &'a str,
@@ -489,6 +517,26 @@ fn format_fire<'a>(buf: &'a mut [u8], sites: u32) -> &'a str {
     if h > 0 || t > 0 { buf[len] = b'0' + t as u8; len += 1; }
     buf[len] = b'0' + o as u8;
     len += 1;
+    core::str::from_utf8(&buf[..len]).unwrap_or("")
+}
+
+/// "SEASON N" — endless-mode summary banner header. Supports
+/// 1..999; clamps higher seasons to 999 (the player has earned
+/// their bragging rights by then).
+fn format_season_header<'a>(buf: &'a mut [u8], n: u32) -> &'a str {
+    let n = n.min(999);
+    buf[..7].copy_from_slice(b"SEASON ");
+    let mut len = 7;
+    if n >= 100 {
+        buf[len] = b'0' + ((n / 100) % 10) as u8; len += 1;
+        buf[len] = b'0' + ((n / 10) % 10) as u8;  len += 1;
+        buf[len] = b'0' + (n % 10) as u8;         len += 1;
+    } else if n >= 10 {
+        buf[len] = b'0' + ((n / 10) % 10) as u8; len += 1;
+        buf[len] = b'0' + (n % 10) as u8;         len += 1;
+    } else {
+        buf[len] = b'0' + (n % 10) as u8;         len += 1;
+    }
     core::str::from_utf8(&buf[..len]).unwrap_or("")
 }
 

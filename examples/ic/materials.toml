@@ -29,10 +29,13 @@ slot         = 4
 name         = "pine_wood"
 color        = "brown:0"
 flags        = ["flammable"]
-# Was 180 (12 fire-neighbors — impossible; only 6 cardinals exist).
-# 30 = 2 fire neighbors per tick chain a tree's trunk so a single
-# burning leaf adjacent to wood reliably propagates.
-ca_threshold = 30
+# Tuned around the cart-side long-burn loop (see fire.rs). The CA's
+# fire-temp is hard-coded at 15, so heat/tick = 15 × neighbour count.
+# Bumped to 120 (was 30) — 8 ticks single-neighbour, 4 ticks
+# double-neighbour. Slow enough that propagation through a tree's
+# voxels takes seconds, not frames, so the burn_sites cap doesn't
+# saturate from a single ignition and evict its own wavefront.
+ca_threshold = 120
 ignites_to   = 7
 
 [[material]]
@@ -40,12 +43,14 @@ slot         = 5
 name         = "pine_leaves"
 color        = "forest_green:2"
 flags        = ["flammable"]
-# Was 80 originally → 15 (too aggressive: caused total cabin loss
-# in 4-7 s, no time for player response). 45 splits: 3 fire neighbors
-# ignite leaves cleanly, single-neighbor accumulation still works
-# over a few ticks. With narrowed wind this gives ~30 s to first
-# cabin loss.
-ca_threshold = 45
+# Was 80 originally → 15 → 45 → 180. With the long-burn loop holding
+# each lit cell visible for ~6 s, propagation needs to be SLOW so the
+# burn-sites cap (512) doesn't fill in seconds and evict wavefront
+# entries before they finish burning. 180 = 12 ticks at one fire
+# neighbour, 6 ticks at two, 4 ticks at three. With CA fire-life=15
+# ticks, single-neighbour propagation only fires once the source has
+# been burning a while — natural pacing.
+ca_threshold = 180
 ignites_to   = 7
 
 # ── Liquids ───────────────────────────────────────────────────────
@@ -306,3 +311,60 @@ emission = 6
 slot  = 39
 name  = "engine_hose"
 color = "warm_gray:0"
+
+# Title-screen flame — bright yellow at max emission. Red/orange
+# blend into the magenta-and-orange sunset sky too much; the high
+# green channel of yellow:3 (G=232 vs ~100 mid-gradient) makes the
+# flames pop in front of the C. No CA flags so the flame is stable
+# until the heli's drop clears it cell-by-cell.
+[[material]]
+slot     = 40
+name     = "title_flame"
+color    = "yellow:3"
+emission = 15
+
+# Char/scorch mark left on the title-screen "C" as the fire eats it.
+# Darkest cool-gray shade so it reads as a soot stain against the
+# stone-gray body of the letters.
+[[material]]
+slot  = 41
+name  = "scorch"
+color = "cool_gray:0"
+
+# Title menu highlight — saturated cyan, complementary to the warm
+# sunset sky so the selected option pops without competing with the
+# fire/ember palette. Full emission to render at max-brightness
+# shade regardless of light direction (screen-mode actors).
+[[material]]
+slot     = 42
+name     = "title_menu"
+color    = "cyan:3"
+emission = 15
+
+# Dark backing for the selected menu panel — near-black so the
+# bright cyan text and border lines sit on top with maximum
+# contrast against the warm sunset sky behind it.
+[[material]]
+slot  = 43
+name  = "title_menu_bg"
+color = "cool_gray:0"
+
+# Title-screen lightning bolt — bright yellow at max emission so the
+# jagged voxel column reads like a real strike against the dusky
+# sunset sky. Painted for ~220 ms before the fire takes hold.
+[[material]]
+slot     = 44
+name     = "title_lightning"
+color    = "yellow:3"
+emission = 15
+
+# Lake water. Visually identical to dropped water (M_WATER, slot 6)
+# but with NO `liquid` flag — sits permanently in the terrain basin
+# without participating in the §10.3 liquid CA. The cart's
+# water.rs tracker only ever clears M_WATER cells, so isolating the
+# lake into its own slot means the evaporation sweep can never
+# accidentally drain the lake.
+[[material]]
+slot  = 45
+name  = "lake_water"
+color = "cyan:2"
