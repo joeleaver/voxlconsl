@@ -244,6 +244,15 @@ pub fn render_frame(scene: &Scene, camera: &Camera, framebuffer: &mut [u8]) {
                         }
                     }
                 }
+
+                // Macro-grid yields cells front-to-back: anything in
+                // later cells starts at a t ≥ current cell's exit,
+                // which is ≥ any hit we found here. Once we have a
+                // hit, later cells can only contain geometry that's
+                // behind it — safe to stop walking the ray.
+                if closest.is_some() {
+                    break;
+                }
             }
 
             let color = match closest {

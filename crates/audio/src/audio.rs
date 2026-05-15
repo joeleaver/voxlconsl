@@ -35,7 +35,7 @@ pub const BLOCK_FRAMES: usize = 64;
 pub const BLOCK_SAMPLES: usize = BLOCK_FRAMES * 2;
 
 /// Maximum simultaneous voices (§5.2). Shared across MIDI notes + SFX.
-pub const VOICE_POOL_SIZE: usize = 16;
+pub const VOICE_POOL_SIZE: usize = 32;
 
 /// Maximum sample slots per cart (§5.4).
 pub const SAMPLE_SLOTS: usize = 64;

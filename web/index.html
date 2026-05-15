@@ -4,12 +4,13 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <title>voxlconsl</title>
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="style.css?v=mute1">
 </head>
 <body>
     <main>
         <div class="screen-frame">
             <canvas id="screen" width="256" height="144"></canvas>
+            <button id="mute" type="button" aria-label="Mute audio" title="Mute (M)">SOUND</button>
             <div id="status">loading…</div>
         </div>
         <section id="cart-library" aria-label="Cart library"></section>
@@ -52,7 +53,7 @@
             // gracefully), load the main app.
             const s = document.createElement("script");
             s.type = "module";
-            s.src = "main.js?v=cartlibrary1";
+            s.src = "main.js?v=mute2";
             document.body.appendChild(s);
         })();
     </script>

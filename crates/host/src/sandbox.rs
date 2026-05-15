@@ -755,10 +755,15 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), runtime:
     )?;
     linker.func_wrap(
         "env", "aabb_overlap_world",
-        |mut caller: Caller<WorldState>,
+        |caller: Caller<WorldState>,
          min_x: f32, min_y: f32, min_z: f32,
          max_x: f32, max_y: f32, max_z: f32| -> u32 {
-            prepare_for_queries(caller.data_mut());
+            // World voxel reads go directly to each chunk's dense
+            // buffer — the SVO isn't queried — so we don't need to
+            // flush. Skipping `prepare_for_queries` is critical here:
+            // carts that interleave write + read in hot loops (e.g.
+            // ic's fire spread) would otherwise force a full chunk
+            // SVO rebuild on every read.
             crate::physics::aabb_overlap_world(
                 caller.data(),
                 Vec3::new(min_x, min_y, min_z),
@@ -798,8 +803,14 @@ fn register_host_imports(linker: &mut Linker<WorldState>) -> Result<(), runtime:
     )?;
     linker.func_wrap(
         "env", "material_at",
-        |mut caller: Caller<WorldState>, x: u32, y: u32, z: u32| -> u32 {
-            prepare_for_queries(caller.data_mut());
+        |caller: Caller<WorldState>, x: u32, y: u32, z: u32| -> u32 {
+            // `material_at` reads the chunk's dense byte buffer
+            // directly — the SVO isn't consulted — so the flush in
+            // `prepare_for_queries` is wasted work. Skipping it is
+            // critical for carts that interleave set_voxel + material_at
+            // in tight loops (e.g. fire spread): every read otherwise
+            // forced a full chunk SVO rebuild for whatever the previous
+            // write dirtied.
             crate::physics::material_at(caller.data(), x, y, z) as u32
         },
     )?;

@@ -1,8 +1,13 @@
 # voxdude audio patches — see SPEC.md §12.6.3.
 #
-# Two simple synth voices drive every sound effect: a bright square
-# stab for chomps and a rounded saw + filter ping for the bigger
-# events (power pellet, ghost eaten, win).
+# Slots 0–1: SFX patches for chomp + power-pellet / event ping.
+# Slots 2–6: chiptune music patches. The cart's init() does
+# `program_change` on every melodic MIDI channel to route the SMF
+# tracks through one of these five voices. The `Bass:` and `Synth:`
+# prefixes in the source MIDI (from stems2midi's stem-detection)
+# inform which patch each channel is bound to.
+
+# ─── SFX ──────────────────────────────────────────────────────────
 
 [[patch]]
 slot = 0
@@ -64,6 +69,216 @@ depth      = 60
 
 [patch.lfo]
 rate_hz = 5
+shape   = "sine"
+target  = "pitch"
+depth   = 3
+
+
+# ─── Music (chiptune voices) ──────────────────────────────────────
+#
+# tri_bass — rounded triangle sub-bass. Routed to channels that
+# carry low sustained content: Bass: Piano, Bass: Bass, Bass:
+# Strings, Bass: Synth Pad.
+
+[[patch]]
+slot = 2
+name = "tri_bass"
+kind = "synth"
+
+[patch.osc1]
+mode  = "triangle"
+level = 127
+octave = -1
+
+[patch.osc2]
+mode  = "triangle"
+detune_cents = 4
+level = 80
+octave = -1
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 1800
+resonance = 10
+
+[patch.amp_env]
+attack_ms  = 4
+decay_ms   = 140
+sustain    = 95
+release_ms = 90
+
+
+# saw_bass — growly saw-bass for the more aggressive bass content:
+# Bass: Organ, Bass: Guitar, Bass: Synth Lead.
+
+[[patch]]
+slot = 3
+name = "saw_bass"
+kind = "synth"
+
+[patch.osc1]
+mode  = "saw"
+level = 110
+octave = -1
+
+[patch.osc2]
+mode  = "saw"
+detune_cents = 7
+level = 80
+octave = -1
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 900
+resonance = 40
+
+[patch.amp_env]
+attack_ms  = 3
+decay_ms   = 130
+sustain    = 80
+release_ms = 70
+
+[patch.filter_env]
+attack_ms  = 3
+decay_ms   = 160
+sustain    = 30
+release_ms = 80
+depth      = 40
+
+
+# square_lead — bright square lead with chorus-ish detune and a touch
+# of vibrato. Routed to Synth: Synth Lead, Synth: Brass, Synth: Reed.
+
+[[patch]]
+slot = 4
+name = "square_lead"
+kind = "synth"
+
+[patch.osc1]
+mode  = "square"
+level = 120
+
+[patch.osc2]
+mode  = "square"
+detune_cents = -7
+level = 60
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 5500
+resonance = 20
+
+[patch.amp_env]
+attack_ms  = 4
+decay_ms   = 120
+sustain    = 80
+release_ms = 120
+
+[patch.filter_env]
+attack_ms  = 2
+decay_ms   = 220
+sustain    = 50
+release_ms = 120
+depth      = 40
+
+[patch.lfo]
+rate_hz = 5
+shape   = "sine"
+target  = "pitch"
+depth   = 3
+
+
+# saw_lead — saw-driven melodic lead with a small square mix-in for
+# extra harmonics. Routed to Synth: Guitar (clean), Synth: Piano.
+#
+# Release intentionally short (100 ms) so released voices free up
+# fast — the 16-voice pool peaks at 15–16 with longer tails, and the
+# score itself only exceeds 16 simultaneous notes for ~0.1 % of the
+# song. Tightening release here is the cheapest fix.
+
+[[patch]]
+slot = 5
+name = "saw_lead"
+kind = "synth"
+
+[patch.osc1]
+mode  = "saw"
+level = 110
+
+[patch.osc2]
+mode  = "square"
+detune_cents = 10
+level = 55
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 3500
+resonance = 25
+
+[patch.amp_env]
+attack_ms  = 5
+decay_ms   = 180
+sustain    = 75
+release_ms = 100
+
+[patch.filter_env]
+attack_ms  = 4
+decay_ms   = 220
+sustain    = 35
+release_ms = 100
+depth      = 50
+
+[patch.lfo]
+rate_hz = 4
+shape   = "sine"
+target  = "pitch"
+depth   = 2
+
+
+# pad — slow-attack square pad with wider detune and pitch vibrato.
+# Routed to Synth: Strings, Synth: Organ (the sustained polyphonic
+# layers).
+#
+# These are by far the densest tracks (Synth: Strings hits 9 notes
+# simultaneously). Release stays short (90 ms) so released chord
+# voices vacate the 16-voice pool before the next chord arrives.
+# Attack still has a touch of glide so the pad sits *behind* the
+# lead — much shorter and the patch reads as a lead instead.
+
+[[patch]]
+slot = 6
+name = "pad"
+kind = "synth"
+
+[patch.osc1]
+mode  = "square"
+level = 100
+
+[patch.osc2]
+mode  = "square"
+detune_cents = 12
+level = 80
+
+[patch.filter]
+mode      = "lp"
+cutoff    = 2400
+resonance = 18
+
+[patch.amp_env]
+attack_ms  = 30
+decay_ms   = 180
+sustain    = 90
+release_ms = 90
+
+[patch.filter_env]
+attack_ms  = 40
+decay_ms   = 240
+sustain    = 60
+release_ms = 90
+depth      = 30
+
+[patch.lfo]
+rate_hz = 3
 shape   = "sine"
 target  = "pitch"
 depth   = 3

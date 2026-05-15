@@ -99,6 +99,10 @@ async function start() {
     const audioSampleRate = host.audio_sample_rate();
     let audioCtx = null;
     let workletNode = null;
+    let masterGain = null;
+    // Persist mute across reloads so the player isn't surprised by sound
+    // returning after they explicitly silenced it.
+    let muted = localStorage.getItem("voxl.muted") === "1";
 
     // Event-tag table — mirrors `crates/host/src/audio_events.rs` and
     // the `EVT.*` consts in web/audio-worklet.js. Keep all three in
@@ -447,9 +451,59 @@ async function start() {
                 console.error("[audio-worklet] error:", m.error);
             }
         };
-        workletNode.connect(audioCtx.destination);
+        // Master gain sits between the worklet and the destination so
+        // the mute button can flip output without pausing the
+        // AudioContext (resuming a suspended ctx has a ~100 ms cost,
+        // which we don't want every time the player toggles mute).
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = muted ? 0 : 1;
+        workletNode.connect(masterGain);
+        masterGain.connect(audioCtx.destination);
         await audioCtx.resume().catch((err) => console.warn("audio resume failed:", err));
     }
+
+    // ── Mute toggle ─────────────────────────────────────────────────────
+    //
+    // The button is visible from the very first frame; clicking it
+    // before the audio context exists just flips the persisted state
+    // (and the button label), so when the player later clicks the
+    // canvas to start audio the gain node initializes already muted.
+
+    const muteBtn = document.getElementById("mute");
+    function applyMuteState() {
+        if (muteBtn) {
+            muteBtn.classList.toggle("muted", muted);
+            muteBtn.textContent = muted ? "MUTED" : "SOUND";
+            muteBtn.setAttribute("aria-label", muted ? "Unmute audio" : "Mute audio");
+        }
+        if (masterGain) {
+            masterGain.gain.value = muted ? 0 : 1;
+        }
+    }
+    function toggleMute() {
+        muted = !muted;
+        localStorage.setItem("voxl.muted", muted ? "1" : "0");
+        applyMuteState();
+    }
+    applyMuteState();
+    if (muteBtn) {
+        muteBtn.addEventListener("click", (e) => {
+            // Don't let the click bubble to the canvas — that would
+            // also try to grab pointer lock + resume audio, both
+            // unintended side effects of toggling mute.
+            e.stopPropagation();
+            toggleMute();
+        });
+    }
+    window.addEventListener("keydown", (e) => {
+        // Ignore if the user is typing into an input/textarea
+        // somewhere on the page (none today, but cheap to future-proof).
+        const tag = e.target && e.target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA") return;
+        if (e.code === "KeyM" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+            toggleMute();
+        }
+    });
 
     // ── Pointer-lock state ──────────────────────────────────────────────
     //

@@ -169,6 +169,66 @@ impl<'a> Font<'a> {
         let mask = 1u8 << (7 - (bit_index % 8));
         (self.bytes[byte_index] & mask) != 0
     }
+
+    /// Leftmost / rightmost inked columns of a glyph (inclusive).
+    /// Returns `None` for glyphs absent from the font and for fully-empty
+    /// cells (e.g. ASCII space). Used to derive proportional advance
+    /// widths from a fixed-cell bitmap font.
+    pub fn glyph_ink_bounds(&self, codepoint: u32) -> Option<(u8, u8)> {
+        self.glyph_bitmap_off(codepoint)?;
+        let mut left: Option<u8> = None;
+        let mut right: u8 = 0;
+        let mut col: u8 = 0;
+        while col < self.cell_w {
+            let mut any = false;
+            let mut row: u8 = 0;
+            while row < self.cell_h {
+                if self.glyph_bit(codepoint, col, row) {
+                    any = true;
+                    break;
+                }
+                row += 1;
+            }
+            if any {
+                if left.is_none() { left = Some(col); }
+                right = col;
+            }
+            col += 1;
+        }
+        left.map(|l| (l, right))
+    }
+
+    /// Default inter-letter spacing in glyph cells (scale=1). Derived
+    /// from the cell width so a 16-px font gets a 2-px gap and a 4-px
+    /// font still gets at least 1.
+    pub const fn letter_spacing(&self) -> u8 {
+        let s = self.cell_w / 8;
+        if s == 0 { 1 } else { s }
+    }
+
+    /// Pen advance (in glyph cells) after painting this glyph: ink
+    /// width + `letter_spacing()`. Glyphs that aren't in the font (and
+    /// purely-empty cells such as ASCII space) return `cell_w / 2` as a
+    /// reasonable default whitespace width.
+    pub fn glyph_advance(&self, codepoint: u32) -> u32 {
+        match self.glyph_ink_bounds(codepoint) {
+            Some((l, r)) => (r - l + 1) as u32 + self.letter_spacing() as u32,
+            None         => (self.cell_w / 2).max(2) as u32,
+        }
+    }
+
+    /// Cumulative pen offset (in glyph cells) before painting char index
+    /// `char_idx` of `s`. Equivalent to summing `glyph_advance` over the
+    /// preceding chars. Useful when a cart needs to locate the world
+    /// position of a specific character after proportional layout
+    /// (e.g. "where does the 'C' in INCIDENT land?").
+    pub fn pen_offset(&self, s: &str, char_idx: usize) -> u32 {
+        let mut off: u32 = 0;
+        for ch in s.chars().take(char_idx) {
+            off = off.saturating_add(self.glyph_advance(ch as u32));
+        }
+        off
+    }
 }
 
 /// `(col_unit, vert_unit, slice_unit)` — each is a unit vector with
@@ -203,11 +263,22 @@ const fn axis_units(a: Axis) -> (UVec3, UVec3, UVec3) {
 pub fn measure(font: &Font, scale: u8, depth: u32, s: &str) -> U8Vec3 {
     let scale = if scale == 0 { 1 } else { scale } as u32;
     let depth = if depth == 0 { 1 } else { depth };
-    let chars = s.chars().count() as u32;
-    let w = chars * font.cell_w as u32 * scale;
+    // Sum proportional advances; the last char contributes its ink
+    // width with no trailing letter-spacing.
+    let mut w: u32 = 0;
+    let mut last_trailing: u32 = 0;
+    for ch in s.chars() {
+        let adv = font.glyph_advance(ch as u32);
+        w = w.saturating_add(adv);
+        last_trailing = match font.glyph_ink_bounds(ch as u32) {
+            Some(_) => font.letter_spacing() as u32,
+            None    => 0, // whitespace/missing: no trailing letter-spacing
+        };
+    }
+    w = w.saturating_sub(last_trailing);
     let h = font.cell_h as u32 * scale;
     U8Vec3::new(
-        w.min(255) as u8,
+        (w * scale).min(255) as u8,
         h.min(255) as u8,
         depth.min(255) as u8,
     )
@@ -278,22 +349,31 @@ pub fn paint_world(
     s: &str,
 ) {
     let (col_u, vert_u, slice_u) = axis_units(axis);
-    let cell_w = font.cell_w as u32;
     let cell_h = font.cell_h as u32;
     let scale = if scale == 0 { 1 } else { scale } as u32;
     let depth = if depth == 0 { 1 } else { depth };
 
-    let mut text_col_offset: u32 = 0;
+    let mut pen: u32 = 0;
     for ch in s.chars() {
         let cp = ch as u32;
+        let (left, right) = match font.glyph_ink_bounds(cp) {
+            Some(b) => b,
+            None    => {
+                // Whitespace / missing glyph: advance, paint nothing.
+                pen = pen.saturating_add(font.glyph_advance(cp));
+                continue;
+            }
+        };
         for row in 0..cell_h {
-            for col in 0..cell_w {
+            for col in (left as u32)..=(right as u32) {
                 if !font.glyph_bit(cp, col as u8, row as u8) {
                     continue;
                 }
+                // Shift the glyph leftward by `left` so each glyph's
+                // leftmost inked column lands at the pen position.
                 // Top-of-glyph (row 0) lands at the highest vertical
                 // coord; convert by inverting through the vertical span.
-                let base_col = (text_col_offset + col) * scale;
+                let base_col = (pen + (col - left as u32)) * scale;
                 let base_vert_top = (cell_h - 1 - row) * scale;
                 for sx in 0..scale {
                     for sy in 0..scale {
@@ -321,7 +401,7 @@ pub fn paint_world(
                 }
             }
         }
-        text_col_offset += cell_w;
+        pen = pen.saturating_add(font.glyph_advance(cp));
     }
 }
 
@@ -343,7 +423,6 @@ pub fn rasterize_into(
     s: &str,
 ) -> U8Vec3 {
     let (col_u, vert_u, slice_u) = axis_units(axis);
-    let cell_w = font.cell_w as u32;
     let cell_h = font.cell_h as u32;
     let scale = if scale == 0 { 1 } else { scale } as u32;
     let depth = if depth == 0 { 1 } else { depth };
@@ -370,15 +449,22 @@ pub fn rasterize_into(
         }
     };
 
-    let mut text_col_offset: u32 = 0;
+    let mut pen: u32 = 0;
     for ch in s.chars() {
         let cp = ch as u32;
+        let (left, right) = match font.glyph_ink_bounds(cp) {
+            Some(b) => b,
+            None    => {
+                pen = pen.saturating_add(font.glyph_advance(cp));
+                continue;
+            }
+        };
         for row in 0..cell_h {
-            for col in 0..cell_w {
+            for col in (left as u32)..=(right as u32) {
                 if !font.glyph_bit(cp, col as u8, row as u8) {
                     continue;
                 }
-                let base_col = (text_col_offset + col) * scale;
+                let base_col = (pen + (col - left as u32)) * scale;
                 let base_vert_top = (cell_h - 1 - row) * scale;
                 for sx in 0..scale {
                     for sy in 0..scale {
@@ -404,7 +490,7 @@ pub fn rasterize_into(
                 }
             }
         }
-        text_col_offset += cell_w;
+        pen = pen.saturating_add(font.glyph_advance(cp));
     }
 
     U8Vec3::new(
@@ -550,14 +636,44 @@ mod tests {
 
     #[test]
     fn measure_extents() {
+        // Proportional advance: width depends on each glyph's actual
+        // inked columns + letter_spacing between glyphs. Height/depth
+        // stay fixed-cell.
         let m = measure(&FONT_ANSI, 1, 1, "Hi");
-        assert_eq!(m.x, 20);   // 10 cell_w * 2 chars * 1 scale
+        let expected_w = {
+            let (hl, hr) = FONT_ANSI.glyph_ink_bounds('H' as u32).unwrap();
+            let (il, ir) = FONT_ANSI.glyph_ink_bounds('i' as u32).unwrap();
+            (hr - hl + 1) as u32 + FONT_ANSI.letter_spacing() as u32 + (ir - il + 1) as u32
+        };
+        assert_eq!(m.x as u32, expected_w);
         assert_eq!(m.y, 11);
         assert_eq!(m.z, 1);
+
         let m = measure(&FONT_DCP1, 2, 8, "X");
-        assert_eq!(m.x, 32);   // 16 * 1 * 2
-        assert_eq!(m.y, 36);   // 18 * 2
+        let (xl, xr) = FONT_DCP1.glyph_ink_bounds('X' as u32).unwrap();
+        assert_eq!(m.x as u32, (xr - xl + 1) as u32 * 2); // single glyph, no trailing spacing
+        assert_eq!(m.y, 36);
         assert_eq!(m.z, 8);
+    }
+
+    #[test]
+    fn glyph_ink_bounds_basic() {
+        // FONT_TINY's 'A' has inked columns within its 4-col cell.
+        let (l, r) = FONT_TINY.glyph_ink_bounds('A' as u32).expect("A has ink");
+        assert!(l <= r);
+        assert!(r < FONT_TINY.cell_width());
+        // Space is absent / empty → None.
+        assert!(FONT_TINY.glyph_ink_bounds(' ' as u32).is_none());
+    }
+
+    #[test]
+    fn pen_offset_matches_advance_sum() {
+        // pen_offset(s, k) should equal the sum of glyph_advance for
+        // chars 0..k.
+        let s = "ABC";
+        let manual: u32 = s.chars().take(2).map(|c| FONT_ANSI.glyph_advance(c as u32)).sum();
+        assert_eq!(FONT_ANSI.pen_offset(s, 2), manual);
+        assert_eq!(FONT_ANSI.pen_offset(s, 0), 0);
     }
 
     #[test]

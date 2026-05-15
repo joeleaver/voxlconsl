@@ -65,6 +65,34 @@ main {
     letter-spacing: 0.04em;
 }
 
+/* Audio mute toggle, top-right of the screen-frame. Subtle by default
+   so it doesn't dominate the cart visual; turns red when muted. */
+#mute {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    font: inherit;
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+    color: rgba(255, 255, 255, 0.75);
+    background: rgba(0, 0, 0, 0.45);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: 3px;
+    padding: 0.2rem 0.5rem;
+    cursor: pointer;
+    text-shadow: 0 0 4px rgba(0, 0, 0, 0.9);
+}
+
+#mute:hover {
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.55);
+}
+
+#mute.muted {
+    color: rgba(255, 120, 120, 0.95);
+    border-color: rgba(255, 120, 120, 0.55);
+}
+
 /* Cart library — a grid of clickable tiles below the renderer. Each
    tile reloads the page with ?cart=<name>. Hidden until the JS picker
    populates it from /carts/index.json. */

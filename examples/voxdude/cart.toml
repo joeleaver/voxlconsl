@@ -16,3 +16,4 @@ file = "materials.toml"
 
 [audio]
 patches = "audio/patches.toml"
+songs   = "audio/songs"

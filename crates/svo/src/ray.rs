@@ -29,13 +29,18 @@ impl ChunkData {
     /// are handled but pessimize the math). `max_t` clamps the ray length.
     pub fn raycast(&self, origin: Vec3, dir: Vec3, max_t: f32) -> Option<RayHit> {
         let chunk_size = crate::build::CHUNK_SIZE as f32;
+        // Precompute 1/dir once per ray. The SVO descent does ~3 ray-AABB
+        // tests per child × up to 8 children × ~5 levels = ~120 slab
+        // evaluations, each of which was running its own division
+        // before. Hoisting saves ~100 divisions per chunk-raycast.
+        let inv = inv_dir(dir);
 
         // Uniform fast path.
         if self.is_uniform() {
             if self.header.material == 0 {
                 return None;
             }
-            let (t_in, t_out) = ray_aabb(origin, dir, Vec3::ZERO, Vec3::splat(chunk_size))?;
+            let (t_in, t_out) = ray_aabb_inv(origin, dir, inv, Vec3::ZERO, Vec3::splat(chunk_size))?;
             if t_out < 0.0 || t_in > max_t {
                 return None;
             }
@@ -44,7 +49,7 @@ impl ChunkData {
         }
 
         // Trace the root branch (nodes[0] by convention).
-        let (t_in, t_out) = ray_aabb(origin, dir, Vec3::ZERO, Vec3::splat(chunk_size))?;
+        let (t_in, t_out) = ray_aabb_inv(origin, dir, inv, Vec3::ZERO, Vec3::splat(chunk_size))?;
         if t_out < 0.0 || t_in > max_t {
             return None;
         }
@@ -53,7 +58,7 @@ impl ChunkData {
         traverse(
             &self.nodes,
             0,
-            origin, dir,
+            origin, dir, inv,
             t_min, t_max,
             Vec3::ZERO, Vec3::splat(chunk_size),
         )
@@ -65,6 +70,7 @@ fn traverse(
     node_idx: usize,
     origin: Vec3,
     dir: Vec3,
+    inv: Vec3,
     t_min: f32,
     t_max: f32,
     aabb_min: Vec3,
@@ -93,7 +99,7 @@ fn traverse(
             continue;
         }
         let (cmin, cmax) = sub_aabb(aabb_min, aabb_max, center, k);
-        let Some((t_a, t_b)) = ray_aabb(origin, dir, cmin, cmax) else { continue };
+        let Some((t_a, t_b)) = ray_aabb_inv(origin, dir, inv, cmin, cmax) else { continue };
         if t_b < t_min || t_a > t_max {
             continue;
         }
@@ -117,7 +123,7 @@ fn traverse(
             (valid & ((1 << octant) - 1)).count_ones() as usize;
         let child_idx = first_child + child_offset;
         let (cmin, cmax) = sub_aabb(aabb_min, aabb_max, center, octant);
-        if let Some(hit) = traverse(nodes, child_idx, origin, dir, ta, tb, cmin, cmax) {
+        if let Some(hit) = traverse(nodes, child_idx, origin, dir, inv, ta, tb, cmin, cmax) {
             return Some(hit);
         }
     }
@@ -125,8 +131,21 @@ fn traverse(
     None
 }
 
-/// Slab-method ray-AABB intersection. Returns `(t_enter, t_exit)` or `None`
-/// when the ray misses entirely.
+/// Precompute `1/dir` once for the lifetime of a ray. `0.0` axes encode
+/// as `f32::INFINITY` (with sign) which makes the slab test fold the
+/// "parallel ray inside the slab" case into the same arithmetic without
+/// branching.
+#[inline]
+fn inv_dir(dir: Vec3) -> Vec3 {
+    Vec3 {
+        x: if dir.x != 0.0 { 1.0 / dir.x } else { f32::INFINITY },
+        y: if dir.y != 0.0 { 1.0 / dir.y } else { f32::INFINITY },
+        z: if dir.z != 0.0 { 1.0 / dir.z } else { f32::INFINITY },
+    }
+}
+
+/// Slab-method ray-AABB intersection using a precomputed `1/dir`.
+/// Returns `(t_enter, t_exit)` or `None` when the ray misses.
 ///
 /// Each axis is handled separately so axis-aligned rays (one or more
 /// `dir` components exactly zero) don't tunnel through `0 * ∞ = NaN`
@@ -134,10 +153,11 @@ fn traverse(
 /// contributes the unconstrained slab `[-∞, +∞]` if `origin` lies
 /// inside `[min, max]` on that axis, and rejects the ray entirely
 /// otherwise.
-fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<(f32, f32)> {
-    let (tmin_x, tmax_x) = axis_slab(origin.x, dir.x, min.x, max.x)?;
-    let (tmin_y, tmax_y) = axis_slab(origin.y, dir.y, min.y, max.y)?;
-    let (tmin_z, tmax_z) = axis_slab(origin.z, dir.z, min.z, max.z)?;
+#[inline]
+fn ray_aabb_inv(origin: Vec3, dir: Vec3, inv: Vec3, min: Vec3, max: Vec3) -> Option<(f32, f32)> {
+    let (tmin_x, tmax_x) = axis_slab_inv(origin.x, dir.x, inv.x, min.x, max.x)?;
+    let (tmin_y, tmax_y) = axis_slab_inv(origin.y, dir.y, inv.y, min.y, max.y)?;
+    let (tmin_z, tmax_z) = axis_slab_inv(origin.z, dir.z, inv.z, min.z, max.z)?;
 
     let t_enter = tmin_x.max(tmin_y).max(tmin_z);
     let t_exit = tmax_x.min(tmax_y).min(tmax_z);
@@ -149,11 +169,10 @@ fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<(f32, f32)>
 }
 
 #[inline]
-fn axis_slab(o: f32, d: f32, lo: f32, hi: f32) -> Option<(f32, f32)> {
+fn axis_slab_inv(o: f32, d: f32, inv: f32, lo: f32, hi: f32) -> Option<(f32, f32)> {
     if d == 0.0 {
         if o < lo || o > hi { None } else { Some((f32::NEG_INFINITY, f32::INFINITY)) }
     } else {
-        let inv = 1.0 / d;
         let t1 = (lo - o) * inv;
         let t2 = (hi - o) * inv;
         Some((t1.min(t2), t1.max(t2)))
